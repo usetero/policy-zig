@@ -49,6 +49,8 @@ jobs:
       github.actor == 'renovate[bot]' ||
       github.actor == 'dependabot[bot]' ||
       github.actor == 'tero[bot]' ||
+      github.actor == 'tero-internal-bot' ||
+      github.actor == 'tero-internal-bot[bot]' ||
       github.ref == 'refs/heads/master' ||
       contains(github.event.pull_request.labels.*.name, 'ci') ||
       github.event_name == 'workflow_dispatch' ||
