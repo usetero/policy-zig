@@ -3,7 +3,7 @@ const policy_provider = @import("./provider.zig");
 const types = @import("./types.zig");
 const proto = @import("proto");
 const protobuf = @import("protobuf");
-const o11y = @import("./observability/root.zig");
+const o11y = @import("o11y");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const TransformResult = policy_provider.TransformResult;

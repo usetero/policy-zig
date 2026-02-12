@@ -31,6 +31,10 @@ const std = @import("std");
 /// Consumers can use these directly instead of compiling their own protos.
 pub const proto = @import("proto");
 
+/// Observability primitives (EventBus, spans, formatters, logging).
+/// Shared as a named module so consumers get type identity with policy internals.
+pub const o11y = @import("o11y");
+
 // =============================================================================
 // Core Types
 // =============================================================================
