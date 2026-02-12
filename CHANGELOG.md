@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/usetero/policy-zig/compare/v0.1.0...v0.1.1) (2026-02-12)
+
+
+### Bug Fixes
+
+* more pub ([#7](https://github.com/usetero/policy-zig/issues/7)) ([526bc3a](https://github.com/usetero/policy-zig/commit/526bc3acf0f229573ddea54623323493d67c7f58))
+
 ## [0.1.0](https://github.com/usetero/policy-zig/compare/v0.0.1...v0.1.0) (2026-02-12)
 
 
