@@ -24,6 +24,14 @@
 const std = @import("std");
 
 // =============================================================================
+// Proto Types (re-exported for consumers)
+// =============================================================================
+
+/// Generated protobuf types for the policy spec.
+/// Consumers can use these directly instead of compiling their own protos.
+pub const proto = @import("proto");
+
+// =============================================================================
 // Core Types
 // =============================================================================
 

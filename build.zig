@@ -52,6 +52,9 @@ pub fn build(b: *std.Build) void {
             .source_files = &.{
                 "proto/tero/policy/v1/policy.proto",
                 "proto/tero/policy/v1/log.proto",
+                "proto/tero/policy/v1/metric.proto",
+                "proto/tero/policy/v1/trace.proto",
+                "proto/tero/policy/v1/shared.proto",
             },
             .include_directories = &.{
                 "proto",
