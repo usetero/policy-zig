@@ -32,7 +32,7 @@ const SourceType = policy.SourceType;
 const ProviderConfig = policy.ProviderConfig;
 const ServiceMetadata = policy.ServiceMetadata;
 
-const o11y = @import("./observability/root.zig");
+const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 
 // =============================================================================

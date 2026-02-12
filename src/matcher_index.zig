@@ -23,7 +23,7 @@ const hyperscan = @import("./hyperscan.zig");
 const policy_types = @import("./types.zig");
 const sampler_mod = @import("./sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
-const o11y = @import("./observability/root.zig");
+const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 

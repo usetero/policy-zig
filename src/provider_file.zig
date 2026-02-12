@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const proto = @import("proto");
 const policy_provider = @import("./provider.zig");
 const parser = @import("./parser.zig");
-const o11y = @import("./observability/root.zig");
+const o11y = @import("o11y");
 
 const Policy = proto.policy.Policy;
 const PolicyCallback = policy_provider.PolicyCallback;

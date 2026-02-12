@@ -3,7 +3,7 @@ const proto = @import("proto");
 const policy_source = @import("./source.zig");
 const policy_provider = @import("./provider.zig");
 const matcher_index = @import("./matcher_index.zig");
-const o11y = @import("./observability/root.zig");
+const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 

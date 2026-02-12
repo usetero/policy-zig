@@ -35,7 +35,7 @@ const log_transform = @import("./log_transform.zig");
 const sampler_mod = @import("./sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
 
-const o11y = @import("./observability/root.zig");
+const o11y = @import("o11y");
 const NoopEventBus = o11y.NoopEventBus;
 const EventBus = o11y.EventBus;
 
