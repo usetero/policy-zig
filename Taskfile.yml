@@ -1,0 +1,180 @@
+# https://taskfile.dev
+
+version: "3"
+
+vars:
+  PROJECT_NAME: policy-zig
+  BUILD_DIR: zig-out
+
+tasks:
+  default:
+    desc: "Build the project in debug mode"
+    aliases: [b]
+    cmds:
+      - zig build
+
+  build:
+    desc: "Build the project with specified optimization"
+    aliases: [build-opt]
+    cmds:
+      - zig build -Doptimize={{.OPTIMIZE | default "Debug"}}
+
+  build:protos:
+    desc: "Build the project with protos"
+    cmds:
+      - zig build -Dgen-proto=true gen-proto
+
+  build:release:
+    desc: "Build the project in release mode (ReleaseFast)"
+    aliases: [br, release]
+    cmds:
+      - zig build -Doptimize=ReleaseFast
+
+  build:safe:
+    desc: "Build the project in ReleaseSafe mode"
+    aliases: [bs]
+    cmds:
+      - zig build -Doptimize=ReleaseSafe
+
+  build:small:
+    desc: "Build the project in ReleaseSmall mode"
+    aliases: [bsm]
+    cmds:
+      - zig build -Doptimize=ReleaseSmall
+
+  test:
+    desc: "Run all tests"
+    aliases: [t]
+    cmds:
+      - zig build test -Doptimize=ReleaseSafe
+
+  test:file:
+    desc: "Run tests for a specific file"
+    aliases: [tf]
+    cmds:
+      - |
+        if [ -z "{{.FILE}}" ]; then
+          echo "Usage: task test:file FILE=<path>"
+          echo "Example: task test:file FILE=src/parser.zig"
+          exit 1
+        fi
+        zig test {{.FILE}}
+
+  test:summary:
+    desc: "Run tests with summary output"
+    aliases: [ts]
+    cmds:
+      - zig build test --summary all
+
+  format:
+    desc: "Format all Zig source files"
+    aliases: [fmt, f]
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - zig fmt src/
+      - zig fmt build.zig
+
+  format:check:
+    desc: "Check if code is formatted correctly"
+    aliases: [fmt-check, fc]
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - zig fmt --check src/
+      - zig fmt --check build.zig
+
+  lint:
+    desc: "Run linting checks"
+    aliases: [l]
+    cmds:
+      - task: format:check
+
+  clean:
+    desc: "Clean build artifacts"
+    aliases: [c]
+    cmds:
+      - rm -rf zig-out/
+      - rm -rf zig-cache/
+      - rm -rf .zig-cache/
+
+  check:
+    desc: "Check the project (build without running)"
+    cmds:
+      - zig build --summary failures
+
+  deps:
+    desc: "Check dependencies and Zig installation"
+    cmds:
+      - zig version
+      - zig env
+
+  do:
+    desc: "Run all pre-commit checks"
+    cmds:
+      - task: format
+      - task: lint
+      - task: test
+
+  signoff:
+    desc: "Sign off the codebase"
+    aliases: ["sign", "s"]
+    cmds:
+      - task: do
+      - task: build:safe
+      - gh signoff
+
+  info:
+    desc: "Show project information"
+    cmds:
+      - echo "Project {{.PROJECT_NAME}}"
+      - echo "Build directory {{.BUILD_DIR}}"
+      - zig version
+      - echo ""
+      - echo "Available build modes:"
+      - echo "  - Debug (default)"
+      - echo "  - ReleaseFast (task build:release)"
+      - echo "  - ReleaseSafe (task build:safe)"
+      - echo "  - ReleaseSmall (task build:small)"
+
+  update:protos:
+    desc: "Update proto files"
+    cmds:
+      - buf export buf.build/tero/policy -o proto
+      - buf export buf.build/opentelemetry/opentelemetry -o proto
+      - task: build:protos
+
+  # =============================================================================
+  # CI Setup
+  # =============================================================================
+
+  ci:setup:
+    desc: "Install CI/development dependencies (idempotent, safe to run locally)"
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - |
+        echo "Checking for required dependencies..."
+
+        # Check for hyperscan/vectorscan
+        if ! pkg-config --exists libhs 2>/dev/null; then
+          echo "Installing hyperscan..."
+          if [ "$(uname)" = "Darwin" ]; then
+            if command -v brew >/dev/null 2>&1; then
+              brew install vectorscan pkg-config
+            else
+              echo "Homebrew not found. Install vectorscan manually or use Hermit."
+            fi
+          elif [ "$(uname)" = "Linux" ]; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y libhyperscan-dev pkg-config
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y hyperscan-devel pkg-config
+            else
+              echo "Unknown package manager. Install hyperscan manually."
+            fi
+          else
+            echo "Unknown platform: $(uname)"
+          fi
+        else
+          echo "Hyperscan already installed"
+        fi
+
+        echo "CI setup complete"

@@ -1,0 +1,14 @@
+{
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "build.zig.zon",
+          "glob": false
+        }
+      ]
+    }
+  }
+}
