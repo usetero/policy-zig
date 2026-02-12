@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/usetero/policy-zig/compare/v0.1.2...v0.1.3) (2026-02-12)
+
+
+### Bug Fixes
+
+* expose otel protos ([#11](https://github.com/usetero/policy-zig/issues/11)) ([e5e1c11](https://github.com/usetero/policy-zig/commit/e5e1c11b277e6691fc5dec539a90fb354214a77d))
+
 ## [0.1.2](https://github.com/usetero/policy-zig/compare/v0.1.1...v0.1.2) (2026-02-12)
 
 
