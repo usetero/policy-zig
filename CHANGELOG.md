@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/usetero/policy-zig/compare/v0.1.3...v0.1.4) (2026-02-13)
+
+
+### Bug Fixes
+
+* use different reset method ([#13](https://github.com/usetero/policy-zig/issues/13)) ([0aa5d10](https://github.com/usetero/policy-zig/commit/0aa5d100452cea685c7107479ab84e4e876160dc))
+
 ## [0.1.3](https://github.com/usetero/policy-zig/compare/v0.1.2...v0.1.3) (2026-02-12)
 
 
