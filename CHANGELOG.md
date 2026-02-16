@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/usetero/policy-zig/compare/v0.1.6...v0.1.7) (2026-02-16)
+
+
+### Bug Fixes
+
+* better approach for providers ([#19](https://github.com/usetero/policy-zig/issues/19)) ([eb20494](https://github.com/usetero/policy-zig/commit/eb20494a6a98bc29b1d59b84bafee328b76b3fd0))
+
 ## [0.1.6](https://github.com/usetero/policy-zig/compare/v0.1.5...v0.1.6) (2026-02-16)
 
 
