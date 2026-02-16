@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/usetero/policy-zig/compare/v0.1.5...v0.1.6) (2026-02-16)
+
+
+### Bug Fixes
+
+* return file listener, fix metric_type and aggregation producing ([#17](https://github.com/usetero/policy-zig/issues/17)) ([1f260d5](https://github.com/usetero/policy-zig/commit/1f260d573608343abbb12f28f264b3843c15f5e4))
+
 ## [0.1.5](https://github.com/usetero/policy-zig/compare/v0.1.4...v0.1.5) (2026-02-16)
 
 
