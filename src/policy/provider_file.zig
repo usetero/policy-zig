@@ -38,7 +38,7 @@ pub const FileProvider = struct {
     config_path: []const u8,
     callback: ?PolicyCallback,
     watch_thread: ?std.Thread,
-    shutdown_flag: std.atomic.Value(bool),
+    shutdown_event: std.Thread.ResetEvent,
     /// SHA256 hash of the last loaded file contents
     content_hash: ?[Sha256.digest_length]u8,
     /// Event bus for observability
@@ -60,7 +60,7 @@ pub const FileProvider = struct {
             .config_path = path_copy,
             .callback = null,
             .watch_thread = null,
-            .shutdown_flag = std.atomic.Value(bool).init(false),
+            .shutdown_event = .{},
             .content_hash = null,
             .bus = bus,
         };
@@ -84,7 +84,7 @@ pub const FileProvider = struct {
     }
 
     pub fn shutdown(self: *FileProvider) void {
-        self.shutdown_flag.store(true, .release);
+        self.shutdown_event.set();
 
         if (self.watch_thread) |thread| {
             thread.join();
@@ -169,8 +169,9 @@ pub const FileProvider = struct {
     fn watchLoopPoll(self: *FileProvider) !void {
         var last_mtime: i128 = 0;
 
-        while (!self.shutdown_flag.load(.acquire)) {
-            std.Thread.sleep(1 * std.time.ns_per_s); // Check every second
+        while (!self.shutdown_event.isSet()) {
+            self.shutdown_event.timedWait(1 * std.time.ns_per_s) catch {};
+            if (self.shutdown_event.isSet()) break;
 
             const file = std.fs.cwd().openFile(self.config_path, .{}) catch continue;
             defer file.close();

@@ -644,7 +644,8 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
         }
     };
 
-    // Parse match
+    // Parse match (enum fields like metric_type and aggregation_temporality
+    // default to exists=true when no explicit match is specified)
     const match: MetricMatcher.match_union = blk: {
         if (jm.regex) |pattern| {
             break :blk .{ .regex = try allocator.dupe(u8, pattern) };
@@ -658,6 +659,8 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
             break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
         } else if (jm.contains) |pattern| {
             break :blk .{ .contains = try allocator.dupe(u8, pattern) };
+        } else if (jm.metric_type != null or jm.aggregation_temporality != null) {
+            break :blk .{ .exists = true };
         } else {
             return error.MissingMatch;
         }
@@ -2170,8 +2173,7 @@ test "parsePoliciesBytes: metric policy with metric_type short form" {
         \\    "name": "Drop histogram metrics",
         \\    "metric": {
         \\      "match": [{
-        \\        "metric_type": "histogram",
-        \\        "exists": true
+        \\        "metric_type": "histogram"
         \\      }],
         \\      "keep": false
         \\    }
@@ -2236,8 +2238,7 @@ test "parsePoliciesBytes: metric policy with aggregation_temporality short form"
         \\    "name": "Drop delta metrics",
         \\    "metric": {
         \\      "match": [{
-        \\        "aggregation_temporality": "delta",
-        \\        "exists": true
+        \\        "aggregation_temporality": "delta"
         \\      }],
         \\      "keep": false
         \\    }

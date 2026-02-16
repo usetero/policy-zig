@@ -191,11 +191,9 @@ pub const MetricFieldRef = union(enum) {
     /// AttributePath for nested scope attribute access
     scope_attribute: AttributePath,
     /// Match on metric type (gauge, sum, histogram, etc.)
-    /// The field accessor returns the type as a string, matched via regex.
-    metric_type: void,
+    metric_type: MetricType,
     /// Match on aggregation temporality (delta, cumulative)
-    /// The field accessor returns the temporality as a string, matched via regex.
-    aggregation_temporality: void,
+    aggregation_temporality: AggregationTemporality,
 
     pub fn fromMatcherField(field: ?MetricMatcher.field_union) ?MetricFieldRef {
         const f = field orelse return null;
@@ -204,8 +202,8 @@ pub const MetricFieldRef = union(enum) {
             .datapoint_attribute => |v| .{ .datapoint_attribute = v },
             .resource_attribute => |v| .{ .resource_attribute = v },
             .scope_attribute => |v| .{ .scope_attribute = v },
-            .metric_type => .{ .metric_type = {} },
-            .aggregation_temporality => .{ .aggregation_temporality = {} },
+            .metric_type => |v| .{ .metric_type = v },
+            .aggregation_temporality => |v| .{ .aggregation_temporality = v },
         };
     }
 
