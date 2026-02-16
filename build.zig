@@ -18,19 +18,19 @@ pub fn build(b: *std.Build) void {
     proto_mod.addImport("protobuf", protobuf_dep.module("protobuf"));
 
     // Observability module - shared with consumers for type identity
-    const o11y_mod = b.addModule("o11y", .{
+    const o11y_mod = b.addModule("observability", .{
         .root_source_file = b.path("src/observability/root.zig"),
         .target = target,
     });
 
     // Main library module exposed to consumers
     const mod = b.addModule("policy_zig", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/policy/root.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "proto", .module = proto_mod },
             .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
-            .{ .name = "o11y", .module = o11y_mod },
+            .{ .name = "observability", .module = o11y_mod },
         },
     });
 
