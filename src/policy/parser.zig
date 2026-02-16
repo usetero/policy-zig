@@ -13,6 +13,8 @@ const LogAdd = proto.policy.LogAdd;
 const MetricTarget = proto.policy.MetricTarget;
 const MetricMatcher = proto.policy.MetricMatcher;
 const MetricField = proto.policy.MetricField;
+const MetricType = proto.policy.MetricType;
+const AggregationTemporality = proto.policy.AggregationTemporality;
 const TraceTarget = proto.policy.TraceTarget;
 const TraceMatcher = proto.policy.TraceMatcher;
 const TraceField = proto.policy.TraceField;
@@ -124,12 +126,16 @@ const LogMatcherJson = struct {
 /// Example: { "metric_field": "name", "regex": "^debug\\." }
 /// Example: { "datapoint_attribute": "env", "exact": "dev" }
 /// Example: { "datapoint_attribute": ["tags", "env"], "exact": "prod" }
+/// Example: { "metric_type": "METRIC_TYPE_HISTOGRAM", "exists": true }
+/// Example: { "aggregation_temporality": "AGGREGATION_TEMPORALITY_DELTA", "exists": true }
 const MetricMatcherJson = struct {
     // Field selectors (one of these should be set)
     metric_field: ?[]const u8 = null, // "name", "unit", etc.
     datapoint_attribute: ?std.json.Value = null, // datapoint attribute path
     resource_attribute: ?std.json.Value = null, // resource attribute path
     scope_attribute: ?std.json.Value = null, // scope attribute path
+    metric_type: ?[]const u8 = null, // "METRIC_TYPE_GAUGE", "METRIC_TYPE_SUM", etc.
+    aggregation_temporality: ?[]const u8 = null, // "AGGREGATION_TEMPORALITY_DELTA", etc.
 
     // Match type (one of these should be set)
     regex: ?[]const u8 = null,
@@ -629,6 +635,10 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
             break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
         } else if (jm.scope_attribute) |value| {
             break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.metric_type) |type_name| {
+            break :blk .{ .metric_type = try parseMetricType(type_name) };
+        } else if (jm.aggregation_temporality) |temporality_name| {
+            break :blk .{ .aggregation_temporality = try parseAggregationTemporality(temporality_name) };
         } else {
             return error.MissingField;
         }
@@ -670,6 +680,21 @@ fn parseMetricFieldName(name: []const u8) !MetricField {
     if (std.mem.eql(u8, name, "scope_name")) return .METRIC_FIELD_SCOPE_NAME;
     if (std.mem.eql(u8, name, "scope_version")) return .METRIC_FIELD_SCOPE_VERSION;
     return error.InvalidMetricField;
+}
+
+fn parseMetricType(name: []const u8) !MetricType {
+    if (std.mem.eql(u8, name, "gauge") or std.mem.eql(u8, name, "METRIC_TYPE_GAUGE")) return .METRIC_TYPE_GAUGE;
+    if (std.mem.eql(u8, name, "sum") or std.mem.eql(u8, name, "METRIC_TYPE_SUM")) return .METRIC_TYPE_SUM;
+    if (std.mem.eql(u8, name, "histogram") or std.mem.eql(u8, name, "METRIC_TYPE_HISTOGRAM")) return .METRIC_TYPE_HISTOGRAM;
+    if (std.mem.eql(u8, name, "exponential_histogram") or std.mem.eql(u8, name, "METRIC_TYPE_EXPONENTIAL_HISTOGRAM")) return .METRIC_TYPE_EXPONENTIAL_HISTOGRAM;
+    if (std.mem.eql(u8, name, "summary") or std.mem.eql(u8, name, "METRIC_TYPE_SUMMARY")) return .METRIC_TYPE_SUMMARY;
+    return error.InvalidMetricType;
+}
+
+fn parseAggregationTemporality(name: []const u8) !AggregationTemporality {
+    if (std.mem.eql(u8, name, "delta") or std.mem.eql(u8, name, "AGGREGATION_TEMPORALITY_DELTA")) return .AGGREGATION_TEMPORALITY_DELTA;
+    if (std.mem.eql(u8, name, "cumulative") or std.mem.eql(u8, name, "AGGREGATION_TEMPORALITY_CUMULATIVE")) return .AGGREGATION_TEMPORALITY_CUMULATIVE;
+    return error.InvalidAggregationTemporality;
 }
 
 // =============================================================================
@@ -2129,4 +2154,140 @@ test "parsePoliciesBytes: log policy without sample_key" {
 
     const log_target = policies[0].target.?.log;
     try std.testing.expect(log_target.sample_key == null);
+}
+
+// =============================================================================
+// Tests for metric_type and aggregation_temporality
+// =============================================================================
+
+test "parsePoliciesBytes: metric policy with metric_type short form" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-histograms",
+        \\    "name": "Drop histogram metrics",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "metric_type": "histogram",
+        \\        "exists": true
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .metric_type);
+    try std.testing.expectEqual(MetricType.METRIC_TYPE_HISTOGRAM, matcher.field.?.metric_type);
+    try std.testing.expect(matcher.match.? == .exists);
+    try std.testing.expectEqual(true, matcher.match.?.exists);
+}
+
+test "parsePoliciesBytes: metric policy with metric_type canonical form" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-gauges",
+        \\    "name": "Drop gauge metrics",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "metric_type": "METRIC_TYPE_GAUGE",
+        \\        "exists": true
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .metric_type);
+    try std.testing.expectEqual(MetricType.METRIC_TYPE_GAUGE, matcher.field.?.metric_type);
+}
+
+test "parsePoliciesBytes: metric policy with aggregation_temporality short form" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-delta-metrics",
+        \\    "name": "Drop delta metrics",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "aggregation_temporality": "delta",
+        \\        "exists": true
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .aggregation_temporality);
+    try std.testing.expectEqual(AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, matcher.field.?.aggregation_temporality);
+    try std.testing.expect(matcher.match.? == .exists);
+    try std.testing.expectEqual(true, matcher.match.?.exists);
+}
+
+test "parsePoliciesBytes: metric policy with aggregation_temporality canonical form" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-cumulative-metrics",
+        \\    "name": "Drop cumulative metrics",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "aggregation_temporality": "AGGREGATION_TEMPORALITY_CUMULATIVE",
+        \\        "exists": true
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .aggregation_temporality);
+    try std.testing.expectEqual(AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE, matcher.field.?.aggregation_temporality);
 }
