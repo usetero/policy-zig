@@ -96,34 +96,40 @@ const policy = @import("policy_zig");
 var registry = policy.Registry.init(allocator, bus);
 defer registry.deinit();
 
-// Create and register a file provider
-const file_provider = try policy.FileProvider.init(allocator, bus, "local", "policies.json");
+// Create a file provider and subscribe it to the registry (one step)
+const file_provider = try policy.FileProvider.init(allocator, bus, .{
+    .id = "local",
+    .path = "policies.json",
+});
 defer file_provider.deinit();
 
-const provider_interface = policy.Provider.init(file_provider);
-try registry.registerProvider(&provider_interface);
+try registry.subscribe(.{ .file = file_provider });
+
+// Periodically flush per-policy stats to providers
+registry.flushStats();
 ```
 
 ## Architecture
 
 ```
 src/
-  root.zig              # Public API - all exports
-  policy_engine.zig     # Hyperscan-based policy evaluation
-  matcher_index.zig     # Inverted index for pattern matching
-  registry.zig          # Policy registry with atomic snapshots
-  parser.zig            # Policy parsing
-  loader.zig            # Async policy loader
-  provider.zig          # Provider interface
-  provider_file.zig     # File-based provider
-  provider_http.zig     # HTTP-based provider
-  source.zig            # Source types and metadata
-  types.zig             # Shared type definitions
-  log_transform.zig     # Log transformation (redact, remove, rename, add)
-  sampler.zig           # Log sampling
-  trace_sampler.zig     # Trace sampling
-  rate_limiter.zig      # Rate limiting
-  hyperscan.zig         # Vectorscan/Hyperscan C bindings
+  policy/
+    root.zig            # Public API - all exports
+    policy_engine.zig   # Hyperscan-based policy evaluation
+    matcher_index.zig   # Inverted index for pattern matching
+    registry.zig        # Policy registry with atomic snapshots
+    parser.zig          # Policy parsing
+    loader.zig          # Async policy loader
+    provider.zig        # Provider callback types
+    provider_file.zig   # File-based provider
+    provider_http.zig   # HTTP-based provider
+    source.zig          # Source types and metadata
+    types.zig           # Shared type definitions and Provider tagged union
+    log_transform.zig   # Log transformation (redact, remove, rename, add)
+    sampler.zig         # Log sampling
+    trace_sampler.zig   # Trace sampling
+    rate_limiter.zig    # Rate limiting
+    hyperscan.zig       # Vectorscan/Hyperscan C bindings
   observability/        # Event bus, spans, formatters
   proto/                # Generated protobuf definitions
 ```

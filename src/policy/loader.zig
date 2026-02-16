@@ -21,14 +21,12 @@
 
 const std = @import("std");
 const policy = @import("./root.zig");
+const policy_types = @import("./types.zig");
 
 const Registry = policy.Registry;
-const Provider = policy.Provider;
+const Provider = policy_types.Provider;
 const FileProvider = policy.FileProvider;
 const HttpProvider = policy.HttpProvider;
-const PolicyCallback = policy.PolicyCallback;
-const PolicyUpdate = policy.PolicyUpdate;
-const SourceType = policy.SourceType;
 const ProviderConfig = policy.ProviderConfig;
 const ServiceMetadata = policy.ServiceMetadata;
 
@@ -46,26 +44,6 @@ const ProviderLoadCompleted = struct { provider_id: []const u8, policy_count: us
 const ProviderLoadFailed = struct { provider_id: []const u8, err: []const u8 };
 const FileProviderConfigured = struct { path: []const u8 };
 const HttpProviderConfigured = struct { url: []const u8, poll_interval: u64 };
-const PolicyRegistryUpdated = struct { provider_id: []const u8, policy_count: usize };
-
-// =============================================================================
-// Policy Callback Context
-// =============================================================================
-
-const CallbackContext = struct {
-    registry: *Registry,
-    bus: *EventBus,
-    source_type: SourceType,
-
-    fn handleUpdate(context: *anyopaque, update: PolicyUpdate) !void {
-        const self: *CallbackContext = @ptrCast(@alignCast(context));
-        try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
-        self.bus.info(PolicyRegistryUpdated{
-            .provider_id = update.provider_id,
-            .policy_count = update.policies.len,
-        });
-    }
-};
 
 // =============================================================================
 // Provider State
@@ -74,9 +52,14 @@ const CallbackContext = struct {
 const ProviderState = struct {
     config: ProviderConfig,
     provider: ?Provider = null,
-    callback_context: ?CallbackContext = null,
     load_error: ?[]const u8 = null,
     loaded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn deinitProvider(self: *ProviderState) void {
+        if (self.provider) |prov| {
+            prov.deinit();
+        }
+    }
 };
 
 // =============================================================================
@@ -194,9 +177,7 @@ pub const PolicyLoader = struct {
 
         // Deinit all providers
         for (self.provider_states) |*state| {
-            if (state.provider) |provider| {
-                provider.deinit();
-            }
+            state.deinitProvider();
             if (state.load_error) |err| {
                 self.allocator.free(err);
             }
@@ -262,28 +243,13 @@ pub const PolicyLoader = struct {
                 const file_provider = try FileProvider.init(
                     self.allocator,
                     self.bus,
-                    config.id,
-                    path,
+                    .{ .id = config.id, .path = path },
                 );
                 errdefer file_provider.deinit();
 
-                // Set up callback context
-                state.callback_context = .{
-                    .registry = self.registry,
-                    .bus = self.bus,
-                    .source_type = .file,
-                };
-
-                const callback = PolicyCallback{
-                    .context = @ptrCast(&state.callback_context.?),
-                    .onUpdate = CallbackContext.handleUpdate,
-                };
-
-                try file_provider.subscribe(callback);
-
-                // Store provider interface
-                state.provider = Provider.init(file_provider);
-                try self.registry.registerProvider(&state.provider.?);
+                const prov: Provider = .{ .file = file_provider };
+                try self.registry.subscribe(prov);
+                state.provider = prov;
                 state.loaded.store(true, .release);
 
                 self.bus.debug(ProviderLoadCompleted{
@@ -299,31 +265,19 @@ pub const PolicyLoader = struct {
                 const http_provider = try HttpProvider.init(
                     self.allocator,
                     self.bus,
-                    config.id,
-                    url,
-                    poll_interval,
-                    self.service,
-                    config.headers,
+                    .{
+                        .id = config.id,
+                        .url = url,
+                        .poll_interval_seconds = poll_interval,
+                        .service = self.service,
+                        .headers = config.headers,
+                    },
                 );
                 errdefer http_provider.deinit();
 
-                // Set up callback context
-                state.callback_context = .{
-                    .registry = self.registry,
-                    .bus = self.bus,
-                    .source_type = .http,
-                };
-
-                const callback = PolicyCallback{
-                    .context = @ptrCast(&state.callback_context.?),
-                    .onUpdate = CallbackContext.handleUpdate,
-                };
-
-                try http_provider.subscribe(callback);
-
-                // Store provider interface
-                state.provider = Provider.init(http_provider);
-                try self.registry.registerProvider(&state.provider.?);
+                const prov: Provider = .{ .http = http_provider };
+                try self.registry.subscribe(prov);
+                state.provider = prov;
                 state.loaded.store(true, .release);
 
                 self.bus.debug(ProviderLoadCompleted{
