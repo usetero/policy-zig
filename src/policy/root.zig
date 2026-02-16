@@ -14,11 +14,10 @@
 //! defer registry.deinit();
 //!
 //! // Create and register a file provider
-//! const file_provider = try policy.FileProvider.init(allocator, bus, "local", "policies.json");
+//! const file_provider = try policy.FileProvider.init(allocator, bus, .{ .id = "local", .path = "policies.json" });
 //! defer file_provider.deinit();
 //!
-//! const provider_interface = policy.Provider.init(file_provider);
-//! try registry.registerProvider(&provider_interface);
+//! try registry.registerProvider(.{ .file = file_provider });
 //! ```
 
 const std = @import("std");
@@ -49,7 +48,6 @@ pub const PolicyMetadata = source.PolicyMetadata;
 
 /// Re-export provider interface
 pub const provider = @import("./provider.zig");
-pub const Provider = provider.PolicyProvider;
 pub const PolicyCallback = provider.PolicyCallback;
 pub const PolicyUpdate = provider.PolicyUpdate;
 
@@ -58,7 +56,6 @@ pub const registry = @import("./registry.zig");
 pub const Registry = registry.PolicyRegistry;
 pub const Snapshot = registry.PolicySnapshot;
 pub const ConfigType = registry.PolicyConfigType;
-pub const TestPolicyProvider = registry.TestPolicyProvider;
 
 // =============================================================================
 // Provider Implementations
@@ -78,6 +75,8 @@ pub const Loader = @import("./loader.zig").PolicyLoader;
 // =============================================================================
 
 pub const types = @import("./types.zig");
+pub const Provider = types.Provider;
+pub const TestProvider = types.TestProvider;
 pub const ServiceMetadata = types.ServiceMetadata;
 pub const ProviderType = types.ProviderType;
 pub const ProviderConfig = types.ProviderConfig;

@@ -44,14 +44,19 @@ pub const FileProvider = struct {
     /// Event bus for observability
     bus: *EventBus,
 
-    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, id: []const u8, config_path: []const u8) !*FileProvider {
+    pub const Config = struct {
+        id: []const u8,
+        path: []const u8,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, config: Config) !*FileProvider {
         const self = try allocator.create(FileProvider);
         errdefer allocator.destroy(self);
 
-        const id_copy = try allocator.dupe(u8, id);
+        const id_copy = try allocator.dupe(u8, config.id);
         errdefer allocator.free(id_copy);
 
-        const path_copy = try allocator.dupe(u8, config_path);
+        const path_copy = try allocator.dupe(u8, config.path);
         errdefer allocator.free(path_copy);
 
         self.* = .{
@@ -206,8 +211,7 @@ test "FileProvider: init and deinit" {
     const provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        "/nonexistent/path/policies.json",
+        .{ .id = "test-provider", .path = "/nonexistent/path/policies.json" },
     );
     defer provider.deinit();
 
@@ -222,8 +226,7 @@ test "FileProvider: subscribe fails when file does not exist" {
     const provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        "/nonexistent/path/policies.json",
+        .{ .id = "test-provider", .path = "/nonexistent/path/policies.json" },
     );
     defer provider.deinit();
 
@@ -258,8 +261,7 @@ test "FileProvider: subscribe fails with invalid JSON" {
     const provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        tmp_path,
+        .{ .id = "test-provider", .path = tmp_path },
     );
     defer provider.deinit();
 
@@ -305,8 +307,7 @@ test "FileProvider: subscribe fails with invalid policy structure" {
     const provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        tmp_path,
+        .{ .id = "test-provider", .path = tmp_path },
     );
     defer provider.deinit();
 
@@ -334,8 +335,7 @@ test "FileProvider: registry remains usable after provider fails to load" {
     const provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "failing-provider",
-        "/nonexistent/path/policies.json",
+        .{ .id = "failing-provider", .path = "/nonexistent/path/policies.json" },
     );
     defer provider.deinit();
 
@@ -379,8 +379,7 @@ test "FileProvider: registry remains usable after provider fails to load" {
     const good_provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "good-provider",
-        tmp_path,
+        .{ .id = "good-provider", .path = tmp_path },
     );
     defer good_provider.deinit();
 
@@ -445,8 +444,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     const provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        tmp_path,
+        .{ .id = "test-provider", .path = tmp_path },
     );
     defer provider.deinit();
 
@@ -592,8 +590,7 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     const failing_provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "failing-provider",
-        "/nonexistent/policies.json",
+        .{ .id = "failing-provider", .path = "/nonexistent/policies.json" },
     );
     defer failing_provider.deinit();
 
@@ -609,8 +606,7 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     const good_provider = try FileProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "good-provider",
-        tmp_path,
+        .{ .id = "good-provider", .path = tmp_path },
     );
     defer good_provider.deinit();
 

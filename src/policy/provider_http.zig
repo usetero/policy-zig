@@ -96,26 +96,30 @@ pub const HttpProvider = struct {
     // Event bus for observability
     bus: *EventBus,
 
+    pub const Config = struct {
+        id: []const u8,
+        url: []const u8,
+        poll_interval_seconds: u64 = 30,
+        service: ServiceMetadata = .{},
+        headers: []const Header = &.{},
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         bus: *EventBus,
-        id: []const u8,
-        config_url: []const u8,
-        poll_interval_seconds: u64,
-        service: ServiceMetadata,
-        headers: []const Header,
+        config: Config,
     ) !*HttpProvider {
         const self = try allocator.create(HttpProvider);
         errdefer allocator.destroy(self);
 
-        const id_copy = try allocator.dupe(u8, id);
+        const id_copy = try allocator.dupe(u8, config.id);
         errdefer allocator.free(id_copy);
 
-        const url_copy = try allocator.dupe(u8, config_url);
+        const url_copy = try allocator.dupe(u8, config.url);
         errdefer allocator.free(url_copy);
 
         // Copy headers (both the slice and the string contents)
-        const headers_copy = try allocator.alloc(Header, headers.len);
+        const headers_copy = try allocator.alloc(Header, config.headers.len);
         errdefer allocator.free(headers_copy);
 
         var headers_initialized: usize = 0;
@@ -126,7 +130,7 @@ pub const HttpProvider = struct {
             }
         }
 
-        for (headers, 0..) |h, i| {
+        for (config.headers, 0..) |h, i| {
             const name_copy = try allocator.dupe(u8, h.name);
             errdefer allocator.free(name_copy);
             const value_copy = try allocator.dupe(u8, h.value);
@@ -139,11 +143,11 @@ pub const HttpProvider = struct {
             .id = id_copy,
             .http_client = std.http.Client{ .allocator = allocator },
             .config_url = url_copy,
-            .poll_interval_ns = poll_interval_seconds * std.time.ns_per_s,
+            .poll_interval_ns = config.poll_interval_seconds * std.time.ns_per_s,
             .callback = null,
             .poll_thread = null,
             .shutdown_flag = std.atomic.Value(bool).init(false),
-            .service = service,
+            .service = config.service,
             .last_sync_timestamp = 0,
             .last_successful_hash = null,
             .policy_statuses = .{},
@@ -339,7 +343,7 @@ pub const HttpProvider = struct {
         response_body: []u8,
     };
 
-    fn fetchAndNotify(self: *HttpProvider) !void {
+    pub fn fetchAndNotify(self: *HttpProvider) !void {
         var span = self.bus.started(.debug, HTTPFetchStarted{});
         defer span.completed(HTTPFetchCompleted{});
         var result = try self.fetchPolicies();
@@ -570,11 +574,7 @@ test "HttpProvider: recordPolicyStats accumulates hits and misses" {
     var provider = try HttpProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        "http://test.local/policies",
-        60,
-        .{},
-        &.{},
+        .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
     );
     defer provider.deinit();
 
@@ -616,11 +616,7 @@ test "HttpProvider: clearPolicyStatuses resets all counters" {
     var provider = try HttpProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        "http://test.local/policies",
-        60,
-        .{},
-        &.{},
+        .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
     );
     defer provider.deinit();
 
@@ -656,11 +652,7 @@ test "HttpProvider: recordPolicyStats after clear starts fresh" {
     var provider = try HttpProvider.init(
         allocator,
         noop_bus.eventBus(),
-        "test-provider",
-        "http://test.local/policies",
-        60,
-        .{},
-        &.{},
+        .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
     );
     defer provider.deinit();
 

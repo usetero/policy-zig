@@ -2,6 +2,7 @@ const std = @import("std");
 const proto = @import("proto");
 const policy_source = @import("./source.zig");
 const policy_provider = @import("./provider.zig");
+const policy_types = @import("./types.zig");
 const matcher_index = @import("./matcher_index.zig");
 const o11y = @import("observability");
 const EventBus = o11y.EventBus;
@@ -13,6 +14,7 @@ const PolicyMetadata = policy_source.PolicyMetadata;
 const LogMatcherIndex = matcher_index.LogMatcherIndex;
 const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
 const TraceMatcherIndex = matcher_index.TraceMatcherIndex;
+const Provider = policy_types.Provider;
 
 // =============================================================================
 // Lock-free Policy Stats
@@ -244,12 +246,34 @@ pub const PolicyRegistry = struct {
     // Snapshots pending cleanup after grace period
     pending_snapshots: std.ArrayListUnmanaged(PendingSnapshot),
 
-    // Provider references for error routing, keyed by provider ID
+    // Provider references for error/stats routing, keyed by provider ID
     // These are not owned by the registry - caller must ensure they outlive the registry
-    providers: std.StringHashMapUnmanaged(*policy_provider.PolicyProvider),
+    providers: std.StringHashMapUnmanaged(Provider),
+
+    // Subscription contexts (stable pointers for callbacks)
+    subscriptions: std.ArrayListUnmanaged(*Subscription),
 
     // Event bus for observability
     bus: *EventBus,
+
+    /// Subscription context for provider callbacks.
+    /// Allocated with stable address so the callback pointer remains valid.
+    const Subscription = struct {
+        registry: *PolicyRegistry,
+        source_type: SourceType,
+
+        fn handleUpdate(context: *anyopaque, update: policy_provider.PolicyUpdate) anyerror!void {
+            const self: *Subscription = @ptrCast(@alignCast(context));
+            try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
+        }
+
+        pub fn init(registry: *PolicyRegistry, source_type: SourceType) Subscription {
+            return .{
+                .registry = registry,
+                .source_type = source_type,
+            };
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator, bus: *EventBus) PolicyRegistry {
         return .{
@@ -261,17 +285,52 @@ pub const PolicyRegistry = struct {
             .current_snapshot = std.atomic.Value(?*const PolicySnapshot).init(null),
             .pending_snapshots = .{},
             .providers = .{},
+            .subscriptions = .empty,
             .bus = bus,
         };
     }
 
     /// Register a provider for error routing.
     /// The provider must outlive the registry.
-    pub fn registerProvider(self: *PolicyRegistry, provider: *policy_provider.PolicyProvider) !void {
-        const id = provider.getId();
+    pub fn registerProvider(self: *PolicyRegistry, prov: Provider) !void {
+        const id = prov.getId();
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
-        try self.providers.put(self.allocator, id_copy, provider);
+        try self.providers.put(self.allocator, id_copy, prov);
+    }
+
+    /// Subscribe a provider to the registry in one step.
+    /// Registers the provider for error/stats routing and subscribes
+    /// to its policy updates with an internal callback that feeds
+    /// updates into the registry.
+    pub fn subscribe(self: *PolicyRegistry, prov: Provider) !void {
+        try self.registerProvider(prov);
+
+        const sub = try self.allocator.create(Subscription);
+        errdefer self.allocator.destroy(sub);
+        sub.* = Subscription.init(self, prov.sourceType());
+
+        try self.subscriptions.append(self.allocator, sub);
+        errdefer _ = self.subscriptions.pop();
+
+        try prov.subscribe(.{
+            .context = @ptrCast(sub),
+            .onUpdate = Subscription.handleUpdate,
+        });
+    }
+
+    /// Flush lock-free per-policy stats from the current snapshot to providers.
+    /// Reads and resets atomic counters, then routes stats to the appropriate
+    /// provider via recordPolicyStats.
+    pub fn flushStats(self: *PolicyRegistry) void {
+        const snapshot = self.getSnapshot() orelse return;
+        for (snapshot.policies, 0..) |*p, i| {
+            const stats = snapshot.getStats(@intCast(i)) orelse continue;
+            const counters = stats.readAndReset();
+            if (counters.hits > 0 or counters.misses > 0 or counters.transforms > 0) {
+                self.recordPolicyStats(p.id, counters.hits, counters.misses, .{});
+            }
+        }
     }
 
     /// Report an error encountered when applying a policy.
@@ -328,6 +387,12 @@ pub const PolicyRegistry = struct {
             self.allocator.free(key.*);
         }
         self.providers.deinit(self.allocator);
+
+        // Free subscription contexts
+        for (self.subscriptions.items) |sub| {
+            self.allocator.destroy(sub);
+        }
+        self.subscriptions.deinit(self.allocator);
 
         // Free all pending snapshots (force cleanup, no grace period on shutdown)
         for (self.pending_snapshots.items) |pending| {
@@ -662,107 +727,7 @@ pub const PolicyRegistry = struct {
 const testing = std.testing;
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
-
-/// Test policy provider that can be configured to emit policies on demand
-/// Implements the PolicyProvider interface for integration testing
-pub const TestPolicyProvider = struct {
-    allocator: std.mem.Allocator,
-    id: []const u8,
-    source_type: SourceType,
-    policies: std.ArrayListUnmanaged(Policy),
-    callbacks: std.ArrayListUnmanaged(PolicyCallback),
-
-    pub fn init(allocator: std.mem.Allocator, id: []const u8, source_type: SourceType) TestPolicyProvider {
-        return .{
-            .allocator = allocator,
-            .id = id,
-            .source_type = source_type,
-            .policies = .empty,
-            .callbacks = .empty,
-        };
-    }
-
-    pub fn deinit(self: *TestPolicyProvider) void {
-        for (self.policies.items) |*policy| {
-            policy.deinit(self.allocator);
-        }
-        self.policies.deinit(self.allocator);
-        self.callbacks.deinit(self.allocator);
-    }
-
-    /// Get the unique identifier for this provider
-    pub fn getId(self: *TestPolicyProvider) []const u8 {
-        return self.id;
-    }
-
-    /// Add a policy to the provider's set
-    pub fn addPolicy(self: *TestPolicyProvider, policy: Policy) !void {
-        const policy_copy = try policy.dupe(self.allocator);
-        try self.policies.append(self.allocator, policy_copy);
-    }
-
-    /// Remove a policy by name
-    pub fn removePolicy(self: *TestPolicyProvider, name: []const u8) void {
-        for (self.policies.items, 0..) |*policy, i| {
-            if (std.mem.eql(u8, policy.name, name)) {
-                policy.deinit(self.allocator);
-                _ = self.policies.swapRemove(i);
-                return;
-            }
-        }
-    }
-
-    /// Clear all policies
-    pub fn clearPolicies(self: *TestPolicyProvider) void {
-        for (self.policies.items) |*policy| {
-            policy.deinit(self.allocator);
-        }
-        self.policies.clearRetainingCapacity();
-    }
-
-    /// Notify all subscribers of the current policy set
-    pub fn notifySubscribers(self: *TestPolicyProvider) !void {
-        const update = PolicyUpdate{
-            .policies = self.policies.items,
-            .provider_id = self.id,
-        };
-        for (self.callbacks.items) |callback| {
-            try callback.call(update);
-        }
-    }
-
-    /// Subscribe to policy updates (PolicyProvider interface)
-    pub fn subscribe(self: *TestPolicyProvider, callback: PolicyCallback) !void {
-        try self.callbacks.append(self.allocator, callback);
-        // Immediately notify with current policies
-        const update = PolicyUpdate{
-            .policies = self.policies.items,
-            .provider_id = self.id,
-        };
-        try callback.call(update);
-    }
-
-    /// Record policy errors (no-op for tests)
-    pub fn recordPolicyError(self: *TestPolicyProvider, policy_id: []const u8, error_message: []const u8) void {
-        _ = self;
-        _ = policy_id;
-        _ = error_message;
-    }
-
-    /// Record policy stats (no-op for tests)
-    pub fn recordPolicyStats(self: *TestPolicyProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: policy_provider.TransformResult) void {
-        _ = self;
-        _ = policy_id;
-        _ = hits;
-        _ = misses;
-        _ = transform_result;
-    }
-
-    /// Get as PolicyProvider interface
-    pub fn provider(self: *TestPolicyProvider) policy_provider.PolicyProvider {
-        return policy_provider.PolicyProvider.init(self);
-    }
-};
+const TestProvider = policy_types.TestProvider;
 
 /// Helper to create a test policy with minimal required fields
 fn createTestPolicy(
@@ -1095,13 +1060,13 @@ test "PolicyRegistry: clearProvider increments version" {
 }
 
 // -----------------------------------------------------------------------------
-// TestPolicyProvider Integration Tests
+// TestProvider Integration Tests
 // -----------------------------------------------------------------------------
 
-test "TestPolicyProvider: basic functionality" {
+test "TestProvider: basic functionality" {
     const allocator = testing.allocator;
 
-    var prov = TestPolicyProvider.init(allocator, "file-provider", .file);
+    var prov = TestProvider.init(allocator, "file-provider", .file);
     defer prov.deinit();
 
     // Add a policy
@@ -1116,7 +1081,7 @@ test "TestPolicyProvider: basic functionality" {
     try testing.expectEqual(@as(usize, 0), prov.policies.items.len);
 }
 
-test "TestPolicyProvider: integrates with PolicyRegistry" {
+test "TestProvider: integrates with PolicyRegistry" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1124,7 +1089,7 @@ test "TestPolicyProvider: integrates with PolicyRegistry" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var file_provider = TestPolicyProvider.init(allocator, "file-provider", .file);
+    var file_provider = TestProvider.init(allocator, "file-provider", .file);
     defer file_provider.deinit();
 
     // Add policy to provider
@@ -1159,7 +1124,7 @@ test "TestPolicyProvider: integrates with PolicyRegistry" {
     try testing.expectEqualStrings("provider-policy", snapshot.?.policies[0].name);
 }
 
-test "TestPolicyProvider: multiple providers with different sources" {
+test "TestProvider: multiple providers with different sources" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1167,10 +1132,10 @@ test "TestPolicyProvider: multiple providers with different sources" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var file_provider = TestPolicyProvider.init(allocator, "file-provider", .file);
+    var file_provider = TestProvider.init(allocator, "file-provider", .file);
     defer file_provider.deinit();
 
-    var http_provider = TestPolicyProvider.init(allocator, "http-provider", .http);
+    var http_provider = TestProvider.init(allocator, "http-provider", .http);
     defer http_provider.deinit();
 
     // Add policies to providers
@@ -1214,7 +1179,7 @@ test "TestPolicyProvider: multiple providers with different sources" {
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
 }
 
-test "TestPolicyProvider: notifySubscribers updates registry" {
+test "TestProvider: notifySubscribers updates registry" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1222,7 +1187,7 @@ test "TestPolicyProvider: notifySubscribers updates registry" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var prov = TestPolicyProvider.init(allocator, "file-provider", .file);
+    var prov = TestProvider.init(allocator, "file-provider", .file);
     defer prov.deinit();
 
     // Create and subscribe callback
@@ -1274,7 +1239,7 @@ test "TestPolicyProvider: notifySubscribers updates registry" {
     try testing.expectEqualStrings("policy-2", snapshot.?.policies[0].name);
 }
 
-test "TestPolicyProvider: HTTP provider overrides file provider" {
+test "TestProvider: HTTP provider overrides file provider" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1282,10 +1247,10 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var file_provider = TestPolicyProvider.init(allocator, "file-provider", .file);
+    var file_provider = TestProvider.init(allocator, "file-provider", .file);
     defer file_provider.deinit();
 
-    var http_provider = TestPolicyProvider.init(allocator, "http-provider", .http);
+    var http_provider = TestProvider.init(allocator, "http-provider", .http);
     defer http_provider.deinit();
 
     // Create callbacks with source types
@@ -1585,78 +1550,6 @@ test "PolicySnapshot: indices update when policies change" {
 // Policy Error Routing Tests
 // -----------------------------------------------------------------------------
 
-/// Mock provider that records errors for testing
-const MockErrorProvider = struct {
-    recorded_errors: std.ArrayListUnmanaged(struct { policy_id: []const u8, message: []const u8 }),
-    allocator: std.mem.Allocator,
-    id: []const u8,
-
-    fn init(allocator: std.mem.Allocator, id: []const u8) MockErrorProvider {
-        return .{
-            .recorded_errors = .{},
-            .allocator = allocator,
-            .id = id,
-        };
-    }
-
-    pub fn getId(self: *MockErrorProvider) []const u8 {
-        return self.id;
-    }
-
-    // Must be pub for PolicyProvider.init to find it
-    pub fn deinit(self: *MockErrorProvider) void {
-        for (self.recorded_errors.items) |entry| {
-            self.allocator.free(entry.policy_id);
-            self.allocator.free(entry.message);
-        }
-        self.recorded_errors.deinit(self.allocator);
-    }
-
-    pub fn subscribe(self: *MockErrorProvider, callback: PolicyCallback) !void {
-        _ = self;
-        _ = callback;
-    }
-
-    pub fn recordPolicyError(self: *MockErrorProvider, policy_id: []const u8, error_message: []const u8) void {
-        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
-        const msg_copy = self.allocator.dupe(u8, error_message) catch {
-            self.allocator.free(id_copy);
-            return;
-        };
-        self.recorded_errors.append(self.allocator, .{
-            .policy_id = id_copy,
-            .message = msg_copy,
-        }) catch {
-            self.allocator.free(id_copy);
-            self.allocator.free(msg_copy);
-        };
-    }
-
-    pub fn recordPolicyStats(self: *MockErrorProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: policy_provider.TransformResult) void {
-        // No-op for mock - stats tracking not needed for error tests
-        _ = self;
-        _ = policy_id;
-        _ = hits;
-        _ = misses;
-        _ = transform_result;
-    }
-
-    fn getErrorCount(self: *MockErrorProvider) usize {
-        return self.recorded_errors.items.len;
-    }
-
-    fn hasError(self: *MockErrorProvider, policy_id: []const u8, message: []const u8) bool {
-        for (self.recorded_errors.items) |entry| {
-            if (std.mem.eql(u8, entry.policy_id, policy_id) and
-                std.mem.eql(u8, entry.message, message))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-};
-
 test "PolicyRegistry: registerProvider and recordPolicyError routes to correct provider" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
@@ -1664,19 +1557,16 @@ test "PolicyRegistry: registerProvider and recordPolicyError routes to correct p
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    // Create mock providers
-    var file_mock = MockErrorProvider.init(allocator, "file-provider");
+    // Create test providers that record errors
+    var file_mock = TestProvider.init(allocator, "file-provider", .file);
     defer file_mock.deinit();
 
-    var http_mock = MockErrorProvider.init(allocator, "http-provider");
+    var http_mock = TestProvider.init(allocator, "http-provider", .http);
     defer http_mock.deinit();
 
     // Register providers
-    var file_provider = policy_provider.PolicyProvider.init(&file_mock);
-    var http_provider = policy_provider.PolicyProvider.init(&http_mock);
-
-    try registry.registerProvider(&file_provider);
-    try registry.registerProvider(&http_provider);
+    try registry.registerProvider(file_mock.provider());
+    try registry.registerProvider(http_mock.provider());
 
     // Add policies from different sources
     var file_policy = try createTestPolicy(allocator, "file-policy-1");
@@ -1711,11 +1601,10 @@ test "PolicyRegistry: recordPolicyError for unknown policy does not route to pro
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var mock = MockErrorProvider.init(allocator, "file-provider");
+    var mock = TestProvider.init(allocator, "file-provider", .file);
     defer mock.deinit();
 
-    var provider = policy_provider.PolicyProvider.init(&mock);
-    try registry.registerProvider(&provider);
+    try registry.registerProvider(mock.provider());
 
     // Add a real policy so we can test error routing works
     var real_policy = try createTestPolicy(allocator, "real-policy");
@@ -1737,11 +1626,10 @@ test "PolicyRegistry: multiple errors for same policy accumulate" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var mock = MockErrorProvider.init(allocator, "file-provider");
+    var mock = TestProvider.init(allocator, "file-provider", .file);
     defer mock.deinit();
 
-    var provider = policy_provider.PolicyProvider.init(&mock);
-    try registry.registerProvider(&provider);
+    try registry.registerProvider(mock.provider());
 
     var policy = try createTestPolicy(allocator, "error-prone-policy");
     defer freeTestPolicy(allocator, &policy);

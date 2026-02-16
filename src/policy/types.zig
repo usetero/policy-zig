@@ -1,6 +1,8 @@
 const std = @import("std");
 const proto = @import("proto");
 const provider_http = @import("./provider_http.zig");
+const provider_file = @import("./provider_file.zig");
+const policy_provider = @import("./provider.zig");
 
 pub const Header = provider_http.Header;
 pub const PolicyStage = proto.policy.PolicyStage;
@@ -436,5 +438,207 @@ pub const TransformResult = struct {
 
     pub fn totalAttempted(self: TransformResult) usize {
         return self.removes_attempted + self.redacts_attempted + self.renames_attempted + self.adds_attempted;
+    }
+};
+
+// =============================================================================
+// Provider - Tagged union over concrete provider types
+// =============================================================================
+
+const Policy = proto.policy.Policy;
+const SourceType = @import("./source.zig").SourceType;
+const PolicyCallback = policy_provider.PolicyCallback;
+const PolicyUpdate = policy_provider.PolicyUpdate;
+
+/// Provider is a tagged union over all concrete provider types.
+pub const Provider = union(enum) {
+    file: *provider_file.FileProvider,
+    http: *provider_http.HttpProvider,
+    testing: *TestProvider,
+
+    pub fn getId(self: Provider) []const u8 {
+        return switch (self) {
+            inline else => |p| p.getId(),
+        };
+    }
+
+    pub fn subscribe(self: Provider, callback: PolicyCallback) !void {
+        return switch (self) {
+            inline else => |p| p.subscribe(callback),
+        };
+    }
+
+    pub fn recordPolicyError(self: Provider, policy_id: []const u8, error_message: []const u8) void {
+        switch (self) {
+            inline else => |p| p.recordPolicyError(policy_id, error_message),
+        }
+    }
+
+    pub fn recordPolicyStats(self: Provider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+        switch (self) {
+            inline else => |p| p.recordPolicyStats(policy_id, hits, misses, transform_result),
+        }
+    }
+
+    pub fn sourceType(self: Provider) SourceType {
+        return switch (self) {
+            .file => .file,
+            .http => .http,
+            .testing => .file,
+        };
+    }
+
+    pub fn deinit(self: Provider) void {
+        switch (self) {
+            inline else => |p| p.deinit(),
+        }
+    }
+};
+
+/// Test provider for use in unit/integration tests.
+pub const TestProvider = struct {
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    source_type: SourceType,
+    policies: std.ArrayListUnmanaged(Policy),
+    callbacks: std.ArrayListUnmanaged(PolicyCallback),
+    recorded_errors: std.ArrayListUnmanaged(struct { policy_id: []const u8, message: []const u8 }),
+    recorded_stats: std.ArrayListUnmanaged(StatsCall),
+
+    pub const StatsCall = struct {
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, id: []const u8, source_type: SourceType) TestProvider {
+        return .{
+            .allocator = allocator,
+            .id = id,
+            .source_type = source_type,
+            .policies = .empty,
+            .callbacks = .empty,
+            .recorded_errors = .empty,
+            .recorded_stats = .empty,
+        };
+    }
+
+    pub fn deinit(self: *TestProvider) void {
+        for (self.policies.items) |*p| {
+            p.deinit(self.allocator);
+        }
+        self.policies.deinit(self.allocator);
+        self.callbacks.deinit(self.allocator);
+        for (self.recorded_errors.items) |entry| {
+            self.allocator.free(entry.policy_id);
+            self.allocator.free(entry.message);
+        }
+        self.recorded_errors.deinit(self.allocator);
+        for (self.recorded_stats.items) |call| {
+            self.allocator.free(call.policy_id);
+        }
+        self.recorded_stats.deinit(self.allocator);
+    }
+
+    pub fn getId(self: *TestProvider) []const u8 {
+        return self.id;
+    }
+
+    pub fn addPolicy(self: *TestProvider, policy: Policy) !void {
+        const policy_copy = try policy.dupe(self.allocator);
+        try self.policies.append(self.allocator, policy_copy);
+    }
+
+    pub fn removePolicy(self: *TestProvider, name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.policies.items.len) {
+            if (std.mem.eql(u8, self.policies.items[i].name, name)) {
+                var removed = self.policies.orderedRemove(i);
+                removed.deinit(self.allocator);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn clearPolicies(self: *TestProvider) void {
+        for (self.policies.items) |*p| {
+            p.deinit(self.allocator);
+        }
+        self.policies.clearRetainingCapacity();
+    }
+
+    pub fn notifySubscribers(self: *TestProvider) !void {
+        const update = PolicyUpdate{
+            .policies = self.policies.items,
+            .provider_id = self.id,
+        };
+        for (self.callbacks.items) |cb| {
+            try cb.call(update);
+        }
+    }
+
+    pub fn subscribe(self: *TestProvider, callback: PolicyCallback) !void {
+        try self.callbacks.append(self.allocator, callback);
+        try callback.call(.{
+            .policies = self.policies.items,
+            .provider_id = self.id,
+        });
+    }
+
+    pub fn recordPolicyError(self: *TestProvider, policy_id: []const u8, error_message: []const u8) void {
+        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
+        const msg_copy = self.allocator.dupe(u8, error_message) catch {
+            self.allocator.free(id_copy);
+            return;
+        };
+        self.recorded_errors.append(self.allocator, .{
+            .policy_id = id_copy,
+            .message = msg_copy,
+        }) catch {
+            self.allocator.free(id_copy);
+            self.allocator.free(msg_copy);
+        };
+    }
+
+    pub fn recordPolicyStats(self: *TestProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
+        self.recorded_stats.append(self.allocator, .{
+            .policy_id = id_copy,
+            .hits = hits,
+            .misses = misses,
+            .transform_result = transform_result,
+        }) catch {
+            self.allocator.free(id_copy);
+        };
+    }
+
+    pub fn provider(self: *TestProvider) Provider {
+        return .{ .testing = self };
+    }
+
+    pub fn getErrorCount(self: *TestProvider) usize {
+        return self.recorded_errors.items.len;
+    }
+
+    pub fn hasError(self: *TestProvider, policy_id: []const u8, message: []const u8) bool {
+        for (self.recorded_errors.items) |entry| {
+            if (std.mem.eql(u8, entry.policy_id, policy_id) and
+                std.mem.eql(u8, entry.message, message))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn getStats(self: *const TestProvider, policy_id: []const u8) ?StatsCall {
+        for (self.recorded_stats.items) |call| {
+            if (std.mem.eql(u8, call.policy_id, policy_id)) {
+                return call;
+            }
+        }
+        return null;
     }
 };
