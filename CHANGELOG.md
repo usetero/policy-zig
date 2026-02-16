@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/usetero/policy-zig/compare/v0.1.4...v0.1.5) (2026-02-16)
+
+
+### Bug Fixes
+
+* support all the fields ([#15](https://github.com/usetero/policy-zig/issues/15)) ([5ae7568](https://github.com/usetero/policy-zig/commit/5ae75684cc5c3eb74e9d696008fee73b4681e9c9))
+
 ## [0.1.4](https://github.com/usetero/policy-zig/compare/v0.1.3...v0.1.4) (2026-02-13)
 
 
