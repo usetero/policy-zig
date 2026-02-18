@@ -643,6 +643,436 @@ test "HttpProvider: clearPolicyStatuses resets all counters" {
     }
 }
 
+// =============================================================================
+// SyncResponse JSON deserialization tests
+//
+// These tests verify that SyncResponse.jsonDecode correctly parses the proto
+// JSON format returned by the HTTP sync server (Go protojson with
+// UseEnumNumbers: true, EmitDefaultValues: true). Each test corresponds to
+// a failing conformance test case from policy-conformance/testcases/.
+// =============================================================================
+
+test "SyncResponse JSON: metrics_aggregation_temporality" {
+    const allocator = testing.allocator;
+
+    // Proto JSON as produced by Go protojson with UseEnumNumbers: true.
+    // aggregationTemporality: 1 = AGGREGATION_TEMPORALITY_DELTA
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "drop-delta-metrics",
+        \\      "name": "Drop metrics with delta aggregation temporality",
+        \\      "enabled": true,
+        \\      "metric": {
+        \\        "match": [
+        \\          { "aggregationTemporality": 1, "exists": true }
+        \\        ],
+        \\        "keep": false
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "abc123",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 1), response.policies.items.len);
+
+    const p = response.policies.items[0];
+    try testing.expectEqualStrings("drop-delta-metrics", p.id);
+    try testing.expect(p.enabled);
+
+    // Verify metric target
+    try testing.expect(p.target != null);
+    const metric = p.target.?.metric;
+    try testing.expect(!metric.keep);
+    try testing.expectEqual(@as(usize, 1), metric.match.items.len);
+
+    // Verify matcher: field = aggregation_temporality(DELTA), match = exists(true)
+    const matcher = metric.match.items[0];
+    try testing.expect(matcher.field != null);
+    try testing.expectEqual(proto.policy.AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, matcher.field.?.aggregation_temporality);
+    try testing.expect(matcher.match != null);
+    try testing.expect(matcher.match.?.exists);
+}
+
+test "SyncResponse JSON: metrics_type_filter" {
+    const allocator = testing.allocator;
+
+    // metricType: 1 = METRIC_TYPE_GAUGE
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "drop-gauges",
+        \\      "name": "Drop all gauge metrics",
+        \\      "enabled": true,
+        \\      "metric": {
+        \\        "match": [
+        \\          { "metricType": 1, "exists": true }
+        \\        ],
+        \\        "keep": false
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "def456",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 1), response.policies.items.len);
+
+    const p = response.policies.items[0];
+    try testing.expectEqualStrings("drop-gauges", p.id);
+
+    const metric = p.target.?.metric;
+    try testing.expect(!metric.keep);
+    try testing.expectEqual(@as(usize, 1), metric.match.items.len);
+
+    const matcher = metric.match.items[0];
+    try testing.expect(matcher.field != null);
+    try testing.expectEqual(proto.policy.MetricType.METRIC_TYPE_GAUGE, matcher.field.?.metric_type);
+    try testing.expect(matcher.match != null);
+    try testing.expect(matcher.match.?.exists);
+}
+
+test "SyncResponse JSON: traces_span_kind" {
+    const allocator = testing.allocator;
+
+    // spanKind: 1 = SPAN_KIND_INTERNAL
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "drop-internal-spans",
+        \\      "name": "Drop internal spans (0% sampling)",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "spanKind": 1, "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 0.0
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "ghi789",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 1), response.policies.items.len);
+
+    const p = response.policies.items[0];
+    try testing.expectEqualStrings("drop-internal-spans", p.id);
+
+    const trace = p.target.?.trace;
+    try testing.expect(trace.keep != null);
+    try testing.expectEqual(@as(f32, 0.0), trace.keep.?.percentage);
+    try testing.expectEqual(@as(usize, 1), trace.match.items.len);
+
+    const matcher = trace.match.items[0];
+    try testing.expect(matcher.field != null);
+    try testing.expectEqual(proto.policy.SpanKind.SPAN_KIND_INTERNAL, matcher.field.?.span_kind);
+    try testing.expect(matcher.match != null);
+    try testing.expect(matcher.match.?.exists);
+}
+
+test "SyncResponse JSON: traces_keep_100pct" {
+    const allocator = testing.allocator;
+
+    // spanStatus: 2 = SPAN_STATUS_CODE_ERROR
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "keep-error-spans",
+        \\      "name": "Keep all error spans (100% sampling)",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "spanStatus": 2, "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 100.0
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "jkl012",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 1), response.policies.items.len);
+
+    const p = response.policies.items[0];
+    try testing.expectEqualStrings("keep-error-spans", p.id);
+
+    const trace = p.target.?.trace;
+    try testing.expect(trace.keep != null);
+    try testing.expectEqual(@as(f32, 100.0), trace.keep.?.percentage);
+    try testing.expectEqual(@as(usize, 1), trace.match.items.len);
+
+    const matcher = trace.match.items[0];
+    try testing.expect(matcher.field != null);
+    try testing.expectEqual(proto.policy.SpanStatusCode.SPAN_STATUS_CODE_ERROR, matcher.field.?.span_status);
+    try testing.expect(matcher.match != null);
+    try testing.expect(matcher.match.?.exists);
+}
+
+test "SyncResponse JSON: traces_error_vs_health" {
+    const allocator = testing.allocator;
+
+    // Two policies: keep errors (100%) and drop health checks (0%)
+    // traceField: 1 = TRACE_FIELD_NAME
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "keep-error-spans",
+        \\      "name": "Keep all error spans (100% sampling)",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "spanStatus": 2, "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 100.0
+        \\        }
+        \\      }
+        \\    },
+        \\    {
+        \\      "id": "drop-health-checks",
+        \\      "name": "Drop health check spans (0% sampling)",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "traceField": 1, "exact": "GET /health" }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 0.0
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "mno345",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 2), response.policies.items.len);
+
+    // First policy: keep error spans
+    {
+        const p = response.policies.items[0];
+        try testing.expectEqualStrings("keep-error-spans", p.id);
+
+        const trace = p.target.?.trace;
+        try testing.expect(trace.keep != null);
+        try testing.expectEqual(@as(f32, 100.0), trace.keep.?.percentage);
+
+        const matcher = trace.match.items[0];
+        try testing.expectEqual(proto.policy.SpanStatusCode.SPAN_STATUS_CODE_ERROR, matcher.field.?.span_status);
+        try testing.expect(matcher.match.?.exists);
+    }
+
+    // Second policy: drop health checks
+    {
+        const p = response.policies.items[1];
+        try testing.expectEqualStrings("drop-health-checks", p.id);
+
+        const trace = p.target.?.trace;
+        try testing.expect(trace.keep != null);
+        try testing.expectEqual(@as(f32, 0.0), trace.keep.?.percentage);
+
+        const matcher = trace.match.items[0];
+        try testing.expectEqual(proto.policy.TraceField.TRACE_FIELD_NAME, matcher.field.?.trace_field);
+        try testing.expectEqualStrings("GET /health", matcher.match.?.exact);
+    }
+}
+
+test "SyncResponse JSON: traces_multiple_matchers" {
+    const allocator = testing.allocator;
+
+    // One policy with two matchers (ANDed): span_kind=INTERNAL + resource_attribute=frontend
+    // spanKind: 1 = SPAN_KIND_INTERNAL
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "drop-internal-frontend-spans",
+        \\      "name": "Drop internal spans from frontend service",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "spanKind": 1, "exists": true },
+        \\          { "resourceAttribute": { "path": ["service.name"] }, "exact": "frontend" }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 0.0
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "pqr678",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 1), response.policies.items.len);
+
+    const p = response.policies.items[0];
+    try testing.expectEqualStrings("drop-internal-frontend-spans", p.id);
+
+    const trace = p.target.?.trace;
+    try testing.expect(trace.keep != null);
+    try testing.expectEqual(@as(f32, 0.0), trace.keep.?.percentage);
+    try testing.expectEqual(@as(usize, 2), trace.match.items.len);
+
+    // First matcher: span_kind = INTERNAL
+    {
+        const matcher = trace.match.items[0];
+        try testing.expectEqual(proto.policy.SpanKind.SPAN_KIND_INTERNAL, matcher.field.?.span_kind);
+        try testing.expect(matcher.match.?.exists);
+    }
+
+    // Second matcher: resource_attribute = "service.name", exact = "frontend"
+    {
+        const matcher = trace.match.items[1];
+        const attr_path = matcher.field.?.resource_attribute;
+        try testing.expectEqual(@as(usize, 1), attr_path.path.items.len);
+        try testing.expectEqualStrings("service.name", attr_path.path.items[0]);
+        try testing.expectEqualStrings("frontend", matcher.match.?.exact);
+    }
+}
+
+test "SyncResponse JSON: traces_overlapping" {
+    const allocator = testing.allocator;
+
+    // Two overlapping policies: keep errors (100%) and drop health spans (0%)
+    const json_input =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "keep-all-errors",
+        \\      "name": "Keep all error spans",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "spanStatus": 2, "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 100.0
+        \\        }
+        \\      }
+        \\    },
+        \\    {
+        \\      "id": "drop-health-spans",
+        \\      "name": "Drop health check spans",
+        \\      "enabled": true,
+        \\      "trace": {
+        \\        "match": [
+        \\          { "traceField": 1, "contains": "health" }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 0.0
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "hash": "stu901",
+        \\  "syncTimestampUnixNano": "1000000",
+        \\  "recommendedSyncIntervalSeconds": 30,
+        \\  "syncType": 1,
+        \\  "errorMessage": ""
+        \\}
+    ;
+
+    protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
+    defer parsed.deinit();
+
+    const response = parsed.value;
+    try testing.expectEqual(@as(usize, 2), response.policies.items.len);
+
+    // First policy: keep all errors
+    {
+        const p = response.policies.items[0];
+        try testing.expectEqualStrings("keep-all-errors", p.id);
+
+        const trace = p.target.?.trace;
+        try testing.expectEqual(@as(f32, 100.0), trace.keep.?.percentage);
+
+        const matcher = trace.match.items[0];
+        try testing.expectEqual(proto.policy.SpanStatusCode.SPAN_STATUS_CODE_ERROR, matcher.field.?.span_status);
+        try testing.expect(matcher.match.?.exists);
+    }
+
+    // Second policy: drop health spans
+    {
+        const p = response.policies.items[1];
+        try testing.expectEqualStrings("drop-health-spans", p.id);
+
+        const trace = p.target.?.trace;
+        try testing.expectEqual(@as(f32, 0.0), trace.keep.?.percentage);
+
+        const matcher = trace.match.items[0];
+        try testing.expectEqual(proto.policy.TraceField.TRACE_FIELD_NAME, matcher.field.?.trace_field);
+        try testing.expectEqualStrings("health", matcher.match.?.contains);
+    }
+}
+
 test "HttpProvider: recordPolicyStats after clear starts fresh" {
     const allocator = testing.allocator;
 

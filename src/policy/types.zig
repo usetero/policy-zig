@@ -146,6 +146,13 @@ pub const FieldRef = union(enum) {
         };
     }
 
+    /// Check if this field ref is an enum-type field whose value is carried
+    /// in the field union itself (no separate match needed).
+    pub fn isEnumField(self: FieldRef) bool {
+        _ = self;
+        return false; // Log matchers have no enum-type fields
+    }
+
     /// Check if this field ref requires a key (attribute-based fields)
     pub fn isKeyed(self: FieldRef) bool {
         return switch (self) {
@@ -206,6 +213,15 @@ pub const MetricFieldRef = union(enum) {
             .scope_attribute => |v| .{ .scope_attribute = v },
             .metric_type => |v| .{ .metric_type = v },
             .aggregation_temporality => |v| .{ .aggregation_temporality = v },
+        };
+    }
+
+    /// Check if this field ref is an enum-type field whose value is carried
+    /// in the field union itself (no separate match needed).
+    pub fn isEnumField(self: MetricFieldRef) bool {
+        return switch (self) {
+            .metric_type, .aggregation_temporality => true,
+            .metric_field, .datapoint_attribute, .resource_attribute, .scope_attribute => false,
         };
     }
 
@@ -339,6 +355,15 @@ pub const TraceFieldRef = union(enum) {
             .event_name => |v| .{ .event_name = v },
             .event_attribute => |v| .{ .event_attribute = v },
             .link_trace_id => |v| .{ .link_trace_id = v },
+        };
+    }
+
+    /// Check if this field ref is an enum-type field whose value is carried
+    /// in the field union itself (no separate match needed).
+    pub fn isEnumField(self: TraceFieldRef) bool {
+        return switch (self) {
+            .span_kind, .span_status => true,
+            .trace_field, .span_attribute, .resource_attribute, .scope_attribute, .event_name, .event_attribute, .link_trace_id => false,
         };
     }
 
