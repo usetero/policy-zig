@@ -564,19 +564,43 @@ pub const PolicyEngine = struct {
     }
 
     /// Record stats for all matched policies using lock-free atomics.
-    /// Hit if policy's decision matches final decision, miss otherwise.
+    ///
+    /// Per spec:
+    /// - Record kept: all matching policies record a hit.
+    /// - Record dropped: the most restrictive matching policies record a hit,
+    ///   all other matching policies record a miss.
+    ///
+    /// Restrictiveness order: none > percentage/per_second/per_minute > all
     inline fn recordMatchedPolicyStats(
         self: *const Self,
         snapshot: *const PolicySnapshot,
         match_state: *const MatchState,
     ) void {
-        _ = self; // Observability bus not used for stats currently
-        for (0..match_state.matched_count) |i| {
-            const policy_index = match_state.matched_indices[i];
-            const policy_decision = match_state.matched_decisions[i];
+        _ = self;
+        if (match_state.matched_count == 0) return;
 
-            if (snapshot.getStats(policy_index)) |stats| {
-                if (policy_decision == match_state.decision) {
+        if (match_state.decision != .drop) {
+            // Record kept (or unset): all matching policies get a hit
+            for (0..match_state.matched_count) |i| {
+                if (snapshot.getStats(match_state.matched_indices[i])) |stats| {
+                    stats.addHit();
+                }
+            }
+            return;
+        }
+
+        // Record dropped: find the most restrictive keep value tier,
+        // give those policies hits, everyone else gets a miss.
+        // Uses KeepValue.restrictiveness(): none(0) > rate(1) > pct(2) > all(3)
+        var most_restrictive: u8 = 3; // start at least restrictive (all)
+        for (0..match_state.matched_count) |i| {
+            const level = match_state.matched_policies[i].keep.restrictiveness();
+            if (level < most_restrictive) most_restrictive = level;
+        }
+
+        for (0..match_state.matched_count) |i| {
+            if (snapshot.getStats(match_state.matched_indices[i])) |stats| {
+                if (match_state.matched_policies[i].keep.restrictiveness() == most_restrictive) {
                     stats.addHit();
                 } else {
                     stats.addMiss();
@@ -2473,6 +2497,176 @@ test "PolicyEngine stats: no match records no stats" {
     const stats = snapshot.getStats(0).?;
     try testing.expectEqual(@as(i64, 0), stats.hits.load(.monotonic));
     try testing.expectEqual(@as(i64, 0), stats.misses.load(.monotonic));
+}
+
+test "PolicyEngine stats: drop with none + percentage - only none gets hit" {
+    const allocator = testing.allocator;
+
+    // keep: none is more restrictive than keep: 1%
+    var none_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-none"),
+        .name = try allocator.dupe(u8, "drop-none"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    try none_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer none_policy.deinit(allocator);
+
+    // 1% will almost certainly drop (and none already forces drop)
+    var pct_policy = Policy{
+        .id = try allocator.dupe(u8, "sample-pct"),
+        .name = try allocator.dupe(u8, "sample-pct"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "1%") } },
+    };
+    try pct_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer pct_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ none_policy, pct_policy }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var test_log = TestLogContext{ .message = "an error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    const snapshot = registry.getSnapshot().?;
+
+    // keep: none (index 0) is most restrictive -> hit
+    const none_stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), none_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), none_stats.misses.load(.monotonic));
+
+    // keep: 1% (index 1) is less restrictive -> miss
+    const pct_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 0), pct_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), pct_stats.misses.load(.monotonic));
+}
+
+test "PolicyEngine stats: drop with percentage + all - percentage gets hit, all gets miss" {
+    const allocator = testing.allocator;
+
+    var all_policy = Policy{
+        .id = try allocator.dupe(u8, "keep-all"),
+        .name = try allocator.dupe(u8, "keep-all"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try all_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer all_policy.deinit(allocator);
+
+    // 0% always drops
+    var pct_policy = Policy{
+        .id = try allocator.dupe(u8, "sample-pct"),
+        .name = try allocator.dupe(u8, "sample-pct"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "0%") } },
+    };
+    try pct_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer pct_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ all_policy, pct_policy }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var test_log = TestLogContext{ .message = "an error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // 0% drops, so final decision is drop
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    const snapshot = registry.getSnapshot().?;
+
+    // keep: all (index 0) is least restrictive -> miss
+    const all_stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 0), all_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), all_stats.misses.load(.monotonic));
+
+    // keep: 0% (index 1) is most restrictive -> hit
+    const pct_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 1), pct_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), pct_stats.misses.load(.monotonic));
+}
+
+test "PolicyEngine stats: keep with percentage + all - both get hits" {
+    const allocator = testing.allocator;
+
+    var all_policy = Policy{
+        .id = try allocator.dupe(u8, "keep-all"),
+        .name = try allocator.dupe(u8, "keep-all"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try all_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer all_policy.deinit(allocator);
+
+    // 100% always keeps
+    var pct_policy = Policy{
+        .id = try allocator.dupe(u8, "sample-pct"),
+        .name = try allocator.dupe(u8, "sample-pct"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "100%") } },
+    };
+    try pct_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer pct_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ all_policy, pct_policy }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var test_log = TestLogContext{ .message = "an error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // Both keep, so final decision is keep
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+
+    const snapshot = registry.getSnapshot().?;
+
+    // Record kept: all matching policies get hits
+    const all_stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), all_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), all_stats.misses.load(.monotonic));
+
+    const pct_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 1), pct_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), pct_stats.misses.load(.monotonic));
 }
 
 // =============================================================================
