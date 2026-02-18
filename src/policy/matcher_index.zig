@@ -584,6 +584,26 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 return;
             };
 
+            // Enum-type fields (metric_type, aggregation_temporality, span_kind,
+            // span_status) carry their value in the field union itself. When the
+            // HTTP sync server serializes these via protobuf JSON it may omit the
+            // match oneof, so match arrives as null. Treat this as implicit
+            // exists=true so the matcher still fires.
+            if (matcher.match == null and field_ref.isEnumField()) {
+                self.bus.debug(MatcherDetail{
+                    .matcher_idx = matcher_idx,
+                    .regex = "",
+                    .negate = matcher.negate,
+                });
+                const matcher_key = MatcherKeyT{ .field = field_ref };
+                try self.addPattern(matcher_key, .{
+                    .pattern = "",
+                    .match_type = .exists,
+                    .case_insensitive = false,
+                }, matcher.negate, field_ref);
+                return;
+            }
+
             const m = matcher.match orelse {
                 self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
                 return;
@@ -1597,6 +1617,80 @@ test "LogMatcherIndex: exists=false matcher creates negated pattern" {
     try testing.expect(db != null);
     try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
     try testing.expectEqual(@as(usize, 0), db.?.positive_patterns.len);
+}
+
+test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
+    // When policies arrive via HTTP sync, the Go server leaves match=null
+    // for enum-type fields like metric_type. The matcher index should treat
+    // this as an implicit exists=true, matching the Go engine behavior.
+    const allocator = testing.allocator;
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init();
+
+    const policy = Policy{
+        .id = "drop-gauges",
+        .name = "Drop gauge metrics",
+        .enabled = true,
+        .target = .{
+            .metric = .{
+                .match = .{
+                    .items = @constCast(&[_]MetricMatcher{
+                        .{
+                            .field = .{ .metric_type = .METRIC_TYPE_GAUGE },
+                            .match = null, // <-- This is what the HTTP sync produces
+                            .negate = false,
+                            .case_insensitive = false,
+                        },
+                    }),
+                },
+                .keep = false,
+            },
+        },
+    };
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    // The index should have registered one policy with one matcher
+    try testing.expectEqual(@as(usize, 1), index.policies.len);
+    try testing.expectEqual(@as(u16, 1), index.policies[0].required_match_count);
+}
+
+test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
+    const allocator = testing.allocator;
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init();
+
+    const policy = Policy{
+        .id = "drop-internal-spans",
+        .name = "Drop internal spans",
+        .enabled = true,
+        .target = .{
+            .trace = .{
+                .match = .{
+                    .items = @constCast(&[_]TraceMatcher{
+                        .{
+                            .field = .{ .span_kind = .SPAN_KIND_INTERNAL },
+                            .match = null, // <-- HTTP sync produces this
+                            .negate = false,
+                            .case_insensitive = false,
+                        },
+                    }),
+                },
+            },
+        },
+    };
+
+    var index = try TraceMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    try testing.expectEqual(@as(u16, 1), index.policies[0].required_match_count);
 }
 
 test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
