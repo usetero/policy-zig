@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/usetero/policy-zig/compare/v0.1.7...v0.1.8) (2026-02-18)
+
+
+### Bug Fixes
+
+* accept null matchers ([#21](https://github.com/usetero/policy-zig/issues/21)) ([03a3ca0](https://github.com/usetero/policy-zig/commit/03a3ca059d0329239880e012d5883b75c5717600))
+
 ## [0.1.7](https://github.com/usetero/policy-zig/compare/v0.1.6...v0.1.7) (2026-02-16)
 
 
