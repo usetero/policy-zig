@@ -267,7 +267,7 @@ pub const KeepValue = union(enum) {
         };
     }
 
-    fn restrictiveness(self: KeepValue) u8 {
+    pub fn restrictiveness(self: KeepValue) u8 {
         // Lower rank = more restrictive
         // none: drop everything (most restrictive)
         // rate limit: keep up to N per time unit
