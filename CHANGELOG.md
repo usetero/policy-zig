@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/usetero/policy-zig/compare/v0.1.8...v0.1.9) (2026-02-18)
+
+
+### Bug Fixes
+
+* record hit correctly ([#23](https://github.com/usetero/policy-zig/issues/23)) ([7546e29](https://github.com/usetero/policy-zig/commit/7546e2910eb60125caa1829f4f971985fee9058b))
+
 ## [0.1.8](https://github.com/usetero/policy-zig/compare/v0.1.7...v0.1.8) (2026-02-18)
 
 
