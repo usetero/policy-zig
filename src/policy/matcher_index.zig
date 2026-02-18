@@ -1657,6 +1657,50 @@ test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
     try testing.expectEqual(@as(u16, 1), index.policies[0].required_match_count);
 }
 
+test "TraceMatcherIndex: span_kind null match with second resource_attribute matcher" {
+    // Mirrors traces_multiple_matchers conformance case: an enum field with
+    // null match (implicit exists) ANDed with a resource_attribute exact match.
+    const allocator = testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const policy = Policy{
+        .id = "drop-internal-frontend-spans",
+        .name = "Drop internal spans from frontend service",
+        .enabled = true,
+        .target = .{
+            .trace = .{
+                .match = .{
+                    .items = @constCast(&[_]TraceMatcher{
+                        .{
+                            .field = .{ .span_kind = .SPAN_KIND_INTERNAL },
+                            .match = null, // implicit exists via HTTP sync
+                            .negate = false,
+                            .case_insensitive = false,
+                        },
+                        .{
+                            .field = .{ .resource_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service.name"}) } } },
+                            .match = .{ .exact = "frontend" },
+                            .negate = false,
+                            .case_insensitive = false,
+                        },
+                    }),
+                },
+            },
+        },
+    };
+
+    var index = try TraceMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+    // Two matchers -> two databases, required_match_count = 2
+    try testing.expectEqual(@as(usize, 2), index.getDatabaseCount());
+    try testing.expectEqual(@as(u16, 2), index.policies[0].required_match_count);
+}
+
 test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
     const allocator = testing.allocator;
 
