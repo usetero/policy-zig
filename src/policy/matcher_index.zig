@@ -21,13 +21,13 @@ const std = @import("std");
 const proto = @import("proto");
 const hyperscan = @import("./hyperscan.zig");
 const policy_types = @import("./types.zig");
-const sampler_mod = @import("./sampler.zig");
+const probabilistic_sampler_mod = @import("./probabilistic_sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
 const o11y = @import("observability");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
-const Sampler = sampler_mod.Sampler;
+const ProbabilisticSampler = probabilistic_sampler_mod.ProbabilisticSampler;
 const RateLimiter = rate_limiter_mod.RateLimiter;
 
 const FieldRef = policy_types.FieldRef;
@@ -302,6 +302,9 @@ pub const PolicyInfo = struct {
     /// value is hashed for consistent sampling decisions (e.g., same trace_id always
     /// gets same decision). Only applicable for log policies with percentage keep.
     sample_key: ?LogSampleKey = null,
+    /// OTel-compliant probabilistic sampler. Pre-computed at index build time.
+    /// Set for trace and log policies with percentage keep.
+    sampler: ?ProbabilisticSampler = null,
 };
 
 // =============================================================================
@@ -744,6 +747,18 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             // Extract sample_key for log policies
             const sample_key: ?LogSampleKey = if (T == .log) target.sample_key else null;
 
+            // Build probabilistic sampler for percentage-based policies
+            const sampler: ?ProbabilisticSampler = switch (keep) {
+                .percentage => |pct| if (T == .trace) blk: {
+                    // Traces: init from TraceSamplingConfig (has mode, hash_seed, etc.)
+                    if (target.keep) |*keep_config| {
+                        break :blk ProbabilisticSampler.init(keep_config);
+                    }
+                    break :blk ProbabilisticSampler.init(null);
+                } else ProbabilisticSampler.initFromPercentage(pct),
+                else => null,
+            };
+
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
                 .index = self.policy_index,
@@ -753,6 +768,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .enabled = policy.enabled,
                 .rate_limiter = rate_limiter,
                 .sample_key = sample_key,
+                .sampler = sampler,
             });
 
             self.bus.debug(PolicyStored{
