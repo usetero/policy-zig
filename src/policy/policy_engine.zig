@@ -32,7 +32,6 @@ const matcher_index = @import("./matcher_index.zig");
 const policy_mod = @import("./root.zig");
 const policy_types = @import("./types.zig");
 const log_transform = @import("./log_transform.zig");
-const sampler_mod = @import("./sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
 
 const o11y = @import("observability");
@@ -45,7 +44,6 @@ const KeepValue = matcher_index.KeepValue;
 const PolicyIndex = matcher_index.PolicyIndex;
 const PolicyInfo = matcher_index.PolicyInfo;
 const MAX_POLICIES = matcher_index.MAX_POLICIES;
-const Sampler = sampler_mod.Sampler;
 const RateLimiter = rate_limiter_mod.RateLimiter;
 
 const MatcherDatabase = matcher_index.MatcherDatabase;
@@ -454,31 +452,27 @@ pub const PolicyEngine = struct {
         return state;
     }
 
-    /// Compute hash for deterministic sampling based on telemetry type and policy config.
-    /// - Traces: hash trace_id so all spans in a trace get the same sampling decision
-    /// - Logs with sample_key: hash the specified field value for consistent sampling
-    /// - Otherwise: use context pointer as fallback
-    inline fn getSamplingHash(
+    /// Get sampling input bytes for probabilistic sampling.
+    /// - Traces: raw trace ID bytes from field accessor
+    /// - Logs with sample_key: sample key field value from field accessor
+    /// - Otherwise: null (falls through to non-percentage keep handling)
+    inline fn getSamplingInput(
         comptime T: TelemetryType,
         ctx: *anyopaque,
         field_accessor: FieldAccessorType(T),
         policy_info: PolicyInfo,
-    ) u64 {
+    ) ?[]const u8 {
         if (T == .trace) {
             const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
-            if (field_accessor(ctx, trace_id_ref)) |trace_id_hex| {
-                return hashTraceId(trace_id_hex);
-            }
+            return field_accessor(ctx, trace_id_ref);
         } else if (T == .log) {
             if (policy_info.sample_key) |sample_key| {
                 if (FieldRef.fromSampleKeyField(sample_key.field)) |field_ref| {
-                    if (field_accessor(ctx, field_ref)) |value| {
-                        return hashString(value);
-                    }
+                    return field_accessor(ctx, field_ref);
                 }
             }
         }
-        return @intFromPtr(ctx);
+        return null;
     }
 
     /// Find all matching policies, apply sampling/rate limiting, and determine final decision.
@@ -508,10 +502,14 @@ pub const PolicyEngine = struct {
             if (scan_state.match_counts[policy_index] == policy_info.required_match_count) {
                 self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
 
-                const hash_input = getSamplingHash(T, ctx, field_accessor, policy_info);
-
                 // Apply sampling/rate limiting to get this policy's decision
-                const decision = applyKeepValue(policy_info, hash_input);
+                const decision = blk: {
+                    if (policy_info.sampler) |s| {
+                        const input = getSamplingInput(T, ctx, field_accessor, policy_info) orelse "";
+                        break :blk if (s.shouldKeep(input)) FilterDecision.keep else FilterDecision.drop;
+                    }
+                    break :blk applyKeepValue(policy_info);
+                };
 
                 if (state.matched_count < policy_id_buf.len) {
                     policy_id_buf[state.matched_count] = policy_info.id;
@@ -609,19 +607,13 @@ pub const PolicyEngine = struct {
         }
     }
 
-    /// Apply policy's keep value with sampling/rate limiting to get decision.
-    /// - none: always drop
-    /// - all: always keep
-    /// - percentage: hash-based deterministic sampling
-    /// - per_second/per_minute: uses the policy's RateLimiter
-    fn applyKeepValue(policy_info: PolicyInfo, hash_input: u64) FilterDecision {
+    /// Apply policy's keep value for non-percentage policies.
+    /// Percentage sampling is handled by ProbabilisticSampler in findMatchingPolicies.
+    fn applyKeepValue(policy_info: PolicyInfo) FilterDecision {
         return switch (policy_info.keep) {
             .none => .drop,
             .all => .keep,
-            .percentage => |pct| {
-                const sampler = Sampler{ .percentage = pct };
-                return if (sampler.shouldKeep(hash_input)) .keep else .drop;
-            },
+            .percentage => .keep, // Should not reach here; handled by ProbabilisticSampler
             .per_second, .per_minute => {
                 if (policy_info.rate_limiter) |rl| {
                     return if (rl.shouldKeep()) .keep else .drop;
@@ -631,48 +623,6 @@ pub const PolicyEngine = struct {
         };
     }
 };
-
-/// Hash a trace ID hex string to u64 for deterministic sampling.
-/// This ensures all spans with the same trace_id get the same sampling decision.
-///
-/// Following OTel probability sampling spec, we use the rightmost 56 bits
-/// of the trace ID for randomness. For a 32-char hex string (16 bytes),
-/// we use the last 14 hex chars (56 bits).
-fn hashTraceId(trace_id_hex: []const u8) u64 {
-    if (trace_id_hex.len == 0) return 0;
-
-    var hash: u64 = 0;
-
-    // Use the last 14 hex characters (56 bits) if available
-    // This follows OTel spec which uses rightmost bits for randomness
-    const start = if (trace_id_hex.len > 14) trace_id_hex.len - 14 else 0;
-
-    for (trace_id_hex[start..]) |c| {
-        const nibble: u64 = switch (c) {
-            '0'...'9' => c - '0',
-            'a'...'f' => c - 'a' + 10,
-            'A'...'F' => c - 'A' + 10,
-            else => 0,
-        };
-        hash = (hash << 4) | nibble;
-    }
-
-    return hash;
-}
-
-/// Hash a string value for deterministic sampling.
-/// Uses FNV-1a for good distribution and speed.
-fn hashString(s: []const u8) u64 {
-    if (s.len == 0) return 0;
-
-    // FNV-1a 64-bit
-    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    for (s) |byte| {
-        hash ^= byte;
-        hash *%= 0x100000001b3; // FNV prime
-    }
-    return hash;
-}
 
 // =============================================================================
 // Tests
@@ -3804,15 +3754,3 @@ test "PolicyEngine: sample_key missing field falls back to default" {
     try testing.expect(result.decision == .keep or result.decision == .drop);
 }
 
-test "hashString: deterministic" {
-    const hash1 = hashString("trace-abc-123");
-    const hash2 = hashString("trace-abc-123");
-    const hash3 = hashString("trace-xyz-789");
-
-    try testing.expectEqual(hash1, hash2);
-    try testing.expect(hash1 != hash3);
-}
-
-test "hashString: empty string" {
-    try testing.expectEqual(@as(u64, 0), hashString(""));
-}

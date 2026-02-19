@@ -1,10 +1,11 @@
-//! Probabilistic Trace Sampler
+//! Probabilistic Sampler
 //!
-//! Implements the OpenTelemetry probability sampling specification:
+//! Implements the OpenTelemetry consistent probability sampling specification:
 //! https://opentelemetry.io/docs/specs/otel/trace/tracestate-probability-sampling/
 //!
-//! The sampling decision is based on comparing a 56-bit randomness value (R) against
-//! a rejection threshold (T). If R >= T, the span is kept; otherwise it is dropped.
+//! Used for both trace and log sampling. The sampling decision is based on
+//! comparing a 56-bit randomness value (R) against a rejection threshold (T).
+//! If R >= T, the item is kept; otherwise it is dropped.
 //!
 //! ## Threshold Calculation
 //!
@@ -18,9 +19,10 @@
 //!
 //! ## Randomness Value (R)
 //!
-//! The randomness value is derived from the trace_id:
-//!   - For hash_seed mode: R = hash(trace_id, seed) & 0x00FFFFFFFFFFFFFF
-//!   - For proportional/equalizing modes: R is extracted from existing tracestate
+//! The randomness value is derived from the input bytes:
+//!   - For 16-byte trace IDs: uses last 7 bytes (OTel spec)
+//!   - For shorter inputs: hashes all bytes
+//!   - Mixed with hash_seed and splitmix64 for uniform distribution
 //!
 //! ## Tracestate Handling
 //!
@@ -43,9 +45,10 @@ const DEFAULT_PRECISION: u32 = 4;
 /// Default hash seed
 const DEFAULT_HASH_SEED: u32 = 0;
 
-/// Probabilistic trace sampler following OTel probability sampling spec.
-pub const TraceSampler = struct {
-    /// Rejection threshold (T). Spans with R >= T are kept.
+/// Probabilistic sampler following OTel consistent probability sampling spec.
+/// Used for both trace and log percentage-based sampling.
+pub const ProbabilisticSampler = struct {
+    /// Rejection threshold (T). Items with R >= T are kept.
     threshold: u64,
     /// Sampling mode
     mode: SamplingMode,
@@ -58,8 +61,8 @@ pub const TraceSampler = struct {
     /// Original percentage for reference
     percentage: f32,
 
-    /// Initialize sampler from TraceSamplingConfig
-    pub fn init(config: ?*const TraceSamplingConfig) TraceSampler {
+    /// Initialize sampler from TraceSamplingConfig (used for trace policies).
+    pub fn init(config: ?*const TraceSamplingConfig) ProbabilisticSampler {
         if (config == null) {
             // No config = keep all
             return .{
@@ -88,6 +91,24 @@ pub const TraceSampler = struct {
         };
     }
 
+    /// Initialize sampler from a simple percentage (used for log policies).
+    pub fn initFromPercentage(percentage: u8) ProbabilisticSampler {
+        return .{
+            .threshold = calculateThreshold(@floatFromInt(percentage)),
+            .mode = .SAMPLING_MODE_HASH_SEED,
+            .hash_seed = DEFAULT_HASH_SEED,
+            .precision = DEFAULT_PRECISION,
+            .fail_closed = true,
+            .percentage = @floatFromInt(percentage),
+        };
+    }
+
+    /// Simple keep/drop decision on raw input bytes.
+    /// For callers that don't need tracestate or SamplingResult.
+    pub fn shouldKeep(self: ProbabilisticSampler, input: []const u8) bool {
+        return self.sample(input, "").keep;
+    }
+
     /// Calculate threshold from percentage
     /// T = floor((1 - percentage/100) * 2^56)
     fn calculateThreshold(percentage: f32) u64 {
@@ -99,12 +120,12 @@ pub const TraceSampler = struct {
         return @intFromFloat(@min(@as(f64, @floatFromInt(MAX_56BIT)), @max(0.0, threshold_f)));
     }
 
-    /// Make sampling decision for a span.
+    /// Make sampling decision for an item.
     ///
     /// Returns a SamplingResult with:
-    /// - keep: whether to keep the span
+    /// - keep: whether to keep the item
     /// - new_threshold: threshold to write to tracestate (if sampling)
-    pub fn sample(self: TraceSampler, trace_id: []const u8, tracestate: []const u8) SamplingResult {
+    pub fn sample(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
         // Edge cases
         if (self.percentage >= 100.0) {
             return .{ .keep = true, .new_threshold = null };
@@ -114,16 +135,16 @@ pub const TraceSampler = struct {
         }
 
         return switch (self.mode) {
-            .SAMPLING_MODE_UNSPECIFIED, .SAMPLING_MODE_HASH_SEED => self.sampleHashSeed(trace_id),
-            .SAMPLING_MODE_PROPORTIONAL => self.sampleProportional(trace_id, tracestate),
-            .SAMPLING_MODE_EQUALIZING => self.sampleEqualizing(trace_id, tracestate),
-            _ => self.sampleHashSeed(trace_id), // Unknown mode defaults to hash_seed
+            .SAMPLING_MODE_UNSPECIFIED, .SAMPLING_MODE_HASH_SEED => self.sampleHashSeed(input),
+            .SAMPLING_MODE_PROPORTIONAL => self.sampleProportional(input, tracestate),
+            .SAMPLING_MODE_EQUALIZING => self.sampleEqualizing(input, tracestate),
+            _ => self.sampleHashSeed(input), // Unknown mode defaults to hash_seed
         };
     }
 
-    /// Hash seed mode: deterministic sampling based on trace_id hash
-    fn sampleHashSeed(self: TraceSampler, trace_id: []const u8) SamplingResult {
-        const r = self.computeRandomness(trace_id);
+    /// Hash seed mode: deterministic sampling based on input hash
+    fn sampleHashSeed(self: ProbabilisticSampler, input: []const u8) SamplingResult {
+        const r = self.computeRandomness(input);
         const keep = r >= self.threshold;
         return .{
             .keep = keep,
@@ -132,7 +153,7 @@ pub const TraceSampler = struct {
     }
 
     /// Proportional mode: adjust sampling relative to existing probability
-    fn sampleProportional(self: TraceSampler, trace_id: []const u8, tracestate: []const u8) SamplingResult {
+    fn sampleProportional(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
         // Parse existing threshold from tracestate
         const existing_threshold = parseThresholdFromTracestate(tracestate);
 
@@ -140,7 +161,7 @@ pub const TraceSampler = struct {
             // If existing threshold is more restrictive (higher), respect it
             if (existing_t >= self.threshold) {
                 // Already sampled at lower rate, check if it passes our threshold
-                const r = self.computeRandomness(trace_id);
+                const r = self.computeRandomness(input);
                 const keep = r >= self.threshold;
                 return .{
                     .keep = keep,
@@ -148,7 +169,7 @@ pub const TraceSampler = struct {
                 };
             }
             // Existing threshold is less restrictive - apply our more restrictive threshold
-            const r = self.computeRandomness(trace_id);
+            const r = self.computeRandomness(input);
             const keep = r >= self.threshold;
             return .{
                 .keep = keep,
@@ -157,11 +178,11 @@ pub const TraceSampler = struct {
         }
 
         // No existing threshold - use hash seed behavior
-        return self.sampleHashSeed(trace_id);
+        return self.sampleHashSeed(input);
     }
 
     /// Equalizing mode: preferentially sample spans with higher existing rates
-    fn sampleEqualizing(self: TraceSampler, trace_id: []const u8, tracestate: []const u8) SamplingResult {
+    fn sampleEqualizing(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
         // Parse existing threshold from tracestate
         const existing_threshold = parseThresholdFromTracestate(tracestate);
 
@@ -169,7 +190,7 @@ pub const TraceSampler = struct {
             // Calculate effective threshold for equalizing
             // Spans that were sampled at high rates (low threshold) should be
             // more likely to be dropped to equalize overall sampling
-            const r = self.computeRandomness(trace_id);
+            const r = self.computeRandomness(input);
 
             // Use the more restrictive threshold
             const effective_threshold = @max(existing_t, self.threshold);
@@ -181,24 +202,24 @@ pub const TraceSampler = struct {
         }
 
         // No existing threshold - use hash seed behavior
-        return self.sampleHashSeed(trace_id);
+        return self.sampleHashSeed(input);
     }
 
-    /// Compute 56-bit randomness value from trace_id and hash_seed
-    fn computeRandomness(self: TraceSampler, trace_id: []const u8) u64 {
-        // Use the last 7 bytes of trace_id XORed with hash_seed
-        // This follows the OTel spec which uses the rightmost bits
+    /// Compute 56-bit randomness value from input bytes and hash_seed.
+    /// For 16-byte trace IDs, uses the last 7 bytes per OTel spec.
+    /// For shorter inputs, hashes all bytes.
+    fn computeRandomness(self: ProbabilisticSampler, input: []const u8) u64 {
         var r: u64 = 0;
 
-        if (trace_id.len >= 16) {
+        if (input.len >= 16) {
             // Standard 16-byte trace_id - use last 7 bytes for randomness
             // Bytes 9-15 (indices 9, 10, 11, 12, 13, 14, 15) = 7 bytes = 56 bits
-            for (trace_id[9..16]) |b| {
+            for (input[9..16]) |b| {
                 r = (r << 8) | b;
             }
-        } else if (trace_id.len > 0) {
-            // Shorter trace_id - hash the whole thing
-            for (trace_id) |b| {
+        } else if (input.len > 0) {
+            // Shorter input - hash the whole thing
+            for (input) |b| {
                 r = (r << 8) ^ b;
             }
         }
@@ -215,7 +236,7 @@ pub const TraceSampler = struct {
 
     /// Encode threshold as hex string for tracestate.
     /// Returns a thread-local buffer - caller should copy if needed.
-    pub fn encodeThreshold(self: TraceSampler) []const u8 {
+    pub fn encodeThreshold(self: ProbabilisticSampler) []const u8 {
         // Static buffer for threshold encoding
         const S = struct {
             threadlocal var buf: [14]u8 = undefined;
@@ -255,7 +276,7 @@ pub const TraceSampler = struct {
 
 /// Result of sampling decision
 pub const SamplingResult = struct {
-    /// Whether to keep the span
+    /// Whether to keep the item
     keep: bool,
     /// New threshold to write to tracestate (null if not sampling)
     new_threshold: ?[]const u8,
@@ -376,11 +397,11 @@ pub fn updateTracestateInPlace(
 }
 
 /// Compute the threshold hex string for a given percentage.
-/// This is a standalone helper for when you don't have a full TraceSampler.
+/// This is a standalone helper for when you don't have a full ProbabilisticSampler.
 /// Returns a thread-local buffer - caller should copy if persistence needed.
 pub fn thresholdHexFromPercentage(percentage: f32, precision: u32) []const u8 {
-    const sampler = TraceSampler{
-        .threshold = TraceSampler.calculateThreshold(percentage),
+    const sampler = ProbabilisticSampler{
+        .threshold = ProbabilisticSampler.calculateThreshold(percentage),
         .mode = .SAMPLING_MODE_HASH_SEED,
         .hash_seed = 0,
         .precision = @min(14, @max(1, precision)),
@@ -394,7 +415,7 @@ pub fn thresholdHexFromPercentage(percentage: f32, precision: u32) []const u8 {
 // Tests
 // =============================================================================
 
-test "TraceSampler: 100% keeps all" {
+test "ProbabilisticSampler: 100% keeps all" {
     const config = TraceSamplingConfig{
         .percentage = 100.0,
         .mode = null,
@@ -402,7 +423,7 @@ test "TraceSampler: 100% keeps all" {
         .hash_seed = null,
         .fail_closed = null,
     };
-    const sampler = TraceSampler.init(&config);
+    const sampler = ProbabilisticSampler.init(&config);
 
     // All trace IDs should be kept
     const trace_id = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
@@ -411,7 +432,7 @@ test "TraceSampler: 100% keeps all" {
     try testing.expect(result.keep);
 }
 
-test "TraceSampler: 0% rejects all" {
+test "ProbabilisticSampler: 0% rejects all" {
     const config = TraceSamplingConfig{
         .percentage = 0.0,
         .mode = null,
@@ -419,7 +440,7 @@ test "TraceSampler: 0% rejects all" {
         .hash_seed = null,
         .fail_closed = null,
     };
-    const sampler = TraceSampler.init(&config);
+    const sampler = ProbabilisticSampler.init(&config);
 
     const trace_id = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
     const result = sampler.sample(&trace_id, "");
@@ -427,8 +448,8 @@ test "TraceSampler: 0% rejects all" {
     try testing.expect(!result.keep);
 }
 
-test "TraceSampler: null config keeps all" {
-    const sampler = TraceSampler.init(null);
+test "ProbabilisticSampler: null config keeps all" {
+    const sampler = ProbabilisticSampler.init(null);
 
     const trace_id = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
     const result = sampler.sample(&trace_id, "");
@@ -436,7 +457,7 @@ test "TraceSampler: null config keeps all" {
     try testing.expect(result.keep);
 }
 
-test "TraceSampler: deterministic for same trace_id" {
+test "ProbabilisticSampler: deterministic for same input" {
     const config = TraceSamplingConfig{
         .percentage = 50.0,
         .mode = null,
@@ -444,7 +465,7 @@ test "TraceSampler: deterministic for same trace_id" {
         .hash_seed = null,
         .fail_closed = null,
     };
-    const sampler = TraceSampler.init(&config);
+    const sampler = ProbabilisticSampler.init(&config);
 
     const trace_id = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
 
@@ -455,7 +476,7 @@ test "TraceSampler: deterministic for same trace_id" {
     }
 }
 
-test "TraceSampler: hash_seed affects sampling" {
+test "ProbabilisticSampler: hash_seed affects sampling" {
     const config1 = TraceSamplingConfig{
         .percentage = 50.0,
         .mode = .SAMPLING_MODE_HASH_SEED,
@@ -471,8 +492,8 @@ test "TraceSampler: hash_seed affects sampling" {
         .fail_closed = null,
     };
 
-    const sampler1 = TraceSampler.init(&config1);
-    const sampler2 = TraceSampler.init(&config2);
+    const sampler1 = ProbabilisticSampler.init(&config1);
+    const sampler2 = ProbabilisticSampler.init(&config2);
 
     // Different hash seeds may produce different results for some trace IDs
     var different_count: u32 = 0;
@@ -490,7 +511,7 @@ test "TraceSampler: hash_seed affects sampling" {
     try testing.expect(different_count > 0);
 }
 
-test "TraceSampler: approximate distribution for 50%" {
+test "ProbabilisticSampler: approximate distribution for 50%" {
     const config = TraceSamplingConfig{
         .percentage = 50.0,
         .mode = null,
@@ -498,7 +519,7 @@ test "TraceSampler: approximate distribution for 50%" {
         .hash_seed = null,
         .fail_closed = null,
     };
-    const sampler = TraceSampler.init(&config);
+    const sampler = ProbabilisticSampler.init(&config);
 
     var kept: u32 = 0;
     const total: u32 = 10000;
@@ -517,17 +538,38 @@ test "TraceSampler: approximate distribution for 50%" {
     try testing.expect(ratio > 0.45 and ratio < 0.55);
 }
 
-test "TraceSampler: threshold calculation" {
+test "ProbabilisticSampler: threshold calculation" {
     // 100% = threshold 0 (keep all)
-    try testing.expectEqual(@as(u64, 0), TraceSampler.calculateThreshold(100.0));
+    try testing.expectEqual(@as(u64, 0), ProbabilisticSampler.calculateThreshold(100.0));
 
     // 0% = threshold MAX (keep none)
-    try testing.expectEqual(MAX_56BIT, TraceSampler.calculateThreshold(0.0));
+    try testing.expectEqual(MAX_56BIT, ProbabilisticSampler.calculateThreshold(0.0));
 
     // 50% = threshold is half of MAX
-    const half_threshold = TraceSampler.calculateThreshold(50.0);
+    const half_threshold = ProbabilisticSampler.calculateThreshold(50.0);
     const expected_half = MAX_56BIT / 2;
     try testing.expect(half_threshold > expected_half - 1000 and half_threshold < expected_half + 1000);
+}
+
+test "ProbabilisticSampler: initFromPercentage" {
+    const sampler = ProbabilisticSampler.initFromPercentage(50);
+    try testing.expectEqual(@as(f32, 50.0), sampler.percentage);
+
+    // 0% rejects all
+    const zero = ProbabilisticSampler.initFromPercentage(0);
+    try testing.expect(!zero.shouldKeep("anything"));
+
+    // 100% keeps all
+    const full = ProbabilisticSampler.initFromPercentage(100);
+    try testing.expect(full.shouldKeep("anything"));
+}
+
+test "ProbabilisticSampler: shouldKeep matches sample" {
+    const sampler = ProbabilisticSampler.initFromPercentage(50);
+    const input = "test-input-bytes";
+
+    // shouldKeep should match sample().keep
+    try testing.expectEqual(sampler.sample(input, "").keep, sampler.shouldKeep(input));
 }
 
 test "parseThresholdFromTracestate: empty" {
