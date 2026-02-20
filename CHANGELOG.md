@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/usetero/policy-zig/compare/v0.1.9...v0.1.10) (2026-02-19)
+
+
+### Bug Fixes
+
+* tracing should use probabilistic sampler ([#25](https://github.com/usetero/policy-zig/issues/25)) ([14224ce](https://github.com/usetero/policy-zig/commit/14224cecbf4447d1c3fa5b53e32f77cb5a7004c0))
+
 ## [0.1.9](https://github.com/usetero/policy-zig/compare/v0.1.8...v0.1.9) (2026-02-18)
 
 
