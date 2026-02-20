@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/usetero/policy-zig/compare/v0.1.11...v0.1.12) (2026-02-20)
+
+
+### Bug Fixes
+
+* support shorthand and schema urls and versions ([#30](https://github.com/usetero/policy-zig/issues/30)) ([aa5f5ac](https://github.com/usetero/policy-zig/commit/aa5f5acc4b69ef051053b78e90086bdee133c39d))
+
 ## [0.1.11](https://github.com/usetero/policy-zig/compare/v0.1.10...v0.1.11) (2026-02-20)
 
 
