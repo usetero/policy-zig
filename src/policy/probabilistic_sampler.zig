@@ -205,33 +205,36 @@ pub const ProbabilisticSampler = struct {
         return self.sampleHashSeed(input);
     }
 
-    /// Compute 56-bit randomness value from input bytes and hash_seed.
-    /// For 16-byte trace IDs, uses the last 7 bytes per OTel spec.
-    /// For shorter inputs, hashes all bytes.
+    /// Compute 56-bit randomness value from input bytes.
+    ///
+    /// For 16-byte trace IDs (standard OTel format), extracts the
+    /// least-significant 56 bits (last 7 bytes) directly without hashing,
+    /// per the OTel consistent probability sampling spec.
+    ///
+    /// For shorter inputs (e.g. log sample keys), hashes all bytes with
+    /// hash_seed using splitmix64 for uniform distribution.
     fn computeRandomness(self: ProbabilisticSampler, input: []const u8) u64 {
-        var r: u64 = 0;
-
         if (input.len >= 16) {
-            // Standard 16-byte trace_id - use last 7 bytes for randomness
-            // Bytes 9-15 (indices 9, 10, 11, 12, 13, 14, 15) = 7 bytes = 56 bits
-            for (input[9..16]) |b| {
+            // Standard 16-byte trace_id - extract last 7 bytes as randomness
+            // directly, without hashing. Per OTel spec, the least-significant
+            // 56 bits of the trace ID ARE the randomness value.
+            var r: u64 = 0;
+            for (input[input.len - 7 ..]) |b| {
                 r = (r << 8) | b;
             }
+            return r & (MAX_56BIT - 1);
         } else if (input.len > 0) {
-            // Shorter input - hash the whole thing
+            // Shorter input (log sample keys, etc.) - hash for uniform distribution
+            var r: u64 = 0;
             for (input) |b| {
                 r = (r << 8) ^ b;
             }
+            r ^= @as(u64, self.hash_seed);
+            r = mixHash(r);
+            return r & (MAX_56BIT - 1);
         }
 
-        // Mix with hash_seed for deterministic but varied sampling
-        r ^= @as(u64, self.hash_seed);
-
-        // Apply splitmix64 mixing to ensure good distribution
-        r = mixHash(r);
-
-        // Mask to 56 bits
-        return r & (MAX_56BIT - 1);
+        return 0;
     }
 
     /// Encode threshold as hex string for tracestate.
@@ -476,7 +479,7 @@ test "ProbabilisticSampler: deterministic for same input" {
     }
 }
 
-test "ProbabilisticSampler: hash_seed affects sampling" {
+test "ProbabilisticSampler: hash_seed affects sampling for short inputs" {
     const config1 = TraceSamplingConfig{
         .percentage = 50.0,
         .mode = .SAMPLING_MODE_HASH_SEED,
@@ -495,14 +498,15 @@ test "ProbabilisticSampler: hash_seed affects sampling" {
     const sampler1 = ProbabilisticSampler.init(&config1);
     const sampler2 = ProbabilisticSampler.init(&config2);
 
-    // Different hash seeds may produce different results for some trace IDs
+    // hash_seed affects short inputs (log sample keys) where hashing is applied.
+    // For 16-byte trace IDs, hash_seed is NOT applied per OTel spec.
     var different_count: u32 = 0;
     for (0..100) |i| {
-        var trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        trace_id[15] = @intCast(i);
+        var input: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        input[7] = @intCast(i);
 
-        const r1 = sampler1.sample(&trace_id, "");
-        const r2 = sampler2.sample(&trace_id, "");
+        const r1 = sampler1.sample(&input, "");
+        const r2 = sampler2.sample(&input, "");
 
         if (r1.keep != r2.keep) different_count += 1;
     }
@@ -526,9 +530,13 @@ test "ProbabilisticSampler: approximate distribution for 50%" {
 
     for (0..total) |i| {
         var trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        // Vary the last bytes
-        trace_id[14] = @intCast((i >> 8) & 0xff);
-        trace_id[15] = @intCast(i & 0xff);
+        // Per OTel spec, randomness is the least-significant 56 bits of the
+        // trace ID (last 7 bytes), used directly without hashing.
+        // Distribute across the full 56-bit range by varying the most
+        // significant byte (index 9) uniformly and using lower bytes for detail.
+        trace_id[9] = @intCast((i * 256 / total) & 0xff);
+        trace_id[10] = @intCast(i & 0xff);
+        trace_id[11] = @intCast((i >> 8) & 0xff);
 
         const result = sampler.sample(&trace_id, "");
         if (result.keep) kept += 1;
