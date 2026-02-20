@@ -234,9 +234,6 @@ const TestContext = struct {
                     .scope_attribute => |p| getFirstPathSegment(p.path.items),
                 };
                 const k = key orelse return false;
-                const exists = self.fields.contains(k);
-                if (!s.upsert and !exists) return false;
-
                 self.set(k, s.value) catch return false;
                 return true;
             },
@@ -418,6 +415,22 @@ test "applyAdd: upsert=false skips existing field" {
     const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(!result);
     try testing.expectEqualStrings("original", ctx.fields.get("existing").?);
+}
+
+test "applyAdd: upsert=false adds non-existent field" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    var rule = LogAdd{
+        .field = .{ .log_attribute = testAttrPath("new_field") },
+        .value = "hello",
+        .upsert = false,
+    };
+
+    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    try testing.expect(result);
+    try testing.expectEqualStrings("hello", ctx.fields.get("new_field").?);
 }
 
 test "applyAdd: upsert=true overwrites existing field" {
