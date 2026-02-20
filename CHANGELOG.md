@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/usetero/policy-zig/compare/v0.1.10...v0.1.11) (2026-02-20)
+
+
+### Bug Fixes
+
+* probabilistic sampling off spec ([#27](https://github.com/usetero/policy-zig/issues/27)) ([f494423](https://github.com/usetero/policy-zig/commit/f494423065dd8edcd7ce8c4d8bbfecea52b4f1a1))
+
 ## [0.1.10](https://github.com/usetero/policy-zig/compare/v0.1.9...v0.1.10) (2026-02-19)
 
 
