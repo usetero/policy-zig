@@ -780,15 +780,15 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
 }
 
 fn parseTraceFieldName(name: []const u8) !TraceField {
-    if (std.mem.eql(u8, name, "TRACE_FIELD_NAME")) return .TRACE_FIELD_NAME;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_ID")) return .TRACE_FIELD_TRACE_ID;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SPAN_ID")) return .TRACE_FIELD_SPAN_ID;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_PARENT_SPAN_ID")) return .TRACE_FIELD_PARENT_SPAN_ID;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_STATE")) return .TRACE_FIELD_TRACE_STATE;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_RESOURCE_SCHEMA_URL")) return .TRACE_FIELD_RESOURCE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_SCHEMA_URL")) return .TRACE_FIELD_SCOPE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_NAME")) return .TRACE_FIELD_SCOPE_NAME;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_VERSION")) return .TRACE_FIELD_SCOPE_VERSION;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_NAME") or std.mem.eql(u8, name, "name")) return .TRACE_FIELD_NAME;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_ID") or std.mem.eql(u8, name, "trace_id")) return .TRACE_FIELD_TRACE_ID;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SPAN_ID") or std.mem.eql(u8, name, "span_id")) return .TRACE_FIELD_SPAN_ID;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_PARENT_SPAN_ID") or std.mem.eql(u8, name, "parent_span_id")) return .TRACE_FIELD_PARENT_SPAN_ID;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_STATE") or std.mem.eql(u8, name, "trace_state")) return .TRACE_FIELD_TRACE_STATE;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_RESOURCE_SCHEMA_URL") or std.mem.eql(u8, name, "resource_schema_url")) return .TRACE_FIELD_RESOURCE_SCHEMA_URL;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_SCHEMA_URL") or std.mem.eql(u8, name, "scope_schema_url")) return .TRACE_FIELD_SCOPE_SCHEMA_URL;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_NAME") or std.mem.eql(u8, name, "scope_name")) return .TRACE_FIELD_SCOPE_NAME;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_VERSION") or std.mem.eql(u8, name, "scope_version")) return .TRACE_FIELD_SCOPE_VERSION;
     return error.InvalidTraceField;
 }
 
@@ -803,9 +803,9 @@ fn parseSpanKind(name: []const u8) !SpanKind {
 }
 
 fn parseSpanStatusCode(name: []const u8) !SpanStatusCode {
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSPECIFIED")) return .SPAN_STATUS_CODE_UNSPECIFIED;
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_OK")) return .SPAN_STATUS_CODE_OK;
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_ERROR")) return .SPAN_STATUS_CODE_ERROR;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSPECIFIED") or std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSET") or std.mem.eql(u8, name, "unset")) return .SPAN_STATUS_CODE_UNSPECIFIED;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_OK") or std.mem.eql(u8, name, "ok")) return .SPAN_STATUS_CODE_OK;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_ERROR") or std.mem.eql(u8, name, "error")) return .SPAN_STATUS_CODE_ERROR;
     return error.InvalidSpanStatusCode;
 }
 
@@ -2291,4 +2291,88 @@ test "parsePoliciesBytes: metric policy with aggregation_temporality canonical f
     const matcher = metric_target.match.items[0];
     try std.testing.expect(matcher.field.? == .aggregation_temporality);
     try std.testing.expectEqual(AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE, matcher.field.?.aggregation_temporality);
+}
+
+test "parsePoliciesBytes: trace policy with SPAN_STATUS_CODE_UNSET" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "match-unset-spans",
+        \\    "name": "Match spans with unset status",
+        \\    "trace": {
+        \\      "match": [
+        \\        { "span_status": "SPAN_STATUS_CODE_UNSET", "exists": true }
+        \\      ]
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.trace.match.items[0];
+    try std.testing.expect(matcher.field.? == .span_status);
+    try std.testing.expectEqual(SpanStatusCode.SPAN_STATUS_CODE_UNSPECIFIED, matcher.field.?.span_status);
+}
+
+test "parsePoliciesBytes: trace policy with shortname trace fields" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-by-scope",
+        \\    "name": "Drop spans from specific scope",
+        \\    "trace": {
+        \\      "match": [
+        \\        { "trace_field": "scope_name", "exact": "my-library" }
+        \\      ]
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.trace.match.items[0];
+    try std.testing.expect(matcher.field.? == .trace_field);
+    try std.testing.expectEqual(TraceField.TRACE_FIELD_SCOPE_NAME, matcher.field.?.trace_field);
+}
+
+test "parsePoliciesBytes: trace policy with shortname resource_schema_url" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-old-schema",
+        \\    "name": "Drop traces from old schema",
+        \\    "trace": {
+        \\      "match": [
+        \\        { "trace_field": "resource_schema_url", "exact": "https://old.schema/v1" }
+        \\      ]
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.trace.match.items[0];
+    try std.testing.expect(matcher.field.? == .trace_field);
+    try std.testing.expectEqual(TraceField.TRACE_FIELD_RESOURCE_SCHEMA_URL, matcher.field.?.trace_field);
 }

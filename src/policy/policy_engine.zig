@@ -648,6 +648,8 @@ const TestLogContext = struct {
     ddtags: ?[]const u8 = null,
     env: ?[]const u8 = null,
     trace_id: ?[]const u8 = null,
+    resource_schema_url: ?[]const u8 = null,
+    scope_schema_url: ?[]const u8 = null,
 
     pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
         const self: *const TestLogContext = @ptrCast(@alignCast(ctx_ptr));
@@ -655,6 +657,8 @@ const TestLogContext = struct {
             .log_field => |lf| switch (lf) {
                 .LOG_FIELD_BODY => self.message,
                 .LOG_FIELD_SEVERITY_TEXT => self.level,
+                .LOG_FIELD_RESOURCE_SCHEMA_URL => self.resource_schema_url,
+                .LOG_FIELD_SCOPE_SCHEMA_URL => self.scope_schema_url,
                 else => null,
             },
             .log_attribute => |attr_path| {
@@ -2632,6 +2636,9 @@ const TestMetricContext = struct {
     description: ?[]const u8 = null,
     unit: ?[]const u8 = null,
     scope_name: ?[]const u8 = null,
+    scope_version: ?[]const u8 = null,
+    resource_schema_url: ?[]const u8 = null,
+    scope_schema_url: ?[]const u8 = null,
     datapoint_attributes: ?std.StringHashMap([]const u8) = null,
     resource_attributes: ?std.StringHashMap([]const u8) = null,
 
@@ -2643,6 +2650,9 @@ const TestMetricContext = struct {
                 .METRIC_FIELD_DESCRIPTION => self.description,
                 .METRIC_FIELD_UNIT => self.unit,
                 .METRIC_FIELD_SCOPE_NAME => self.scope_name,
+                .METRIC_FIELD_SCOPE_VERSION => self.scope_version,
+                .METRIC_FIELD_RESOURCE_SCHEMA_URL => self.resource_schema_url,
+                .METRIC_FIELD_SCOPE_SCHEMA_URL => self.scope_schema_url,
                 else => null,
             },
             .datapoint_attribute => |attr_path| {
@@ -3752,4 +3762,179 @@ test "PolicyEngine: sample_key missing field falls back to default" {
 
     // Should get a decision (either keep or drop based on hash)
     try testing.expect(result.decision == .keep or result.decision == .drop);
+}
+
+test "PolicyEngine: log resource_schema_url matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-old-schema"),
+        .name = try allocator.dupe(u8, "Drop old schema logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_RESOURCE_SCHEMA_URL },
+        .match = .{ .exact = try allocator.dupe(u8, "https://old.schema/v1") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var old_log = TestLogContext{ .message = "test", .resource_schema_url = "https://old.schema/v1" };
+    const result = engine.evaluate(.log, &old_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    var new_log = TestLogContext{ .message = "test", .resource_schema_url = "https://new.schema/v2" };
+    const result2 = engine.evaluate(.log, &new_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "PolicyEngine: log scope_schema_url matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-scope-schema"),
+        .name = try allocator.dupe(u8, "Drop scope schema logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SCOPE_SCHEMA_URL },
+        .match = .{ .exact = try allocator.dupe(u8, "https://scope.schema/v1") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var match_log = TestLogContext{ .message = "test", .scope_schema_url = "https://scope.schema/v1" };
+    const result = engine.evaluate(.log, &match_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    var no_match_log = TestLogContext{ .message = "test", .scope_schema_url = "https://other.schema/v2" };
+    const result2 = engine.evaluate(.log, &no_match_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "MetricPolicyEngine: resource_schema_url matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-old-metric-schema"),
+        .name = try allocator.dupe(u8, "Drop old schema metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_RESOURCE_SCHEMA_URL },
+        .match = .{ .exact = try allocator.dupe(u8, "https://old.schema/v1") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var old_metric = TestMetricContext{ .name = "cpu", .resource_schema_url = "https://old.schema/v1" };
+    const result = engine.evaluate(.metric, &old_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    var new_metric = TestMetricContext{ .name = "cpu", .resource_schema_url = "https://new.schema/v2" };
+    const result2 = engine.evaluate(.metric, &new_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "MetricPolicyEngine: scope_schema_url matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-scope-schema-metric"),
+        .name = try allocator.dupe(u8, "Drop scope schema metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_SCOPE_SCHEMA_URL },
+        .match = .{ .exact = try allocator.dupe(u8, "https://scope.schema/v1") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var match_metric = TestMetricContext{ .name = "cpu", .scope_schema_url = "https://scope.schema/v1" };
+    const result = engine.evaluate(.metric, &match_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    var no_match = TestMetricContext{ .name = "cpu", .scope_schema_url = "https://other/v2" };
+    const result2 = engine.evaluate(.metric, &no_match, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "MetricPolicyEngine: scope_version matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-old-scope-version"),
+        .name = try allocator.dupe(u8, "Drop old scope version metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_SCOPE_VERSION },
+        .match = .{ .exact = try allocator.dupe(u8, "1.0.0") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var old_metric = TestMetricContext{ .name = "cpu", .scope_version = "1.0.0" };
+    const result = engine.evaluate(.metric, &old_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    var new_metric = TestMetricContext{ .name = "cpu", .scope_version = "2.0.0" };
+    const result2 = engine.evaluate(.metric, &new_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
