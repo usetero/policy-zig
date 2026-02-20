@@ -209,8 +209,7 @@ pub const ProbabilisticSampler = struct {
     ///
     /// For 16-byte trace IDs (standard OTel format), extracts the
     /// least-significant 56 bits (last 7 bytes) directly without hashing,
-    /// per the OTel consistent probability sampling spec. This matches
-    /// the behavior of policy-go and policy-rs.
+    /// per the OTel consistent probability sampling spec.
     ///
     /// For shorter inputs (e.g. log sample keys), hashes all bytes with
     /// hash_seed using splitmix64 for uniform distribution.
