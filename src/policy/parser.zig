@@ -803,9 +803,9 @@ fn parseSpanKind(name: []const u8) !SpanKind {
 }
 
 fn parseSpanStatusCode(name: []const u8) !SpanStatusCode {
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSPECIFIED") or std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSET" or std.mem.eql(u8, name, "unset")) return .SPAN_STATUS_CODE_UNSPECIFIED;
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_OK" or std.mem.eql(u8, name, "ok")) return .SPAN_STATUS_CODE_OK;
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_ERROR" or std.mem.eql(u8, name, "error")) return .SPAN_STATUS_CODE_ERROR;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSPECIFIED") or std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSET") or std.mem.eql(u8, name, "unset")) return .SPAN_STATUS_CODE_UNSPECIFIED;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_OK") or std.mem.eql(u8, name, "ok")) return .SPAN_STATUS_CODE_OK;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_ERROR") or std.mem.eql(u8, name, "error")) return .SPAN_STATUS_CODE_ERROR;
     return error.InvalidSpanStatusCode;
 }
 
