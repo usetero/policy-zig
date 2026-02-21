@@ -23,11 +23,18 @@
 //!   - For 16-byte trace IDs: uses last 7 bytes (OTel spec)
 //!   - For shorter inputs: hashes all bytes
 //!   - Mixed with hash_seed and splitmix64 for uniform distribution
+//!   - If an explicit `rv` value is present in the tracestate, it is used
+//!     directly as the randomness value.
 //!
 //! ## Tracestate Handling
 //!
-//! The sampler reads and writes the `th` (threshold) key in the tracestate header
-//! following the W3C tracestate specification.
+//! The sampler reads and writes the `th` (threshold) and `rv` (randomness value)
+//! keys in the `ot` vendor section of the tracestate header, following the W3C
+//! tracestate specification and OTel probability sampling spec.
+//!
+//! Consistency check: when both `rv` and `th` are present in the incoming
+//! tracestate, the sampler verifies `rv >= th`. If inconsistent, the threshold
+//! is erased from the output.
 
 const std = @import("std");
 const proto = @import("proto");
@@ -111,7 +118,7 @@ pub const ProbabilisticSampler = struct {
 
     /// Calculate threshold from percentage
     /// T = floor((1 - percentage/100) * 2^56)
-    fn calculateThreshold(percentage: f32) u64 {
+    pub fn calculateThreshold(percentage: f32) u64 {
         if (percentage >= 100.0) return 0; // Keep all
         if (percentage <= 0.0) return MAX_56BIT; // Keep none
 
@@ -120,89 +127,129 @@ pub const ProbabilisticSampler = struct {
         return @intFromFloat(@min(@as(f64, @floatFromInt(MAX_56BIT)), @max(0.0, threshold_f)));
     }
 
+    /// Convert a threshold value back to probability: prob = 1 - T / 2^56
+    fn thresholdToProbability(t: u64) f64 {
+        if (t >= MAX_56BIT) return 0.0;
+        if (t == 0) return 1.0;
+        return 1.0 - @as(f64, @floatFromInt(t)) / @as(f64, @floatFromInt(MAX_56BIT));
+    }
+
+    /// Convert a probability to threshold: T = floor((1 - prob) * 2^56)
+    fn probabilityToThreshold(prob: f64) u64 {
+        if (prob >= 1.0) return 0;
+        if (prob <= 0.0) return MAX_56BIT;
+        const t = (1.0 - prob) * @as(f64, @floatFromInt(MAX_56BIT));
+        return @intFromFloat(@min(@as(f64, @floatFromInt(MAX_56BIT)), @max(0.0, t)));
+    }
+
     /// Make sampling decision for an item.
     ///
     /// Returns a SamplingResult with:
     /// - keep: whether to keep the item
     /// - new_threshold: threshold to write to tracestate (if sampling)
+    /// - rv: explicit randomness value to preserve in tracestate (if present)
     pub fn sample(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
         // Edge cases
         if (self.percentage >= 100.0) {
-            return .{ .keep = true, .new_threshold = null };
+            return .{ .keep = true, .new_threshold = null, .rv = null };
         }
         if (self.percentage <= 0.0) {
-            return .{ .keep = false, .new_threshold = null };
+            return .{ .keep = false, .new_threshold = null, .rv = null };
+        }
+
+        // Parse tracestate for rv and th
+        const ts_info = parseOtFromTracestate(tracestate);
+
+        // If explicit rv is present, use it as the randomness value
+        const r = if (ts_info.rv) |rv_val|
+            rv_val
+        else
+            self.computeRandomness(input);
+
+        // Consistency check: if both rv and th are present, verify rv >= th
+        if (ts_info.rv != null and ts_info.th != null) {
+            if (ts_info.rv.? < ts_info.th.?) {
+                // Inconsistent — erase threshold from output
+                return .{ .keep = true, .new_threshold = null, .rv = ts_info.rv_hex };
+            }
         }
 
         return switch (self.mode) {
-            .SAMPLING_MODE_UNSPECIFIED, .SAMPLING_MODE_HASH_SEED => self.sampleHashSeed(input),
-            .SAMPLING_MODE_PROPORTIONAL => self.sampleProportional(input, tracestate),
-            .SAMPLING_MODE_EQUALIZING => self.sampleEqualizing(input, tracestate),
-            _ => self.sampleHashSeed(input), // Unknown mode defaults to hash_seed
+            .SAMPLING_MODE_UNSPECIFIED, .SAMPLING_MODE_HASH_SEED => self.sampleHashSeed(r, ts_info.rv_hex),
+            .SAMPLING_MODE_PROPORTIONAL => self.sampleProportional(r, ts_info.th, ts_info.rv_hex),
+            .SAMPLING_MODE_EQUALIZING => self.sampleEqualizing(r, ts_info.th, ts_info.rv_hex),
+            _ => self.sampleHashSeed(r, ts_info.rv_hex), // Unknown mode defaults to hash_seed
         };
     }
 
     /// Hash seed mode: deterministic sampling based on input hash
-    fn sampleHashSeed(self: ProbabilisticSampler, input: []const u8) SamplingResult {
-        const r = self.computeRandomness(input);
+    fn sampleHashSeed(self: ProbabilisticSampler, r: u64, rv_hex: ?[]const u8) SamplingResult {
         const keep = r >= self.threshold;
         return .{
             .keep = keep,
-            .new_threshold = if (keep) self.encodeThreshold() else null,
+            .new_threshold = if (keep) encodeThresholdValue(self.threshold, self.precision) else null,
+            .rv = rv_hex,
         };
     }
 
-    /// Proportional mode: adjust sampling relative to existing probability
-    fn sampleProportional(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
-        // Parse existing threshold from tracestate
-        const existing_threshold = parseThresholdFromTracestate(tracestate);
-
+    /// Proportional mode: multiply incoming probability with configured probability.
+    ///
+    /// Per OTel spec:
+    ///   T_o = ProbabilityToThreshold(p * ThresholdToProbability(T_s))
+    /// where p is the configured probability and T_s is the existing threshold.
+    fn sampleProportional(self: ProbabilisticSampler, r: u64, existing_threshold: ?u64, rv_hex: ?[]const u8) SamplingResult {
         if (existing_threshold) |existing_t| {
-            // If existing threshold is more restrictive (higher), respect it
-            if (existing_t >= self.threshold) {
-                // Already sampled at lower rate, check if it passes our threshold
-                const r = self.computeRandomness(input);
-                const keep = r >= self.threshold;
+            // Compute product threshold
+            const prob_s = thresholdToProbability(existing_t);
+            const prob_configured = thresholdToProbability(self.threshold);
+            const prob_o = prob_configured * prob_s;
+            const t_o = probabilityToThreshold(prob_o);
+
+            // If product threshold is maximum (probability effectively zero), reject
+            if (t_o >= MAX_56BIT) {
+                return .{ .keep = false, .new_threshold = null, .rv = rv_hex };
+            }
+
+            const keep = r >= t_o;
+            return .{
+                .keep = keep,
+                .new_threshold = if (keep) encodeThresholdValue(t_o, self.precision) else null,
+                .rv = rv_hex,
+            };
+        }
+
+        // No existing threshold - use hash seed behavior
+        return self.sampleHashSeed(r, rv_hex);
+    }
+
+    /// Equalizing mode: aim for equal threshold after this sampling stage.
+    ///
+    /// Per OTel spec:
+    /// - When T_s > T_d (existing more restrictive): pass through, outbound = T_s
+    /// - When T_s <= T_d: keep if R >= T_d, outbound = T_d
+    fn sampleEqualizing(self: ProbabilisticSampler, r: u64, existing_threshold: ?u64, rv_hex: ?[]const u8) SamplingResult {
+        if (existing_threshold) |existing_t| {
+            if (existing_t > self.threshold) {
+                // Existing threshold is more restrictive — cannot lower it,
+                // so pass the span through with its existing threshold.
                 return .{
-                    .keep = keep,
-                    .new_threshold = if (keep) self.encodeThreshold() else null,
+                    .keep = true,
+                    .new_threshold = encodeThresholdValue(existing_t, self.precision),
+                    .rv = rv_hex,
                 };
             }
-            // Existing threshold is less restrictive - apply our more restrictive threshold
-            const r = self.computeRandomness(input);
+
+            // Apply our threshold to equalize
             const keep = r >= self.threshold;
             return .{
                 .keep = keep,
-                .new_threshold = if (keep) self.encodeThreshold() else null,
+                .new_threshold = if (keep) encodeThresholdValue(self.threshold, self.precision) else null,
+                .rv = rv_hex,
             };
         }
 
         // No existing threshold - use hash seed behavior
-        return self.sampleHashSeed(input);
-    }
-
-    /// Equalizing mode: preferentially sample spans with higher existing rates
-    fn sampleEqualizing(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
-        // Parse existing threshold from tracestate
-        const existing_threshold = parseThresholdFromTracestate(tracestate);
-
-        if (existing_threshold) |existing_t| {
-            // Calculate effective threshold for equalizing
-            // Spans that were sampled at high rates (low threshold) should be
-            // more likely to be dropped to equalize overall sampling
-            const r = self.computeRandomness(input);
-
-            // Use the more restrictive threshold
-            const effective_threshold = @max(existing_t, self.threshold);
-            const keep = r >= effective_threshold;
-            return .{
-                .keep = keep,
-                .new_threshold = if (keep) self.encodeThreshold() else null,
-            };
-        }
-
-        // No existing threshold - use hash seed behavior
-        return self.sampleHashSeed(input);
+        return self.sampleHashSeed(r, rv_hex);
     }
 
     /// Compute 56-bit randomness value from input bytes.
@@ -237,35 +284,10 @@ pub const ProbabilisticSampler = struct {
         return 0;
     }
 
-    /// Encode threshold as hex string for tracestate.
-    /// Returns a thread-local buffer - caller should copy if needed.
+    /// Encode a threshold as a hex string for tracestate.
+    /// Uses a struct-local buffer; returned slice is valid until next call.
     pub fn encodeThreshold(self: ProbabilisticSampler) []const u8 {
-        // Static buffer for threshold encoding
-        const S = struct {
-            threadlocal var buf: [14]u8 = undefined;
-        };
-
-        // Encode threshold as hex with trailing zeros removed
-        const hex_chars = "0123456789abcdef";
-        var len: usize = 0;
-        var t = self.threshold;
-
-        // Encode up to precision digits
-        var i: u32 = 0;
-        while (i < self.precision and t > 0) : (i += 1) {
-            const nibble = @as(u4, @truncate(t >> 52));
-            S.buf[len] = hex_chars[nibble];
-            len += 1;
-            t <<= 4;
-        }
-
-        // If threshold is 0, encode as "0"
-        if (len == 0) {
-            S.buf[0] = '0';
-            len = 1;
-        }
-
-        return S.buf[0..len];
+        return encodeThresholdValue(self.threshold, self.precision);
     }
 
     /// splitmix64 hash mixing function for good avalanche properties
@@ -277,45 +299,82 @@ pub const ProbabilisticSampler = struct {
     }
 };
 
+/// Encode a threshold value as a hex string for tracestate.
+/// Returns a slice from a thread-local buffer — caller should copy if persistence needed.
+fn encodeThresholdValue(threshold: u64, precision: u32) []const u8 {
+    const S = struct {
+        threadlocal var buf: [14]u8 = undefined;
+    };
+
+    const hex_chars = "0123456789abcdef";
+    var len: usize = 0;
+    var t = threshold;
+
+    var i: u32 = 0;
+    while (i < precision and t > 0) : (i += 1) {
+        const nibble = @as(u4, @truncate(t >> 52));
+        S.buf[len] = hex_chars[nibble];
+        len += 1;
+        t <<= 4;
+    }
+
+    // If threshold is 0, encode as "0"
+    if (len == 0) {
+        S.buf[0] = '0';
+        len = 1;
+    }
+
+    return S.buf[0..len];
+}
+
 /// Result of sampling decision
 pub const SamplingResult = struct {
     /// Whether to keep the item
     keep: bool,
     /// New threshold to write to tracestate (null if not sampling)
     new_threshold: ?[]const u8,
+    /// Explicit randomness value to preserve in outgoing tracestate (null if not present)
+    rv: ?[]const u8,
 };
 
-/// Parse threshold value from tracestate header.
-/// Looks for the `th` key in the `ot` vendor section.
-/// Returns null if not found or invalid.
-fn parseThresholdFromTracestate(tracestate: []const u8) ?u64 {
-    if (tracestate.len == 0) return null;
+/// Parsed OT vendor section from tracestate
+const OtTracestateInfo = struct {
+    /// Parsed threshold value (numeric)
+    th: ?u64,
+    /// Parsed randomness value (numeric)
+    rv: ?u64,
+    /// Raw rv hex string to preserve in output
+    rv_hex: ?[]const u8,
+};
+
+/// Parse the `ot=...` vendor section from a tracestate header.
+/// Extracts both `th` (threshold) and `rv` (randomness value) keys.
+fn parseOtFromTracestate(tracestate: []const u8) OtTracestateInfo {
+    var info = OtTracestateInfo{ .th = null, .rv = null, .rv_hex = null };
+    if (tracestate.len == 0) return info;
 
     // Look for "ot=..." vendor section
     var it = std.mem.splitScalar(u8, tracestate, ',');
     while (it.next()) |entry| {
         const trimmed = std.mem.trim(u8, entry, " ");
         if (std.mem.startsWith(u8, trimmed, "ot=")) {
-            // Parse the ot value for th key
             const ot_value = trimmed[3..];
-            return parseOtThreshold(ot_value);
+            // Parse both th and rv from the ot value
+            var kv_it = std.mem.splitScalar(u8, ot_value, ';');
+            while (kv_it.next()) |kv| {
+                if (std.mem.startsWith(u8, kv, "th:")) {
+                    info.th = parseHexThreshold(kv[3..]);
+                } else if (std.mem.startsWith(u8, kv, "rv:")) {
+                    const hex = kv[3..];
+                    info.rv = parseHexThreshold(hex);
+                    info.rv_hex = hex;
+                }
+            }
+            return info;
         }
     }
 
-    return null;
-}
-
-/// Parse threshold from OT vendor tracestate value
-/// Format: "th:HEXVALUE" or "th:HEXVALUE;other:value"
-fn parseOtThreshold(ot_value: []const u8) ?u64 {
-    var it = std.mem.splitScalar(u8, ot_value, ';');
-    while (it.next()) |kv| {
-        if (std.mem.startsWith(u8, kv, "th:")) {
-            const hex_value = kv[3..];
-            return parseHexThreshold(hex_value);
-        }
-    }
-    return null;
+    return info;
 }
 
 /// Parse hex threshold value to u64
@@ -342,8 +401,8 @@ fn parseHexThreshold(hex: []const u8) ?u64 {
 /// Maximum size for tracestate buffer (W3C spec allows up to ~8KB, but we use a reasonable limit)
 pub const MAX_TRACESTATE_LEN: usize = 512;
 
-/// Update tracestate with sampling threshold.
-/// Adds or updates the `ot=th:THRESHOLD` entry in the tracestate.
+/// Update tracestate with sampling threshold and optional randomness value.
+/// Adds or updates the `ot=th:THRESHOLD[;rv:VALUE]` entry in the tracestate.
 ///
 /// Writes the result to the provided buffer and returns a slice of the written data.
 /// Returns null if the buffer is too small.
@@ -351,15 +410,28 @@ pub const MAX_TRACESTATE_LEN: usize = 512;
 /// Per W3C tracestate spec:
 /// - Maximum 32 entries
 /// - Our entry goes at the beginning (most recent sampler)
-/// - If ot vendor already exists, update the th value
+/// - If ot vendor already exists, update the th/rv values
 pub fn updateTracestateInPlace(
     buf: []u8,
     existing_tracestate: []const u8,
     threshold_hex: []const u8,
 ) ?[]u8 {
-    // Build the new ot entry: "ot=th:THRESHOLD"
-    var new_ot_buf: [32]u8 = undefined;
-    const new_ot = std.fmt.bufPrint(&new_ot_buf, "ot=th:{s}", .{threshold_hex}) catch return null;
+    return updateTracestateInPlaceWithRv(buf, existing_tracestate, threshold_hex, null);
+}
+
+/// Update tracestate with sampling threshold and optional rv (randomness value).
+pub fn updateTracestateInPlaceWithRv(
+    buf: []u8,
+    existing_tracestate: []const u8,
+    threshold_hex: []const u8,
+    rv_hex: ?[]const u8,
+) ?[]u8 {
+    // Build the new ot entry: "ot=th:THRESHOLD" or "ot=th:THRESHOLD;rv:VALUE"
+    var new_ot_buf: [64]u8 = undefined;
+    const new_ot = if (rv_hex) |rv|
+        std.fmt.bufPrint(&new_ot_buf, "ot=th:{s};rv:{s}", .{ threshold_hex, rv }) catch return null
+    else
+        std.fmt.bufPrint(&new_ot_buf, "ot=th:{s}", .{threshold_hex}) catch return null;
 
     var pos: usize = 0;
 
@@ -403,15 +475,10 @@ pub fn updateTracestateInPlace(
 /// This is a standalone helper for when you don't have a full ProbabilisticSampler.
 /// Returns a thread-local buffer - caller should copy if persistence needed.
 pub fn thresholdHexFromPercentage(percentage: f32, precision: u32) []const u8 {
-    const sampler = ProbabilisticSampler{
-        .threshold = ProbabilisticSampler.calculateThreshold(percentage),
-        .mode = .SAMPLING_MODE_HASH_SEED,
-        .hash_seed = 0,
-        .precision = @min(14, @max(1, precision)),
-        .fail_closed = true,
-        .percentage = percentage,
-    };
-    return sampler.encodeThreshold();
+    return encodeThresholdValue(
+        ProbabilisticSampler.calculateThreshold(percentage),
+        @min(14, @max(1, precision)),
+    );
 }
 
 // =============================================================================
@@ -580,21 +647,215 @@ test "ProbabilisticSampler: shouldKeep matches sample" {
     try testing.expectEqual(sampler.sample(input, "").keep, sampler.shouldKeep(input));
 }
 
-test "parseThresholdFromTracestate: empty" {
-    try testing.expectEqual(@as(?u64, null), parseThresholdFromTracestate(""));
+test "ProbabilisticSampler: proportional mode computes product threshold" {
+    // Configure sampler at 50%
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = .SAMPLING_MODE_PROPORTIONAL,
+        .sampling_precision = 14,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Existing threshold at 50% (th:8 = 0x80000000000000)
+    // Proportional: 50% * 50% = 25%, so product threshold should be ~75% of MAX_56BIT
+    // T_o = ProbabilityToThreshold(0.5 * 0.5) = ProbabilityToThreshold(0.25)
+    // T_o = (1 - 0.25) * 2^56 = 0.75 * 2^56
+
+    var kept: u32 = 0;
+    const total: u32 = 10000;
+
+    for (0..total) |i| {
+        var trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        trace_id[9] = @intCast((i * 256 / total) & 0xff);
+        trace_id[10] = @intCast(i & 0xff);
+        trace_id[11] = @intCast((i >> 8) & 0xff);
+
+        const result = sampler.sample(&trace_id, "ot=th:8");
+        if (result.keep) kept += 1;
+    }
+
+    // With 50% configured and 50% existing, effective should be ~25%
+    const ratio = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(total));
+    try testing.expect(ratio > 0.20 and ratio < 0.30);
 }
 
-test "parseThresholdFromTracestate: valid ot threshold" {
-    // "ot=th:8" means threshold 0x80000000000000 (8 shifted to fill 56 bits)
-    const result = parseThresholdFromTracestate("ot=th:8");
-    try testing.expect(result != null);
-    try testing.expectEqual(@as(u64, 0x80000000000000), result.?);
+test "ProbabilisticSampler: proportional mode with no existing threshold falls back to hash_seed" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = .SAMPLING_MODE_PROPORTIONAL,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // No tracestate — should behave like hash_seed mode
+    var kept: u32 = 0;
+    const total: u32 = 10000;
+
+    for (0..total) |i| {
+        var trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        trace_id[9] = @intCast((i * 256 / total) & 0xff);
+        trace_id[10] = @intCast(i & 0xff);
+        trace_id[11] = @intCast((i >> 8) & 0xff);
+
+        const result = sampler.sample(&trace_id, "");
+        if (result.keep) kept += 1;
+    }
+
+    const ratio = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(total));
+    try testing.expect(ratio > 0.45 and ratio < 0.55);
 }
 
-test "parseThresholdFromTracestate: multiple entries" {
-    const result = parseThresholdFromTracestate("vendor1=val1,ot=th:4,vendor2=val2");
-    try testing.expect(result != null);
-    try testing.expectEqual(@as(u64, 0x40000000000000), result.?);
+test "ProbabilisticSampler: equalizing mode passes through more restrictive threshold" {
+    // Configure sampler at 50% (threshold = 0x80000000000000)
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = .SAMPLING_MODE_EQUALIZING,
+        .sampling_precision = 14,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Existing threshold at 25% (th:c = 0xc0000000000000, more restrictive)
+    // Since existing is more restrictive, all spans should pass through
+    const trace_id = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    const result = sampler.sample(&trace_id, "ot=th:c");
+
+    // Existing threshold (c = 0xc...) > sampler threshold (8 = 0x8...)
+    // Per spec: pass through with existing threshold
+    try testing.expect(result.keep);
+    try testing.expect(result.new_threshold != null);
+    // Output threshold should encode the existing (more restrictive) threshold
+    try testing.expect(result.new_threshold.?[0] == 'c');
+}
+
+test "ProbabilisticSampler: equalizing mode applies own threshold when less restrictive" {
+    // Configure sampler at 25% (threshold = 0xc0000000000000)
+    const config = TraceSamplingConfig{
+        .percentage = 25.0,
+        .mode = .SAMPLING_MODE_EQUALIZING,
+        .sampling_precision = 14,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Existing threshold at 50% (th:8 = 0x80000000000000, less restrictive)
+    // Since our threshold is more restrictive, we should apply ours
+    var kept: u32 = 0;
+    const total: u32 = 10000;
+
+    for (0..total) |i| {
+        var trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        trace_id[9] = @intCast((i * 256 / total) & 0xff);
+        trace_id[10] = @intCast(i & 0xff);
+        trace_id[11] = @intCast((i >> 8) & 0xff);
+
+        const result = sampler.sample(&trace_id, "ot=th:8");
+        if (result.keep) kept += 1;
+    }
+
+    // Should sample at ~25% (our more restrictive threshold)
+    const ratio = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(total));
+    try testing.expect(ratio > 0.20 and ratio < 0.30);
+}
+
+test "ProbabilisticSampler: rv from tracestate used as randomness" {
+    // Configure sampler at 50% (threshold = 0x80000000000000)
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = .SAMPLING_MODE_HASH_SEED,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // rv:ff... = very high randomness, should always be kept at 50%
+    // th:0 means upstream kept everything (consistent: rv >= 0)
+    const trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const result_high = sampler.sample(&trace_id, "ot=th:0;rv:ffffffffffffff");
+    try testing.expect(result_high.keep);
+
+    // rv:01... = very low randomness, should be dropped at 50%
+    // th:0 means upstream kept everything (consistent: rv >= 0)
+    const result_low = sampler.sample(&trace_id, "ot=th:0;rv:01000000000000");
+    try testing.expect(!result_low.keep);
+}
+
+test "ProbabilisticSampler: rv preserved in output" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = .SAMPLING_MODE_HASH_SEED,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    const trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const result = sampler.sample(&trace_id, "ot=th:0;rv:ffffffffffffff");
+
+    // rv should be preserved in the output
+    try testing.expect(result.rv != null);
+    try testing.expectEqualStrings("ffffffffffffff", result.rv.?);
+}
+
+test "ProbabilisticSampler: inconsistent rv/th erases threshold" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = .SAMPLING_MODE_HASH_SEED,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // rv < th means the span should not have been sampled at this threshold,
+    // which is inconsistent. The sampler should erase the threshold.
+    // rv:1 = 0x10000000000000, th:8 = 0x80000000000000 => rv < th, inconsistent
+    const trace_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const result = sampler.sample(&trace_id, "ot=th:8;rv:1");
+
+    // Inconsistent: should keep (sampled flag says sampled) but erase threshold
+    try testing.expect(result.keep);
+    try testing.expect(result.new_threshold == null);
+    // rv should still be preserved
+    try testing.expect(result.rv != null);
+}
+
+test "parseOtFromTracestate: empty" {
+    const info = parseOtFromTracestate("");
+    try testing.expect(info.th == null);
+    try testing.expect(info.rv == null);
+}
+
+test "parseOtFromTracestate: th only" {
+    const info = parseOtFromTracestate("ot=th:8");
+    try testing.expect(info.th != null);
+    try testing.expectEqual(@as(u64, 0x80000000000000), info.th.?);
+    try testing.expect(info.rv == null);
+}
+
+test "parseOtFromTracestate: th and rv" {
+    const info = parseOtFromTracestate("ot=th:8;rv:abcd");
+    try testing.expect(info.th != null);
+    try testing.expectEqual(@as(u64, 0x80000000000000), info.th.?);
+    try testing.expect(info.rv != null);
+    try testing.expectEqual(@as(u64, 0xabcd0000000000), info.rv.?);
+    try testing.expectEqualStrings("abcd", info.rv_hex.?);
+}
+
+test "parseOtFromTracestate: multiple entries with ot" {
+    const info = parseOtFromTracestate("vendor1=val1,ot=th:4;rv:ff,vendor2=val2");
+    try testing.expect(info.th != null);
+    try testing.expectEqual(@as(u64, 0x40000000000000), info.th.?);
+    try testing.expect(info.rv != null);
+    try testing.expectEqual(@as(u64, 0xff000000000000), info.rv.?);
 }
 
 test "parseHexThreshold: single digit" {
@@ -642,6 +903,20 @@ test "updateTracestateInPlace: buffer too small returns null" {
     try testing.expect(result == null);
 }
 
+test "updateTracestateInPlaceWithRv: includes rv" {
+    var buf: [MAX_TRACESTATE_LEN]u8 = undefined;
+    const result = updateTracestateInPlaceWithRv(&buf, "", "8", "abcd");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("ot=th:8;rv:abcd", result.?);
+}
+
+test "updateTracestateInPlaceWithRv: replaces existing ot with rv" {
+    var buf: [MAX_TRACESTATE_LEN]u8 = undefined;
+    const result = updateTracestateInPlaceWithRv(&buf, "ot=th:4;rv:1234,vendor=val", "8", "abcd");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("ot=th:8;rv:abcd,vendor=val", result.?);
+}
+
 test "thresholdHexFromPercentage: 50%" {
     const hex = thresholdHexFromPercentage(50.0, 4);
     // 50% means threshold = 2^55 = 0x80000000000000
@@ -655,4 +930,22 @@ test "thresholdHexFromPercentage: 100%" {
     const hex = thresholdHexFromPercentage(100.0, 4);
     // 100% means threshold = 0
     try testing.expectEqualStrings("0", hex);
+}
+
+test "ProbabilisticSampler: thresholdToProbability and probabilityToThreshold roundtrip" {
+    // 50% -> threshold -> probability should roundtrip
+    const threshold_50 = ProbabilisticSampler.calculateThreshold(50.0);
+    const prob = ProbabilisticSampler.thresholdToProbability(threshold_50);
+    try testing.expect(prob > 0.499 and prob < 0.501);
+
+    // Roundtrip: probability -> threshold -> probability
+    const t = ProbabilisticSampler.probabilityToThreshold(0.25);
+    const p = ProbabilisticSampler.thresholdToProbability(t);
+    try testing.expect(p > 0.249 and p < 0.251);
+
+    // Edge cases
+    try testing.expectEqual(@as(f64, 1.0), ProbabilisticSampler.thresholdToProbability(0));
+    try testing.expectEqual(@as(f64, 0.0), ProbabilisticSampler.thresholdToProbability(MAX_56BIT));
+    try testing.expectEqual(@as(u64, 0), ProbabilisticSampler.probabilityToThreshold(1.0));
+    try testing.expectEqual(MAX_56BIT, ProbabilisticSampler.probabilityToThreshold(0.0));
 }
