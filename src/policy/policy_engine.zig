@@ -279,6 +279,8 @@ pub const PolicyEngine = struct {
         matched_decisions: [MAX_MATCHES_PER_SCAN]FilterDecision,
         matched_count: usize,
         decision: FilterDecision,
+        /// Whether a trace sampling threshold was written back via mutator
+        was_trace_sampled: bool = false,
     };
 
     pub fn evaluate(
@@ -313,7 +315,7 @@ pub const PolicyEngine = struct {
         var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
-        const match_state = self.findMatchingPolicies(T, ctx, field_accessor, index, &scan_state, policy_id_buf);
+        const match_state = self.findMatchingPolicies(T, ctx, field_accessor, field_mutator, index, &scan_state, policy_id_buf);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
 
@@ -325,7 +327,7 @@ pub const PolicyEngine = struct {
         }
 
         // Phase 3: Apply transforms (log only) and record stats
-        var was_transformed = false;
+        var was_transformed = match_state.was_trace_sampled;
         if (T == .log) {
             if (field_mutator) |mutator| {
                 for (0..match_state.matched_count) |i| {
@@ -477,11 +479,17 @@ pub const PolicyEngine = struct {
 
     /// Find all matching policies, apply sampling/rate limiting, and determine final decision.
     /// Drop always beats keep: if any policy returns drop, final decision is drop.
+    ///
+    /// For trace telemetry with probabilistic sampling, reads tracestate via field_accessor
+    /// and writes the sampling threshold back via field_mutator (if provided). The threshold
+    /// hex value is written to TRACE_FIELD_TRACE_STATE; the host is responsible for merging
+    /// it into the actual W3C tracestate header as `ot=th:VALUE`.
     inline fn findMatchingPolicies(
         self: *const Self,
         comptime T: TelemetryType,
         ctx: *anyopaque,
         field_accessor: FieldAccessorType(T),
+        field_mutator: ?FieldMutatorType(T),
         index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
         policy_id_buf: [][]const u8,
@@ -506,6 +514,30 @@ pub const PolicyEngine = struct {
                 const decision = blk: {
                     if (policy_info.sampler) |s| {
                         const input = getSamplingInput(T, ctx, field_accessor, policy_info) orelse "";
+
+                        if (T == .trace) {
+                            // Trace sampling: read tracestate, run full sample(), write threshold back
+                            const ts_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_STATE };
+                            const tracestate = field_accessor(ctx, ts_ref) orelse "";
+                            const sr = s.sample(input, tracestate);
+
+                            if (sr.keep) {
+                                if (field_mutator) |mutator| {
+                                    if (sr.new_threshold) |th| {
+                                        _ = mutator(ctx, .{ .set = .{
+                                            .field = .{ .trace_field = .TRACE_FIELD_TRACE_STATE },
+                                            .value = th,
+                                            .upsert = true,
+                                        } });
+                                        state.was_trace_sampled = true;
+                                    }
+                                }
+                            }
+
+                            break :blk if (sr.keep) FilterDecision.keep else FilterDecision.drop;
+                        }
+
+                        // Non-trace: simple keep/drop from shouldKeep
                         break :blk if (s.shouldKeep(input)) FilterDecision.keep else FilterDecision.drop;
                     }
                     break :blk applyKeepValue(policy_info);
@@ -631,6 +663,10 @@ pub const PolicyEngine = struct {
 const testing = std.testing;
 const SourceType = policy_mod.SourceType;
 const LogField = proto.policy.LogField;
+const TraceField = proto.policy.TraceField;
+const TraceMatcher = proto.policy.TraceMatcher;
+const TraceSamplingConfig = proto.policy.TraceSamplingConfig;
+const SamplingMode = proto.policy.SamplingMode;
 const AttributePath = proto.policy.AttributePath;
 
 /// Helper to create AttributePath for tests
@@ -3937,4 +3973,260 @@ test "MetricPolicyEngine: scope_version matching" {
     var new_metric = TestMetricContext{ .name = "cpu", .scope_version = "2.0.0" };
     const result2 = engine.evaluate(.metric, &new_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
     try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+// =============================================================================
+// Trace Sampling Tests
+// =============================================================================
+
+/// Test context for trace policy evaluation tests
+const TestTraceContext = struct {
+    name: ?[]const u8 = null,
+    trace_id: ?[]const u8 = null,
+    span_id: ?[]const u8 = null,
+    trace_state: ?[]const u8 = null,
+
+    /// Last value written via the mutator (captured for test assertions)
+    last_mutate_field: ?TraceField = null,
+    last_mutate_value: ?[]const u8 = null,
+    mutate_count: usize = 0,
+
+    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
+        const self: *const TestTraceContext = @ptrCast(@alignCast(ctx_ptr));
+        return switch (field) {
+            .trace_field => |tf| switch (tf) {
+                .TRACE_FIELD_NAME => self.name,
+                .TRACE_FIELD_TRACE_ID => self.trace_id,
+                .TRACE_FIELD_SPAN_ID => self.span_id,
+                .TRACE_FIELD_TRACE_STATE => self.trace_state,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    pub fn fieldMutator(ctx_ptr: *anyopaque, op: TraceMutateOp) bool {
+        const self: *TestTraceContext = @ptrCast(@alignCast(ctx_ptr));
+        switch (op) {
+            .set => |s| {
+                switch (s.field) {
+                    .trace_field => |tf| {
+                        self.last_mutate_field = tf;
+                    },
+                    else => {},
+                }
+                self.last_mutate_value = s.value;
+                self.mutate_count += 1;
+                return true;
+            },
+            else => return false,
+        }
+    }
+};
+
+test "PolicyEngine: trace sampling writes threshold via mutator" {
+    const allocator = testing.allocator;
+
+    // Create a trace policy with 50% sampling
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-sample-50"),
+        .name = try allocator.dupe(u8, "sample-50"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 50.0 },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Use a trace ID whose last 7 bytes produce R >= threshold (will be kept)
+    // 50% threshold = 2^55 = 0x80000000000000
+    // We need R >= 0x80000000000000, so last 7 bytes should be >= 0x80000000000000
+    // Use 0xFF bytes for the last 7 bytes to guarantee keep
+    var ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expect(result.was_transformed);
+    try testing.expectEqual(@as(usize, 1), ctx.mutate_count);
+    try testing.expectEqual(TraceField.TRACE_FIELD_TRACE_STATE, ctx.last_mutate_field.?);
+    // The threshold value should be non-null (the hex encoding of the 50% threshold)
+    try testing.expect(ctx.last_mutate_value != null);
+}
+
+test "PolicyEngine: trace sampling drop does not write threshold" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-sample-50"),
+        .name = try allocator.dupe(u8, "sample-50"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 50.0 },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Use a trace ID whose last 7 bytes produce R < threshold (will be dropped)
+    // 50% threshold = 2^55 = 0x80000000000000
+    // Last 7 bytes = all zeros → R = 0 < threshold → drop
+    var ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+    try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
+}
+
+test "PolicyEngine: trace sampling without mutator still returns correct decision" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-sample-50"),
+        .name = try allocator.dupe(u8, "sample-50"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 50.0 },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // High R → keep, but no mutator provided
+    var ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // was_transformed should be false since no mutator was provided
+    try testing.expect(!result.was_transformed);
+}
+
+test "PolicyEngine: trace proportional sampling reads incoming tracestate" {
+    const allocator = testing.allocator;
+
+    // Create a trace policy with 50% proportional sampling
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-proportional"),
+        .name = try allocator.dupe(u8, "proportional-50"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{
+                .percentage = 50.0,
+                .mode = .SAMPLING_MODE_PROPORTIONAL,
+            },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Incoming tracestate with 50% threshold (th:8) means already sampled at 50%.
+    // Proportional 50% of 50% = 25% effective.
+    // Product threshold = rejection_threshold(0.25) = (1-0.25)*2^56 = 0xC0000000000000
+    // R = 0xFFFFFFFFFFFFFF (max) → R >= product threshold → keep
+    var ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+        .trace_state = "ot=th:8",
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expect(result.was_transformed);
+    try testing.expectEqual(@as(usize, 1), ctx.mutate_count);
+    // The written threshold should reflect the product (not the raw 50% threshold)
+    try testing.expect(ctx.last_mutate_value != null);
+}
+
+test "PolicyEngine: trace sampling 0% drops all" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-sample-0"),
+        .name = try allocator.dupe(u8, "sample-0"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 0.0 },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Even with high R, 0% should always drop
+    var ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+    try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
 }
