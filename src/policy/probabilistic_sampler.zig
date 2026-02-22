@@ -151,7 +151,7 @@ pub const ProbabilisticSampler = struct {
     pub fn sample(self: ProbabilisticSampler, input: []const u8, tracestate: []const u8) SamplingResult {
         // Edge cases
         if (self.percentage >= 100.0) {
-            return .{ .keep = true, .new_threshold = null, .rv = null };
+            return .{ .keep = true, .new_threshold = encodeThresholdValue(0, self.precision), .rv = null };
         }
         if (self.percentage <= 0.0) {
             return .{ .keep = false, .new_threshold = null, .rv = null };
@@ -161,10 +161,16 @@ pub const ProbabilisticSampler = struct {
         const ts_info = parseOtFromTracestate(tracestate);
 
         // If explicit rv is present, use it as the randomness value
-        const r = if (ts_info.rv) |rv_val|
+        const r: ?u64 = if (ts_info.rv) |rv_val|
             rv_val
         else
             self.computeRandomness(input);
+
+        // If randomness couldn't be derived, respect fail_closed setting.
+        // Per spec, threshold must be erased for spans with unknown probability.
+        if (r == null) {
+            return .{ .keep = !self.fail_closed, .new_threshold = null, .rv = null };
+        }
 
         // Consistency check: if both rv and th are present, verify rv >= th
         if (ts_info.rv != null and ts_info.th != null) {
@@ -175,10 +181,10 @@ pub const ProbabilisticSampler = struct {
         }
 
         return switch (self.mode) {
-            .SAMPLING_MODE_UNSPECIFIED, .SAMPLING_MODE_HASH_SEED => self.sampleHashSeed(r, ts_info.rv_hex),
-            .SAMPLING_MODE_PROPORTIONAL => self.sampleProportional(r, ts_info.th, ts_info.rv_hex),
-            .SAMPLING_MODE_EQUALIZING => self.sampleEqualizing(r, ts_info.th, ts_info.rv_hex),
-            _ => self.sampleHashSeed(r, ts_info.rv_hex), // Unknown mode defaults to hash_seed
+            .SAMPLING_MODE_UNSPECIFIED, .SAMPLING_MODE_HASH_SEED => self.sampleHashSeed(r.?, ts_info.rv_hex),
+            .SAMPLING_MODE_PROPORTIONAL => self.sampleProportional(r.?, ts_info.th, ts_info.rv_hex),
+            .SAMPLING_MODE_EQUALIZING => self.sampleEqualizing(r.?, ts_info.th, ts_info.rv_hex),
+            _ => self.sampleHashSeed(r.?, ts_info.rv_hex), // Unknown mode defaults to hash_seed
         };
     }
 
@@ -260,7 +266,7 @@ pub const ProbabilisticSampler = struct {
     ///
     /// For shorter inputs (e.g. log sample keys), hashes all bytes with
     /// hash_seed using splitmix64 for uniform distribution.
-    fn computeRandomness(self: ProbabilisticSampler, input: []const u8) u64 {
+    fn computeRandomness(self: ProbabilisticSampler, input: []const u8) ?u64 {
         if (input.len >= 16) {
             // Standard 16-byte trace_id - extract last 7 bytes as randomness
             // directly, without hashing. Per OTel spec, the least-significant
@@ -281,7 +287,8 @@ pub const ProbabilisticSampler = struct {
             return r & (MAX_56BIT - 1);
         }
 
-        return 0;
+        // Empty input — randomness cannot be derived
+        return null;
     }
 
     /// Encode a threshold as a hex string for tracestate.
@@ -306,19 +313,26 @@ fn encodeThresholdValue(threshold: u64, precision: u32) []const u8 {
         threadlocal var buf: [14]u8 = undefined;
     };
 
+    const p = if (precision < 1) 4 else if (precision > 14) 14 else precision;
+
     const hex_chars = "0123456789abcdef";
     var len: usize = 0;
-    var t = threshold;
 
+    // Encode p nibbles from the top of the 56-bit threshold
     var i: u32 = 0;
-    while (i < precision and t > 0) : (i += 1) {
-        const nibble = @as(u4, @truncate(t >> 52));
+    while (i < p) : (i += 1) {
+        const shift = @as(u6, @intCast(52 -| (i * 4)));
+        const nibble = @as(u4, @truncate(threshold >> shift));
         S.buf[len] = hex_chars[nibble];
         len += 1;
-        t <<= 4;
     }
 
-    // If threshold is 0, encode as "0"
+    // Strip trailing zeros per W3C tracestate spec
+    while (len > 0 and S.buf[len - 1] == '0') {
+        len -= 1;
+    }
+
+    // Always return at least "0"
     if (len == 0) {
         S.buf[0] = '0';
         len = 1;
