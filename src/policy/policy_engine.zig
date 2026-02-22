@@ -4230,3 +4230,79 @@ test "PolicyEngine: trace sampling 0% drops all" {
     try testing.expectEqual(FilterDecision.drop, result.decision);
     try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
 }
+
+test "PolicyEngine: trace sampling fail_closed=true drops span with no trace ID" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-fail-closed"),
+        .name = try allocator.dupe(u8, "fail-closed"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{
+                .percentage = 50.0,
+                .fail_closed = true,
+            },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // No trace ID → can't derive randomness → fail_closed=true → drop
+    var ctx = TestTraceContext{
+        .name = "test-span",
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+}
+
+test "PolicyEngine: trace sampling fail_closed=false keeps span with no trace ID" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-fail-open"),
+        .name = try allocator.dupe(u8, "fail-open"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{
+                .percentage = 50.0,
+                .fail_closed = false,
+            },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // No trace ID → can't derive randomness → fail_closed=false → keep
+    var ctx = TestTraceContext{
+        .name = "test-span",
+    };
+
+    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+}
