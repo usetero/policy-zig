@@ -555,6 +555,14 @@ pub const PolicyRegistry = struct {
 
         @memcpy(policies_slice, self.policies.items);
 
+        // Sort policies by ID so that policy index order = alphanumeric ID order.
+        // The spec requires transforms to be applied in alphanumeric order by policy ID.
+        std.mem.sort(Policy, policies_slice, {}, struct {
+            fn lessThan(_: void, a: Policy, b: Policy) bool {
+                return std.mem.order(u8, a.id, b.id) == .lt;
+            }
+        }.lessThan);
+
         // Build indices by config type
         // First pass: count policies of each type
         var log_target_count: usize = 0;

@@ -312,7 +312,7 @@ pub const PolicyEngine = struct {
         self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len, .policy_count = index.getPolicyCount() });
 
         // Phase 1: Scan all matcher keys and compute match counts
-        var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
+        const scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
         const match_state = self.findMatchingPolicies(T, ctx, field_accessor, field_mutator, index, &scan_state, policy_id_buf);
@@ -381,9 +381,11 @@ pub const PolicyEngine = struct {
         for (index.getPoliciesWithNegation()) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
             state.match_counts[policy_index] = policy_info.negated_count;
-            state.is_active[policy_index] = true;
-            state.active_policies[state.active_count] = policy_index;
-            state.active_count += 1;
+            if (!state.is_active[policy_index]) {
+                state.is_active[policy_index] = true;
+                state.active_policies[state.active_count] = policy_index;
+                state.active_count += 1;
+            }
         }
 
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
@@ -451,6 +453,11 @@ pub const PolicyEngine = struct {
             self.bus.debug(ScanResult{ .positive_count = positive_result.count, .negated_count = negated_result.count });
         }
 
+        // Sort active policies by index so iteration order = alphanumeric policy ID order.
+        // Policy indices are assigned from an ID-sorted policies_slice in createSnapshot.
+        // This sorts only the active set (typically 3-5 elements), not all policies.
+        std.mem.sort(PolicyIndex, state.active_policies[0..state.active_count], {}, std.sort.asc(PolicyIndex));
+
         return state;
     }
 
@@ -502,6 +509,8 @@ pub const PolicyEngine = struct {
             .decision = .unset,
         };
 
+        // Iterate active policies in index order (= alphanumeric ID order from sorted snapshot).
+        // This guarantees transforms are applied in spec-required alphanumeric order.
         for (scan_state.active_policies[0..scan_state.active_count]) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
 
@@ -2314,17 +2323,18 @@ test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     // Both policies should have stats recorded via lock-free atomics
+    // After sorting by ID: "drop-policy" is index 0, "keep-policy" is index 1
     const snapshot = registry.getSnapshot().?;
 
-    // KEEP policy (index 0) gets miss (its decision differs from final decision)
-    const keep_stats = snapshot.getStats(0).?;
-    try testing.expectEqual(@as(i64, 0), keep_stats.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 1), keep_stats.misses.load(.monotonic));
-
-    // DROP policy (index 1) gets hit (its decision matches final decision)
-    const drop_stats = snapshot.getStats(1).?;
+    // DROP policy (index 0 after sort) gets hit
+    const drop_stats = snapshot.getStats(0).?;
     try testing.expectEqual(@as(i64, 1), drop_stats.hits.load(.monotonic));
     try testing.expectEqual(@as(i64, 0), drop_stats.misses.load(.monotonic));
+
+    // KEEP policy (index 1 after sort) gets miss
+    const keep_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 0), keep_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), keep_stats.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: single policy match gets hit" {
@@ -2433,24 +2443,25 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - single DROP winner, KEEPs g
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     // All 4 policies should have stats recorded via lock-free atomics
+    // After sorting by ID: drop-1(0), drop-2(1), keep-1(2), keep-2(3)
     const snapshot = registry.getSnapshot().?;
 
-    // Both KEEP policies (index 0,1) get misses (their decision differs from final decision)
-    const keep1_stats = snapshot.getStats(0).?;
-    try testing.expectEqual(@as(i64, 0), keep1_stats.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 1), keep1_stats.misses.load(.monotonic));
-
-    const keep2_stats = snapshot.getStats(1).?;
-    try testing.expectEqual(@as(i64, 0), keep2_stats.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 1), keep2_stats.misses.load(.monotonic));
-
-    // Single-winner among equally-restrictive DROP policies: one hit, one miss
-    const drop1_stats = snapshot.getStats(2).?;
-    const drop2_stats = snapshot.getStats(3).?;
+    // Single-winner among equally-restrictive DROP policies (index 0,1): one hit, one miss
+    const drop1_stats = snapshot.getStats(0).?;
+    const drop2_stats = snapshot.getStats(1).?;
     const drop_hits = drop1_stats.hits.load(.monotonic) + drop2_stats.hits.load(.monotonic);
     const drop_misses = drop1_stats.misses.load(.monotonic) + drop2_stats.misses.load(.monotonic);
     try testing.expectEqual(@as(i64, 1), drop_hits);
     try testing.expectEqual(@as(i64, 1), drop_misses);
+
+    // Both KEEP policies (index 2,3) get misses (their decision differs from final decision)
+    const keep1_stats = snapshot.getStats(2).?;
+    try testing.expectEqual(@as(i64, 0), keep1_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), keep1_stats.misses.load(.monotonic));
+
+    const keep2_stats = snapshot.getStats(3).?;
+    try testing.expectEqual(@as(i64, 0), keep2_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), keep2_stats.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: no match records no stats" {
