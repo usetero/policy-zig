@@ -500,7 +500,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         policy_info_list: std.ArrayListUnmanaged(PolicyInfo),
         path_storage: std.ArrayListUnmanaged([]const []const u8),
         policy_id_storage: std.ArrayListUnmanaged([]const u8),
-        policy_index: PolicyIndex,
+        current_policy_index: PolicyIndex,
         current_positive_count: u16,
         current_negated_count: u16,
 
@@ -515,23 +515,25 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .policy_info_list = .{},
                 .path_storage = .{},
                 .policy_id_storage = .{},
-                .policy_index = 0,
+                .current_policy_index = 0,
                 .current_positive_count = 0,
                 .current_negated_count = 0,
             };
         }
 
-        fn processPolicy(self: *Self, policy: *const Policy) !void {
+        fn processPolicy(self: *Self, policy: *const Policy, global_index: PolicyIndex) !void {
             const target = getTarget(policy) orelse {
                 self.bus.debug(SkippingPolicyWrongType{ .id = policy.id });
                 return;
             };
 
+            self.current_policy_index = global_index;
+
             self.bus.debug(ProcessingPolicy{
                 .id = policy.id,
                 .name = policy.name,
                 .enabled = policy.enabled,
-                .index = self.policy_index,
+                .index = global_index,
                 .telemetry_type = T,
             });
 
@@ -545,7 +547,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
 
             const keep_value = parseKeepValue(target);
-            try self.storePolicyInfo(policy, target, keep_value);
+            try self.storePolicyInfo(policy, target, keep_value, global_index);
         }
 
         fn getTarget(policy: *const Policy) ?*const TargetT {
@@ -665,7 +667,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
 
             const collector = PatternCollector{
-                .policy_index = self.policy_index,
+                .policy_index = self.current_policy_index,
                 .pattern = info.pattern,
                 .match_type = info.match_type,
                 .case_insensitive = info.case_insensitive,
@@ -726,7 +728,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
         }
 
-        fn storePolicyInfo(self: *Self, policy: *const Policy, target: *const TargetT, keep: KeepValue) !void {
+        fn storePolicyInfo(self: *Self, policy: *const Policy, target: *const TargetT, keep: KeepValue, global_index: PolicyIndex) !void {
             const policy_id_copy = try self.allocator.dupe(u8, policy.id);
             try self.policy_id_storage.append(self.allocator, policy_id_copy);
 
@@ -762,7 +764,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
 
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
-                .index = self.policy_index,
+                .index = global_index,
                 .required_match_count = self.current_positive_count + self.current_negated_count,
                 .negated_count = self.current_negated_count,
                 .keep = keep,
@@ -774,12 +776,10 @@ fn IndexBuilder(comptime T: TelemetryType) type {
 
             self.bus.debug(PolicyStored{
                 .id = policy.id,
-                .index = self.policy_index,
+                .index = global_index,
                 .required_matches = self.current_positive_count,
                 .negated_count = self.current_negated_count,
             });
-
-            self.policy_index += 1;
         }
 
         fn finish(self: *Self) !IndexT {
@@ -852,8 +852,8 @@ pub const LogMatcherIndex = struct {
 
         var builder = IndexBuilder(.log).init(allocator, arena.allocator(), bus);
 
-        for (policies_slice) |*policy| {
-            try builder.processPolicy(policy);
+        for (policies_slice, 0..) |*policy, i| {
+            try builder.processPolicy(policy, @intCast(i));
         }
 
         var index = try builder.finish();
@@ -872,8 +872,10 @@ pub const LogMatcherIndex = struct {
     }
 
     pub fn getPolicyByIndex(self: *const Self, index: PolicyIndex) ?PolicyInfo {
-        if (index >= self.policies.len) return null;
-        return self.policies[index];
+        for (self.policies) |info| {
+            if (info.index == index) return info;
+        }
+        return null;
     }
 
     pub fn getPolicy(self: *const Self, id: []const u8) ?PolicyInfo {
@@ -968,8 +970,8 @@ pub const MetricMatcherIndex = struct {
 
         var builder = IndexBuilder(.metric).init(allocator, arena.allocator(), bus);
 
-        for (policies_slice) |*policy| {
-            try builder.processPolicy(policy);
+        for (policies_slice, 0..) |*policy, i| {
+            try builder.processPolicy(policy, @intCast(i));
         }
 
         var index = try builder.finish();
@@ -988,8 +990,10 @@ pub const MetricMatcherIndex = struct {
     }
 
     pub fn getPolicyByIndex(self: *const Self, index: PolicyIndex) ?PolicyInfo {
-        if (index >= self.policies.len) return null;
-        return self.policies[index];
+        for (self.policies) |info| {
+            if (info.index == index) return info;
+        }
+        return null;
     }
 
     pub fn getPolicy(self: *const Self, id: []const u8) ?PolicyInfo {
@@ -1084,8 +1088,8 @@ pub const TraceMatcherIndex = struct {
 
         var builder = IndexBuilder(.trace).init(allocator, arena.allocator(), bus);
 
-        for (policies_slice) |*policy| {
-            try builder.processPolicy(policy);
+        for (policies_slice, 0..) |*policy, i| {
+            try builder.processPolicy(policy, @intCast(i));
         }
 
         var index = try builder.finish();
@@ -1104,8 +1108,10 @@ pub const TraceMatcherIndex = struct {
     }
 
     pub fn getPolicyByIndex(self: *const Self, index: PolicyIndex) ?PolicyInfo {
-        if (index >= self.policies.len) return null;
-        return self.policies[index];
+        for (self.policies) |info| {
+            if (info.index == index) return info;
+        }
+        return null;
     }
 
     pub fn getPolicy(self: *const Self, id: []const u8) ?PolicyInfo {

@@ -4306,3 +4306,97 @@ test "PolicyEngine: trace sampling fail_closed=false keeps span with no trace ID
     const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
     try testing.expectEqual(FilterDecision.keep, result.decision);
 }
+
+// =============================================================================
+// Mixed Signal Type Stats Tests
+// =============================================================================
+
+test "PolicyEngine: mixed signal policies scope stats to own signal type" {
+    const allocator = testing.allocator;
+
+    // Policy 0: log policy — drop logs matching "error"
+    var log_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-error-logs"),
+        .name = try allocator.dupe(u8, "drop-error-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try log_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer log_policy.deinit(allocator);
+
+    // Policy 1: metric policy — drop metrics named "internal.*"
+    var metric_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-internal-metrics"),
+        .name = try allocator.dupe(u8, "drop-internal-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try metric_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .starts_with = try allocator.dupe(u8, "internal.") },
+    });
+    defer metric_policy.deinit(allocator);
+
+    // Policy 2: trace policy — drop spans containing "health"
+    var trace_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-health-spans"),
+        .name = try allocator.dupe(u8, "drop-health-spans"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 0.0 },
+        } },
+    };
+    try trace_policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .contains = try allocator.dupe(u8, "health") },
+    });
+    defer trace_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Register all three policies together (indices 0, 1, 2 in global stats)
+    try registry.updatePolicies(&.{ log_policy, metric_policy, trace_policy }, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // --- Evaluate a matching LOG ---
+    var log_ctx = TestLogContext{ .message = "an error occurred" };
+    _ = engine.evaluate(.log, &log_ctx, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // --- Evaluate a matching METRIC ---
+    var metric_ctx = TestMetricContext{ .name = "internal.debug.counter" };
+    _ = engine.evaluate(.metric, &metric_ctx, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+
+    // --- Evaluate a matching TRACE ---
+    var trace_ctx = TestTraceContext{
+        .name = "GET /health/ready",
+        .trace_id = &[16]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+    };
+    _ = engine.evaluate(.trace, &trace_ctx, TestTraceContext.fieldAccessor, null, &policy_id_buf);
+
+    // --- Verify stats ---
+    const snapshot = registry.getSnapshot().?;
+
+    // Policy 0 (drop-error-logs): should have exactly 1 hit from the log eval
+    const log_stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), log_stats.hits.load(.monotonic));
+
+    // Policy 1 (drop-internal-metrics): should have exactly 1 hit from the metric eval
+    const metric_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 1), metric_stats.hits.load(.monotonic));
+
+    // Policy 2 (drop-health-spans): should have exactly 1 hit from the trace eval
+    const trace_stats = snapshot.getStats(2).?;
+    try testing.expectEqual(@as(i64, 1), trace_stats.hits.load(.monotonic));
+}
