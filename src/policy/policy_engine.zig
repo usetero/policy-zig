@@ -597,8 +597,9 @@ pub const PolicyEngine = struct {
     ///
     /// Per spec:
     /// - Record kept: all matching policies record a hit.
-    /// - Record dropped: the most restrictive matching policies record a hit,
-    ///   all other matching policies record a miss.
+    /// - Record dropped: the single most restrictive matching policy records a hit,
+    ///   all other matching policies record a miss. When multiple policies share the
+    ///   same restrictiveness, the first encountered wins (consistent with Go).
     ///
     /// Restrictiveness order: none > percentage/per_second/per_minute > all
     inline fn recordMatchedPolicyStats(
@@ -619,18 +620,21 @@ pub const PolicyEngine = struct {
             return;
         }
 
-        // Record dropped: find the most restrictive keep value tier,
-        // give those policies hits, everyone else gets a miss.
+        // Record dropped: find the single most restrictive policy (first encountered wins ties).
         // Uses KeepValue.restrictiveness(): none(0) > rate(1) > pct(2) > all(3)
-        var most_restrictive: u8 = 3; // start at least restrictive (all)
-        for (0..match_state.matched_count) |i| {
+        var best_index: usize = 0;
+        var best_restrictiveness: u8 = match_state.matched_policies[0].keep.restrictiveness();
+        for (1..match_state.matched_count) |i| {
             const level = match_state.matched_policies[i].keep.restrictiveness();
-            if (level < most_restrictive) most_restrictive = level;
+            if (level < best_restrictiveness) {
+                best_restrictiveness = level;
+                best_index = i;
+            }
         }
 
         for (0..match_state.matched_count) |i| {
             if (snapshot.getStats(match_state.matched_policies[i].stats_index)) |stats| {
-                if (match_state.matched_policies[i].keep.restrictiveness() == most_restrictive) {
+                if (i == best_index) {
                     stats.addHit();
                 } else {
                     stats.addMiss();
@@ -2151,7 +2155,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
 // Stats Recording Tests
 // =============================================================================
 
-test "PolicyEngine stats: all DROP policies get hits" {
+test "PolicyEngine stats: single winner among equally-restrictive DROP policies" {
     const allocator = testing.allocator;
 
     // Two DROP policies that both match
@@ -2195,18 +2199,15 @@ test "PolicyEngine stats: all DROP policies get hits" {
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
-    // Both policies should get hits via lock-free atomic stats on snapshot
+    // Single-winner: only one of the equally-restrictive policies gets a hit
     const snapshot = registry.getSnapshot().?;
 
-    // Policy 0 (drop-1) should have 1 hit
     const stats0 = snapshot.getStats(0).?;
-    try testing.expectEqual(@as(i64, 1), stats0.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 0), stats0.misses.load(.monotonic));
-
-    // Policy 1 (drop-2) should have 1 hit
     const stats1 = snapshot.getStats(1).?;
-    try testing.expectEqual(@as(i64, 1), stats1.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 0), stats1.misses.load(.monotonic));
+    const total_hits = stats0.hits.load(.monotonic) + stats1.hits.load(.monotonic);
+    const total_misses = stats0.misses.load(.monotonic) + stats1.misses.load(.monotonic);
+    try testing.expectEqual(@as(i64, 1), total_hits);
+    try testing.expectEqual(@as(i64, 1), total_misses);
 }
 
 test "PolicyEngine stats: all KEEP policies get hits" {
@@ -2361,7 +2362,7 @@ test "PolicyEngine stats: single policy match gets hit" {
     try testing.expectEqual(@as(i64, 0), stats.misses.load(.monotonic));
 }
 
-test "PolicyEngine stats: multiple KEEPs and DROPs - all DROPs get hits, all KEEPs get misses" {
+test "PolicyEngine stats: multiple KEEPs and DROPs - single DROP winner, KEEPs get misses" {
     const allocator = testing.allocator;
 
     // Two KEEP policies
@@ -2443,14 +2444,13 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - all DROPs get hits, all KEE
     try testing.expectEqual(@as(i64, 0), keep2_stats.hits.load(.monotonic));
     try testing.expectEqual(@as(i64, 1), keep2_stats.misses.load(.monotonic));
 
-    // Both DROP policies (index 2,3) get hits (their decision matches final decision)
+    // Single-winner among equally-restrictive DROP policies: one hit, one miss
     const drop1_stats = snapshot.getStats(2).?;
-    try testing.expectEqual(@as(i64, 1), drop1_stats.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 0), drop1_stats.misses.load(.monotonic));
-
     const drop2_stats = snapshot.getStats(3).?;
-    try testing.expectEqual(@as(i64, 1), drop2_stats.hits.load(.monotonic));
-    try testing.expectEqual(@as(i64, 0), drop2_stats.misses.load(.monotonic));
+    const drop_hits = drop1_stats.hits.load(.monotonic) + drop2_stats.hits.load(.monotonic);
+    const drop_misses = drop1_stats.misses.load(.monotonic) + drop2_stats.misses.load(.monotonic);
+    try testing.expectEqual(@as(i64, 1), drop_hits);
+    try testing.expectEqual(@as(i64, 1), drop_misses);
 }
 
 test "PolicyEngine stats: no match records no stats" {
