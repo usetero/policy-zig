@@ -572,9 +572,10 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .metric => if (target.keep) .all else .none,
                 .trace => blk: {
                     // Trace uses TraceSamplingConfig with percentage (0-100)
+                    // Note: we keep 100% as .percentage (not .all) so the sampler is
+                    // created and writes th:0 to tracestate per W3C spec.
                     const keep_config = target.keep orelse break :blk .all;
                     const percentage = keep_config.percentage;
-                    if (percentage >= 100.0) break :blk .all;
                     if (percentage <= 0.0) break :blk .none;
                     break :blk .{ .percentage = @intFromFloat(@min(100.0, @max(0.0, percentage))) };
                 },
