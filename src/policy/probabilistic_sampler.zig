@@ -963,3 +963,41 @@ test "ProbabilisticSampler: thresholdToProbability and probabilityToThreshold ro
     try testing.expectEqual(@as(u64, 0), ProbabilisticSampler.probabilityToThreshold(1.0));
     try testing.expectEqual(MAX_56BIT, ProbabilisticSampler.probabilityToThreshold(0.0));
 }
+
+test "ProbabilisticSampler: fail_closed=true drops on empty input" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .fail_closed = true,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Empty input → no randomness → fail_closed=true → drop
+    const result = sampler.sample("", "");
+    try testing.expect(!result.keep);
+    try testing.expect(result.new_threshold == null);
+}
+
+test "ProbabilisticSampler: fail_closed=false keeps on empty input" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .fail_closed = false,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Empty input → no randomness → fail_closed=false → keep
+    const result = sampler.sample("", "");
+    try testing.expect(result.keep);
+    try testing.expect(result.new_threshold == null);
+}
+
+test "ProbabilisticSampler: fail_closed defaults to true when null" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Empty input → no randomness → default fail_closed=true → drop
+    const result = sampler.sample("", "");
+    try testing.expect(!result.keep);
+}

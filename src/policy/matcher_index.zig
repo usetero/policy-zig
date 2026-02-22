@@ -291,6 +291,9 @@ pub const KeepValue = union(enum) {
 pub const PolicyInfo = struct {
     id: []const u8,
     index: PolicyIndex,
+    /// Global index into the shared policy_stats array. Differs from `index`
+    /// when policies span multiple signal types (log, metric, trace).
+    stats_index: PolicyIndex,
     required_match_count: u16,
     negated_count: u16,
     keep: KeepValue,
@@ -521,7 +524,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             };
         }
 
-        fn processPolicy(self: *Self, policy: *const Policy) !void {
+        fn processPolicy(self: *Self, policy: *const Policy, global_index: PolicyIndex) !void {
             const target = getTarget(policy) orelse {
                 self.bus.debug(SkippingPolicyWrongType{ .id = policy.id });
                 return;
@@ -545,7 +548,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
 
             const keep_value = parseKeepValue(target);
-            try self.storePolicyInfo(policy, target, keep_value);
+            try self.storePolicyInfo(policy, target, keep_value, global_index);
         }
 
         fn getTarget(policy: *const Policy) ?*const TargetT {
@@ -726,7 +729,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
         }
 
-        fn storePolicyInfo(self: *Self, policy: *const Policy, target: *const TargetT, keep: KeepValue) !void {
+        fn storePolicyInfo(self: *Self, policy: *const Policy, target: *const TargetT, keep: KeepValue, global_index: PolicyIndex) !void {
             const policy_id_copy = try self.allocator.dupe(u8, policy.id);
             try self.policy_id_storage.append(self.allocator, policy_id_copy);
 
@@ -763,6 +766,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
                 .index = self.policy_index,
+                .stats_index = global_index,
                 .required_match_count = self.current_positive_count + self.current_negated_count,
                 .negated_count = self.current_negated_count,
                 .keep = keep,
@@ -852,8 +856,8 @@ pub const LogMatcherIndex = struct {
 
         var builder = IndexBuilder(.log).init(allocator, arena.allocator(), bus);
 
-        for (policies_slice) |*policy| {
-            try builder.processPolicy(policy);
+        for (policies_slice, 0..) |*policy, i| {
+            try builder.processPolicy(policy, @intCast(i));
         }
 
         var index = try builder.finish();
@@ -968,8 +972,8 @@ pub const MetricMatcherIndex = struct {
 
         var builder = IndexBuilder(.metric).init(allocator, arena.allocator(), bus);
 
-        for (policies_slice) |*policy| {
-            try builder.processPolicy(policy);
+        for (policies_slice, 0..) |*policy, i| {
+            try builder.processPolicy(policy, @intCast(i));
         }
 
         var index = try builder.finish();
@@ -1084,8 +1088,8 @@ pub const TraceMatcherIndex = struct {
 
         var builder = IndexBuilder(.trace).init(allocator, arena.allocator(), bus);
 
-        for (policies_slice) |*policy| {
-            try builder.processPolicy(policy);
+        for (policies_slice, 0..) |*policy, i| {
+            try builder.processPolicy(policy, @intCast(i));
         }
 
         var index = try builder.finish();
