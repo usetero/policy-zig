@@ -343,7 +343,7 @@ pub const PolicyEngine = struct {
                     if (result.totalApplied() > 0) {
                         was_transformed = true;
                         // Record transform stats using lock-free atomics
-                        if (snapshot.getStats(policy_index)) |stats| {
+                        if (snapshot.getStats(match_state.matched_policies[i].stats_index)) |stats| {
                             stats.addTransform(@intCast(result.totalApplied()));
                         }
                     }
@@ -612,7 +612,7 @@ pub const PolicyEngine = struct {
         if (match_state.decision != .drop) {
             // Record kept (or unset): all matching policies get a hit
             for (0..match_state.matched_count) |i| {
-                if (snapshot.getStats(match_state.matched_indices[i])) |stats| {
+                if (snapshot.getStats(match_state.matched_policies[i].stats_index)) |stats| {
                     stats.addHit();
                 }
             }
@@ -629,7 +629,7 @@ pub const PolicyEngine = struct {
         }
 
         for (0..match_state.matched_count) |i| {
-            if (snapshot.getStats(match_state.matched_indices[i])) |stats| {
+            if (snapshot.getStats(match_state.matched_policies[i].stats_index)) |stats| {
                 if (match_state.matched_policies[i].keep.restrictiveness() == most_restrictive) {
                     stats.addHit();
                 } else {
