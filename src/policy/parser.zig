@@ -174,7 +174,7 @@ const RenameJson = struct {
     from_resource_attribute: ?std.json.Value = null,
     from_scope_attribute: ?std.json.Value = null,
     to: []const u8,
-    upsert: bool = true,
+    upsert: bool = false,
 };
 
 /// JSON schema for an add transform
@@ -184,7 +184,7 @@ const AddJson = struct {
     resource_attribute: ?std.json.Value = null,
     scope_attribute: ?std.json.Value = null,
     value: []const u8,
-    upsert: bool = true,
+    upsert: bool = false,
 };
 
 /// JSON schema for transforms
