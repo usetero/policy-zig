@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.13](https://github.com/usetero/policy-zig/compare/v0.1.12...v0.1.13) (2026-02-23)
+
+
+### Bug Fixes
+
+* policies should work alphanumerically ([#36](https://github.com/usetero/policy-zig/issues/36)) ([f12504b](https://github.com/usetero/policy-zig/commit/f12504b96bafc547e9a7690bbad00dd755929453))
+* sampling logic wasnt hashing right ([#32](https://github.com/usetero/policy-zig/issues/32)) ([1ee791c](https://github.com/usetero/policy-zig/commit/1ee791c552b8319061906893fbe07f976bd151a8))
+* upsert default is false ([#37](https://github.com/usetero/policy-zig/issues/37)) ([08ee378](https://github.com/usetero/policy-zig/commit/08ee3783c401534d70c863046431f4301b6f82e6))
+* zig runner reports incorrect stats for mixed signal policy ([#34](https://github.com/usetero/policy-zig/issues/34)) ([f75a791](https://github.com/usetero/policy-zig/commit/f75a7919ed06e956575823875860b953b1ec8c88))
+* zig should follow spec for recording misses ([#35](https://github.com/usetero/policy-zig/issues/35)) ([a7fabb0](https://github.com/usetero/policy-zig/commit/a7fabb0c682f6d2b91752d6601eac9e1b6714988))
+
 ## [0.1.12](https://github.com/usetero/policy-zig/compare/v0.1.11...v0.1.12) (2026-02-20)
 
 
