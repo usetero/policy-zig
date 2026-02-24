@@ -258,19 +258,38 @@ pub const ProbabilisticSampler = struct {
         return self.sampleHashSeed(r, rv_hex);
     }
 
-    /// Compute 56-bit randomness value from input bytes.
+    /// Compute 56-bit randomness value from input.
     ///
-    /// For 16-byte trace IDs (standard OTel format), extracts the
-    /// least-significant 56 bits (last 7 bytes) directly without hashing,
-    /// per the OTel consistent probability sampling spec.
+    /// Supports three input formats:
+    /// - 32-byte hex-encoded trace ID: parses last 14 hex chars to extract 56-bit randomness
+    /// - 16-byte raw binary trace ID: extracts last 7 bytes directly as randomness
+    /// - Shorter inputs (e.g. log sample keys): hashes with splitmix64 for uniform distribution
     ///
-    /// For shorter inputs (e.g. log sample keys), hashes all bytes with
-    /// hash_seed using splitmix64 for uniform distribution.
+    /// Per the OTel consistent probability sampling spec, the least-significant
+    /// 56 bits of the trace ID ARE the randomness value.
     fn computeRandomness(self: ProbabilisticSampler, input: []const u8) ?u64 {
+        if (input.len == 32) {
+            // 32-char hex-encoded trace_id — parse last 14 hex chars as 56-bit randomness
+            const suffix = input[18..32];
+            var r: u64 = 0;
+            for (suffix) |c| {
+                const digit: u64 = switch (c) {
+                    '0'...'9' => c - '0',
+                    'a'...'f' => c - 'a' + 10,
+                    'A'...'F' => c - 'A' + 10,
+                    else => return self.computeRandomnessRaw(input),
+                };
+                r = (r << 4) | digit;
+            }
+            return r & (MAX_56BIT - 1);
+        }
+        return self.computeRandomnessRaw(input);
+    }
+
+    /// Raw-bytes path for binary trace IDs and short sample keys.
+    fn computeRandomnessRaw(self: ProbabilisticSampler, input: []const u8) ?u64 {
         if (input.len >= 16) {
             // Standard 16-byte trace_id - extract last 7 bytes as randomness
-            // directly, without hashing. Per OTel spec, the least-significant
-            // 56 bits of the trace ID ARE the randomness value.
             var r: u64 = 0;
             for (input[input.len - 7 ..]) |b| {
                 r = (r << 8) | b;
@@ -1000,4 +1019,107 @@ test "ProbabilisticSampler: fail_closed defaults to true when null" {
     // Empty input → no randomness → default fail_closed=true → drop
     const result = sampler.sample("", "");
     try testing.expect(!result.keep);
+}
+
+test "ProbabilisticSampler: hex trace_id 100% keeps all" {
+    const config = TraceSamplingConfig{
+        .percentage = 100.0,
+        .mode = null,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    const result = sampler.sample("0102030405060708090a0b0c0d0e0f10", "");
+    try testing.expect(result.keep);
+}
+
+test "ProbabilisticSampler: hex trace_id 0% rejects all" {
+    const config = TraceSamplingConfig{
+        .percentage = 0.0,
+        .mode = null,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    const result = sampler.sample("0102030405060708090a0b0c0d0e0f10", "");
+    try testing.expect(!result.keep);
+}
+
+test "ProbabilisticSampler: hex and binary trace_id produce same randomness" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = null,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // Binary: last 7 bytes are 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
+    const binary = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    // Hex encoding of the same trace ID
+    const hex = "0102030405060708090a0b0c0d0e0f10";
+
+    const binary_result = sampler.sample(&binary, "");
+    const hex_result = sampler.sample(hex, "");
+
+    try testing.expectEqual(binary_result.keep, hex_result.keep);
+}
+
+test "ProbabilisticSampler: hex trace_id approximate distribution for 50%" {
+    const config = TraceSamplingConfig{
+        .percentage = 50.0,
+        .mode = null,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    var kept: u32 = 0;
+    const total: u32 = 10000;
+
+    for (0..total) |i| {
+        // Build a 32-char hex trace ID, varying the randomness region (last 14 hex chars = positions 18-31).
+        // Must vary the most-significant nibble (pos 18) to distribute across the full 56-bit range.
+        var hex_buf: [32]u8 = "00000000000000000000000000000000".*;
+        const hex_chars = "0123456789abcdef";
+        const byte0: u8 = @intCast((i * 256 / total) & 0xff);
+        const byte1: u8 = @intCast(i & 0xff);
+        const byte2: u8 = @intCast((i >> 8) & 0xff);
+        // Position 18-19: most-significant byte of randomness — must vary for distribution
+        hex_buf[18] = hex_chars[byte0 >> 4];
+        hex_buf[19] = hex_chars[byte0 & 0xf];
+        // Position 20-21
+        hex_buf[20] = hex_chars[byte1 >> 4];
+        hex_buf[21] = hex_chars[byte1 & 0xf];
+        // Position 22-23
+        hex_buf[22] = hex_chars[byte2 >> 4];
+        hex_buf[23] = hex_chars[byte2 & 0xf];
+
+        const result = sampler.sample(&hex_buf, "");
+        if (result.keep) kept += 1;
+    }
+
+    const ratio = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(total));
+    try testing.expect(ratio > 0.45 and ratio < 0.55);
+}
+
+test "ProbabilisticSampler: hex trace_id with invalid chars falls back to raw" {
+    const config = TraceSamplingConfig{
+        .percentage = 100.0,
+        .mode = null,
+        .sampling_precision = null,
+        .hash_seed = null,
+        .fail_closed = null,
+    };
+    const sampler = ProbabilisticSampler.init(&config);
+
+    // 32-byte input with non-hex chars — should fall back to raw 32-byte path (>= 16)
+    const result = sampler.sample("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "");
+    try testing.expect(result.keep);
 }
