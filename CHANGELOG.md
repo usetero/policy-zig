@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.15](https://github.com/usetero/policy-zig/compare/v0.1.14...v0.1.15) (2026-02-25)
+
+
+### Bug Fixes
+
+* bump dep again ([#40](https://github.com/usetero/policy-zig/issues/40)) ([4e02746](https://github.com/usetero/policy-zig/commit/4e02746feb2d590765459d9c0b5ed332a9bab679))
+
 ## [0.1.14](https://github.com/usetero/policy-zig/compare/v0.1.13...v0.1.14) (2026-02-25)
 
 
