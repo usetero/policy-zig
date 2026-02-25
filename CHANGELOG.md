@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/usetero/policy-zig/compare/v0.1.13...v0.1.14) (2026-02-25)
+
+
+### Bug Fixes
+
+* support hex properly ([#38](https://github.com/usetero/policy-zig/issues/38)) ([74ba61d](https://github.com/usetero/policy-zig/commit/74ba61da04d4059948c28a51fbb901f1f56bc12b))
+
 ## [0.1.13](https://github.com/usetero/policy-zig/compare/v0.1.12...v0.1.13) (2026-02-23)
 
 
