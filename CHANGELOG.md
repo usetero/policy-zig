@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/usetero/policy-zig/compare/v0.1.15...v0.1.16) (2026-02-25)
+
+
+### Bug Fixes
+
+* bump protobuf dep to latest ([#42](https://github.com/usetero/policy-zig/issues/42)) ([106a8a4](https://github.com/usetero/policy-zig/commit/106a8a4fea535edb78e03a6bd5c7007213745f6d))
+
 ## [0.1.15](https://github.com/usetero/policy-zig/compare/v0.1.14...v0.1.15) (2026-02-25)
 
 
