@@ -4411,3 +4411,63 @@ test "PolicyEngine: mixed signal policies scope stats to own signal type" {
     const trace_stats = snapshot.getStats(2).?;
     try testing.expectEqual(@as(i64, 1), trace_stats.hits.load(.monotonic));
 }
+
+test "PolicyEngine: hex trace_id (protojson) sampling produces same decision as binary" {
+    const allocator = testing.allocator;
+
+    // Create a trace policy with 50% sampling
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "trace-hex-sample"),
+        .name = try allocator.dupe(u8, "hex-sample-50"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 50.0 },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Binary trace ID with high randomness bytes (last 7 bytes = 0xFF) → keep
+    var bin_keep_ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+    };
+    // Hex encoding of the same trace ID (as protojson would provide)
+    var hex_keep_ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = "010203040506070809ffffffffffffff",
+    };
+
+    const bin_keep = engine.evaluate(.trace, &bin_keep_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const hex_keep = engine.evaluate(.trace, &hex_keep_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(bin_keep.decision, hex_keep.decision);
+    try testing.expectEqual(FilterDecision.keep, hex_keep.decision);
+
+    // Binary trace ID with low randomness bytes (last 7 bytes = 0x00) → drop
+    var bin_drop_ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = &[16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    };
+    // Hex encoding of the same trace ID
+    var hex_drop_ctx = TestTraceContext{
+        .name = "test-span",
+        .trace_id = "01020304050607080900000000000000",
+    };
+
+    const bin_drop = engine.evaluate(.trace, &bin_drop_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const hex_drop = engine.evaluate(.trace, &hex_drop_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    try testing.expectEqual(bin_drop.decision, hex_drop.decision);
+    try testing.expectEqual(FilterDecision.drop, hex_drop.decision);
+}
