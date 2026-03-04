@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/usetero/policy-zig/compare/v0.1.16...v0.1.17) (2026-03-04)
+
+
+### Bug Fixes
+
+* minor perf improvement ([#47](https://github.com/usetero/policy-zig/issues/47)) ([2be0d3a](https://github.com/usetero/policy-zig/commit/2be0d3a51ab5705fd13426a73a8f8bf860bd4fab))
+
 ## [0.1.16](https://github.com/usetero/policy-zig/compare/v0.1.15...v0.1.16) (2026-02-25)
 
 
