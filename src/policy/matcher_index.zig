@@ -338,6 +338,22 @@ pub const ScanResult = struct {
     }
 };
 
+/// Internal context for scanWithCallback that adds O(1) dedup via a seen bitset.
+/// Wraps ScanResult so the public API is unchanged.
+const ScanContext = struct {
+    result: ScanResult,
+    seen: [MAX_DEDUP_IDS]bool,
+
+    const MAX_DEDUP_IDS: usize = 256;
+
+    fn init(buf: []u32) ScanContext {
+        return .{
+            .result = .{ .count = 0, .buf = buf },
+            .seen = @splat(false),
+        };
+    }
+};
+
 // =============================================================================
 // MatcherDatabase - Compiled Hyperscan DBs for one MatcherKey
 // =============================================================================
@@ -345,14 +361,55 @@ pub const ScanResult = struct {
 pub const MatcherDatabase = struct {
     positive_db: ?hyperscan.Database,
     negated_db: ?hyperscan.Database,
-    scratch: ?hyperscan.Scratch,
-    mutex: std.Thread.Mutex,
+    scratch_pool: [SCRATCH_POOL_SIZE]?hyperscan.Scratch,
+    scratch_locks: [SCRATCH_POOL_SIZE]std.atomic.Value(bool),
+    next_scratch: std.atomic.Value(usize),
     positive_patterns: []const PatternMeta,
     negated_patterns: []const PatternMeta,
     allocator: std.mem.Allocator,
     bus: *EventBus,
 
     const Self = @This();
+    pub const SCRATCH_POOL_SIZE: usize = 8;
+
+    const ScratchHandle = struct {
+        scratch: *hyperscan.Scratch,
+        slot: usize,
+        db: *Self,
+
+        pub fn release(self: ScratchHandle) void {
+            self.db.scratch_locks[self.slot].store(false, .release);
+        }
+    };
+
+    fn acquireScratch(self: *Self) ?ScratchHandle {
+        const base = self.next_scratch.fetchAdd(1, .monotonic);
+        // Try each slot once
+        for (0..SCRATCH_POOL_SIZE) |offset| {
+            const slot = (base +% offset) % SCRATCH_POOL_SIZE;
+            if (self.scratch_pool[slot] == null) continue;
+            if (self.scratch_locks[slot].cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
+                return .{
+                    .scratch = &self.scratch_pool[slot].?,
+                    .slot = slot,
+                    .db = self,
+                };
+            }
+        }
+        // All slots busy — spin on original slot (extremely rare with 8 slots)
+        const slot = base % SCRATCH_POOL_SIZE;
+        while (self.scratch_locks[slot].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        if (self.scratch_pool[slot] != null) {
+            return .{
+                .scratch = &self.scratch_pool[slot].?,
+                .slot = slot,
+                .db = self,
+            };
+        }
+        return null;
+    }
 
     pub fn scanPositive(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
         return self.scanDb(self.positive_db, self.positive_patterns, value, result_buf, false);
@@ -364,51 +421,49 @@ pub const MatcherDatabase = struct {
 
     fn scanDb(self: *Self, db: ?hyperscan.Database, patterns: []const PatternMeta, value: []const u8, result_buf: []u32, is_negated: bool) ScanResult {
         const database = db orelse return ScanResult{ .count = 0, .buf = result_buf };
-        const scratch = &(self.scratch orelse return ScanResult{ .count = 0, .buf = result_buf });
+        const handle = self.acquireScratch() orelse return ScanResult{ .count = 0, .buf = result_buf };
+        defer handle.release();
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var result = ScanResult{ .count = 0, .buf = result_buf };
-        _ = database.scanWithCallback(scratch, value, &result, scanCallback) catch |err| {
+        var ctx = ScanContext.init(result_buf);
+        _ = database.scanWithCallback(handle.scratch, value, &ctx, scanCallback) catch |err| {
             self.bus.warn(ScanError{ .err = @errorName(err) });
-            return result;
+            return ctx.result;
         };
 
-        if (result.count > 0) {
+        if (ctx.result.count > 0 and self.bus.isEnabled(.debug)) {
             self.bus.debug(ScanMatched{
-                .pattern_count = result.count,
+                .pattern_count = ctx.result.count,
                 .value_len = value.len,
                 .value_preview = if (value.len > 100) value[0..100] else value,
                 .is_negated = is_negated,
             });
-            for (result.matches()) |pattern_id| {
+            for (ctx.result.matches()) |pattern_id| {
                 if (pattern_id < patterns.len) {
                     self.bus.debug(ScanMatchDetail{ .pattern_id = pattern_id, .policy_index = patterns[pattern_id].policy_index });
                 }
             }
         }
-        return result;
+        return ctx.result;
     }
 
-    fn scanCallback(ctx: *ScanResult, match: hyperscan.Match) bool {
-        if (ctx.count < ctx.buf.len) {
-            // Deduplicate: only store each pattern ID once
-            // (Hyperscan calls back multiple times for different match positions)
-            for (ctx.buf[0..ctx.count]) |existing_id| {
-                if (existing_id == match.id) {
-                    return true; // Already recorded, skip
-                }
+    fn scanCallback(ctx: *ScanContext, match: hyperscan.Match) bool {
+        if (ctx.result.count < ctx.result.buf.len) {
+            // O(1) dedup via seen bitset — Hyperscan calls back per match position
+            if (match.id < ScanContext.MAX_DEDUP_IDS) {
+                if (ctx.seen[match.id]) return true;
+                ctx.seen[match.id] = true;
             }
-            ctx.buf[ctx.count] = match.id;
-            ctx.count += 1;
+            ctx.result.buf[ctx.result.count] = match.id;
+            ctx.result.count += 1;
             return true;
         }
         return false;
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.scratch) |*s| s.deinit();
+        for (&self.scratch_pool) |*s| {
+            if (s.*) |*scratch| scratch.deinit();
+        }
         if (self.positive_db) |*db| db.deinit();
         if (self.negated_db) |*db| db.deinit();
         self.allocator.free(self.positive_patterns);
@@ -1188,10 +1243,12 @@ fn compileDatabase(
 ) !*MatcherDatabase {
     var positive_db: ?hyperscan.Database = null;
     var negated_db: ?hyperscan.Database = null;
-    var scratch: ?hyperscan.Scratch = null;
+    var scratch_pool: [MatcherDatabase.SCRATCH_POOL_SIZE]?hyperscan.Scratch = .{null} ** MatcherDatabase.SCRATCH_POOL_SIZE;
 
     errdefer {
-        if (scratch) |*s| s.deinit();
+        for (&scratch_pool) |*s| {
+            if (s.*) |*scratch| scratch.deinit();
+        }
         if (positive_db) |*db| db.deinit();
         if (negated_db) |*db| db.deinit();
     }
@@ -1211,20 +1268,31 @@ fn compileDatabase(
     }
 
     if (positive_db) |*db| {
-        scratch = try hyperscan.Scratch.init(db);
+        scratch_pool[0] = try hyperscan.Scratch.init(db);
         if (negated_db) |*ndb| {
             _ = try hyperscan.Scratch.init(ndb);
         }
     } else if (negated_db) |*db| {
-        scratch = try hyperscan.Scratch.init(db);
+        scratch_pool[0] = try hyperscan.Scratch.init(db);
     }
+
+    // Clone scratch into remaining pool slots for concurrent access
+    if (scratch_pool[0]) |*base| {
+        for (1..MatcherDatabase.SCRATCH_POOL_SIZE) |i| {
+            scratch_pool[i] = try base.clone();
+        }
+    }
+
+    var scratch_locks: [MatcherDatabase.SCRATCH_POOL_SIZE]std.atomic.Value(bool) = undefined;
+    for (&scratch_locks) |*lock| lock.* = std.atomic.Value(bool).init(false);
 
     const matcher_db = try allocator.create(MatcherDatabase);
     matcher_db.* = .{
         .positive_db = positive_db,
         .negated_db = negated_db,
-        .scratch = scratch,
-        .mutex = .{},
+        .scratch_pool = scratch_pool,
+        .scratch_locks = scratch_locks,
+        .next_scratch = std.atomic.Value(usize).init(0),
         .positive_patterns = positive_patterns,
         .negated_patterns = negated_patterns,
         .allocator = allocator,

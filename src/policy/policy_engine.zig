@@ -312,10 +312,12 @@ pub const PolicyEngine = struct {
         self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len, .policy_count = index.getPolicyCount() });
 
         // Phase 1: Scan all matcher keys and compute match counts
-        const scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
+        var scan_state: ScanState = undefined;
+        self.scanMatcherKeys(T, ctx, field_accessor, index, &scan_state);
 
         // Phase 2: Find matching policies and determine decision
-        const match_state = self.findMatchingPolicies(T, ctx, field_accessor, field_mutator, index, &scan_state, policy_id_buf);
+        var match_state: MatchState = undefined;
+        self.findMatchingPolicies(T, ctx, field_accessor, field_mutator, index, &scan_state, policy_id_buf, &match_state);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
 
@@ -366,8 +368,9 @@ pub const PolicyEngine = struct {
         ctx: *anyopaque,
         field_accessor: FieldAccessorType(T),
         index: *const matcher_index.MatcherIndexType(T),
-    ) ScanState {
-        var state = ScanState{
+        state: *ScanState,
+    ) void {
+        state.* = .{
             .match_counts = undefined,
             .active_policies = undefined,
             .is_active = undefined,
@@ -395,29 +398,35 @@ pub const PolicyEngine = struct {
             const field_ref = matcher_key.field;
 
             const value = field_accessor(ctx, field_ref) orelse {
-                self.bus.debug(MatcherKeyFieldNotPresent{
+                if (self.bus.isEnabled(.debug)) {
+                    self.bus.debug(MatcherKeyFieldNotPresent{
+                        .telemetry_type = T,
+                        .field = switch (T) {
+                            .log => .{ .log = field_ref },
+                            .metric => .{ .metric = field_ref },
+                            .trace => .{ .trace = field_ref },
+                        },
+                    });
+                }
+                continue;
+            };
+
+            if (self.bus.isEnabled(.debug)) {
+                self.bus.debug(MatcherKeyFieldValue{
                     .telemetry_type = T,
                     .field = switch (T) {
                         .log => .{ .log = field_ref },
                         .metric => .{ .metric = field_ref },
                         .trace => .{ .trace = field_ref },
                     },
+                    .value = if (value.len > 100) value[0..100] else value,
                 });
-                continue;
-            };
-
-            self.bus.debug(MatcherKeyFieldValue{
-                .telemetry_type = T,
-                .field = switch (T) {
-                    .log => .{ .log = field_ref },
-                    .metric => .{ .metric = field_ref },
-                    .trace => .{ .trace = field_ref },
-                },
-                .value = if (value.len > 100) value[0..100] else value,
-            });
+            }
 
             const db = index.getDatabase(matcher_key) orelse {
-                self.bus.debug(MatcherKeyNoDatabase{});
+                if (self.bus.isEnabled(.debug)) {
+                    self.bus.debug(MatcherKeyNoDatabase{});
+                }
                 continue;
             };
 
@@ -446,19 +455,21 @@ pub const PolicyEngine = struct {
                         state.active_policies[state.active_count] = meta.policy_index;
                         state.active_count += 1;
                     }
-                    self.bus.debug(PolicyNegationFailed{ .policy_index = meta.policy_index });
+                    if (self.bus.isEnabled(.debug)) {
+                        self.bus.debug(PolicyNegationFailed{ .policy_index = meta.policy_index });
+                    }
                 }
             }
 
-            self.bus.debug(ScanResult{ .positive_count = positive_result.count, .negated_count = negated_result.count });
+            if (self.bus.isEnabled(.debug)) {
+                self.bus.debug(ScanResult{ .positive_count = positive_result.count, .negated_count = negated_result.count });
+            }
         }
 
         // Sort active policies by index so iteration order = alphanumeric policy ID order.
         // Policy indices are assigned from an ID-sorted policies_slice in createSnapshot.
         // This sorts only the active set (typically 3-5 elements), not all policies.
         std.mem.sort(PolicyIndex, state.active_policies[0..state.active_count], {}, std.sort.asc(PolicyIndex));
-
-        return state;
     }
 
     /// Get sampling input bytes for probabilistic sampling.
@@ -500,8 +511,9 @@ pub const PolicyEngine = struct {
         index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
         policy_id_buf: [][]const u8,
-    ) MatchState {
-        var state = MatchState{
+        state: *MatchState,
+    ) void {
+        state.* = .{
             .matched_indices = undefined,
             .matched_policies = undefined,
             .matched_decisions = undefined,
@@ -517,7 +529,9 @@ pub const PolicyEngine = struct {
             if (!policy_info.enabled) continue;
 
             if (scan_state.match_counts[policy_index] == policy_info.required_match_count) {
-                self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
+                if (self.bus.isEnabled(.debug)) {
+                    self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
+                }
 
                 // Apply sampling/rate limiting to get this policy's decision
                 const decision = blk: {
@@ -568,8 +582,6 @@ pub const PolicyEngine = struct {
                 }
             }
         }
-
-        return state;
     }
 
     /// Apply transforms to log context for a matched policy.

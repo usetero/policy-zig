@@ -202,6 +202,12 @@ pub const EventBus = struct {
         return guard;
     }
 
+    /// Check if events at the given level would be emitted.
+    /// Use to guard expensive event construction in hot paths.
+    pub inline fn isEnabled(self: *const EventBus, comptime level: Level) bool {
+        return @intFromEnum(level) >= @intFromEnum(self.min_level);
+    }
+
     /// Emit a debug event
     pub fn debug(self: *EventBus, event: anytype) void {
         self.emit(.debug, event);
