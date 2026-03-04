@@ -582,7 +582,6 @@ pub const PolicyEngine = struct {
                 }
             }
         }
-
     }
 
     /// Apply transforms to log context for a matched policy.
