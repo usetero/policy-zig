@@ -838,7 +838,7 @@ fn parseTraceSamplingConfig(jk: TraceSamplingConfigJson) !TraceSamplingConfig {
 // =============================================================================
 
 /// Parse keep value - validates format
-/// Valid formats: "all", "none", "N%", "N/s", "N/m"
+/// Valid formats: "all", "none", "N%", "N/s", "N/m", "N/Ds", "N/Dm"
 pub fn parseKeepValue(s: []const u8) !void {
     if (s.len == 0 or std.mem.eql(u8, s, "all") or std.mem.eql(u8, s, "none")) {
         return;
@@ -850,12 +850,17 @@ pub fn parseKeepValue(s: []const u8) !void {
         if (pct > 100) return error.InvalidKeepValue;
         return;
     }
-    // Check for rate limit: "N/s" or "N/m"
-    if (s.len >= 3 and s[s.len - 2] == '/') {
-        const num_str = s[0 .. s.len - 2];
-        _ = std.fmt.parseInt(u32, num_str, 10) catch return error.InvalidKeepValue;
-        if (s[s.len - 1] != 's' and s[s.len - 1] != 'm') {
-            return error.InvalidKeepValue;
+    // Check for rate limit: "N/s", "N/m", "N/Ds", "N/Dm"
+    if (std.mem.indexOfScalar(u8, s, '/')) |slash_pos| {
+        if (slash_pos == 0) return error.InvalidKeepValue;
+        _ = std.fmt.parseInt(u32, s[0..slash_pos], 10) catch return error.InvalidKeepValue;
+        const after_slash = s[slash_pos + 1 ..];
+        if (after_slash.len == 0) return error.InvalidKeepValue;
+        const unit = after_slash[after_slash.len - 1];
+        if (unit != 's' and unit != 'm') return error.InvalidKeepValue;
+        if (after_slash.len > 1) {
+            const dur = std.fmt.parseInt(u32, after_slash[0 .. after_slash.len - 1], 10) catch return error.InvalidKeepValue;
+            if (dur == 0) return error.InvalidKeepValue;
         }
         return;
     }
@@ -875,10 +880,17 @@ test "parseKeepValue" {
     try parseKeepValue("100%");
     try parseKeepValue("100/s");
     try parseKeepValue("1000/m");
+    // Arbitrary duration windows
+    try parseKeepValue("1/5s");
+    try parseKeepValue("1/300s");
+    try parseKeepValue("10/5m");
 
     try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("101%"));
     try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("invalid"));
     try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("100/x"));
+    try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("1/0s"));
+    try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("/s"));
+    try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("1/abcs"));
 }
 
 test "parsePoliciesBytes: log policy with new format" {

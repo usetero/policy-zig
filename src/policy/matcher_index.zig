@@ -224,14 +224,20 @@ pub const TraceMatcherKeyContext = struct {
 // KeepValue - Parsed keep configuration
 // =============================================================================
 
+/// Rate limit parameters: count per duration window.
+pub const RateLimit = struct {
+    count: u32,
+    duration: u32,
+};
+
 /// Parsed keep value from policy.
 /// Priority order (most restrictive first): none > rate_limit > percentage > all
 pub const KeepValue = union(enum) {
     all,
     none,
     percentage: u8,
-    per_second: u32,
-    per_minute: u32,
+    per_second: RateLimit,
+    per_minute: RateLimit,
 
     pub fn parse(s: []const u8) KeepValue {
         if (s.len == 0 or std.mem.eql(u8, s, "all")) return .all;
@@ -243,13 +249,20 @@ pub const KeepValue = union(enum) {
             return .{ .percentage = pct };
         }
 
-        if (s.len >= 3 and s[s.len - 2] == '/') {
-            const rate = std.fmt.parseInt(u32, s[0 .. s.len - 2], 10) catch return .all;
-            return switch (s[s.len - 1]) {
-                's' => .{ .per_second = rate },
-                'm' => .{ .per_minute = rate },
-                else => .all,
-            };
+        // Rate limit: "N/s", "N/m", "N/Ds", "N/Dm"
+        if (std.mem.indexOfScalar(u8, s, '/')) |slash_pos| {
+            if (slash_pos == 0 or slash_pos >= s.len - 1) return .all;
+            const count = std.fmt.parseInt(u32, s[0..slash_pos], 10) catch return .all;
+            const after_slash = s[slash_pos + 1 ..];
+            const unit = after_slash[after_slash.len - 1];
+            if (unit != 's' and unit != 'm') return .all;
+            const duration: u32 = if (after_slash.len == 1)
+                1
+            else
+                std.fmt.parseInt(u32, after_slash[0 .. after_slash.len - 1], 10) catch return .all;
+            if (duration == 0) return .all;
+            const rl = RateLimit{ .count = count, .duration = duration };
+            return if (unit == 's') .{ .per_second = rl } else .{ .per_minute = rl };
         }
         return .all;
     }
@@ -790,14 +803,14 @@ fn IndexBuilder(comptime T: TelemetryType) type {
 
             // Create rate limiter for rate limit policies
             const rate_limiter: ?*RateLimiter = switch (keep) {
-                .per_second => |limit| blk: {
+                .per_second => |rl_params| blk: {
                     const rl = try self.allocator.create(RateLimiter);
-                    rl.* = RateLimiter.initPerSecond(limit);
+                    rl.* = RateLimiter.init(rl_params.count, rl_params.duration * 1_000);
                     break :blk rl;
                 },
-                .per_minute => |limit| blk: {
+                .per_minute => |rl_params| blk: {
                     const rl = try self.allocator.create(RateLimiter);
-                    rl.* = RateLimiter.initPerMinute(limit);
+                    rl.* = RateLimiter.init(rl_params.count, rl_params.duration * 60_000);
                     break :blk rl;
                 },
                 else => null,
@@ -1419,8 +1432,19 @@ test "KeepValue: parse" {
     try testing.expectEqual(KeepValue.all, KeepValue.parse("all"));
     try testing.expectEqual(KeepValue.none, KeepValue.parse("none"));
     try testing.expectEqual(KeepValue{ .percentage = 50 }, KeepValue.parse("50%"));
-    try testing.expectEqual(KeepValue{ .per_second = 100 }, KeepValue.parse("100/s"));
-    try testing.expectEqual(KeepValue{ .per_minute = 1000 }, KeepValue.parse("1000/m"));
+    // Backwards-compatible: N/s and N/m (duration=1)
+    try testing.expectEqual(KeepValue{ .per_second = .{ .count = 100, .duration = 1 } }, KeepValue.parse("100/s"));
+    try testing.expectEqual(KeepValue{ .per_minute = .{ .count = 1000, .duration = 1 } }, KeepValue.parse("1000/m"));
+    // Arbitrary duration: N/Ds and N/Dm
+    try testing.expectEqual(KeepValue{ .per_second = .{ .count = 1, .duration = 5 } }, KeepValue.parse("1/5s"));
+    try testing.expectEqual(KeepValue{ .per_second = .{ .count = 1, .duration = 300 } }, KeepValue.parse("1/300s"));
+    try testing.expectEqual(KeepValue{ .per_minute = .{ .count = 10, .duration = 5 } }, KeepValue.parse("10/5m"));
+    // Invalid formats fall back to .all
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("1/0s")); // zero duration
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("1/x")); // invalid unit
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("/s")); // missing count
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("abc/5s")); // non-integer count
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("1/abcs")); // non-integer duration
 }
 
 test "KeepValue: restrictiveness comparison" {
@@ -1428,7 +1452,7 @@ test "KeepValue: restrictiveness comparison" {
     const none: KeepValue = .none;
     const pct50: KeepValue = .{ .percentage = 50 };
     const pct25: KeepValue = .{ .percentage = 25 };
-    const rate: KeepValue = .{ .per_second = 100 };
+    const rate: KeepValue = .{ .per_second = .{ .count = 100, .duration = 1 } };
 
     try testing.expect(none.isMoreRestrictiveThan(all));
     try testing.expect(none.isMoreRestrictiveThan(pct50));
