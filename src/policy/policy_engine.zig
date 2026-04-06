@@ -533,8 +533,17 @@ pub const PolicyEngine = struct {
                     self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
                 }
 
-                // Apply sampling/rate limiting to get this policy's decision
+                // Apply sampling/rate limiting to get this policy's decision.
+                // Skip rate limiter token consumption if record is already dropped
+                // by a more restrictive policy — dropped records should not consume
+                // rate limit budget.
                 const decision = blk: {
+                    if (state.decision == .drop) {
+                        switch (policy_info.keep) {
+                            .per_second, .per_minute => break :blk FilterDecision.drop,
+                            else => {},
+                        }
+                    }
                     if (policy_info.sampler) |s| {
                         const input = getSamplingInput(T, ctx, field_accessor, policy_info) orelse "";
 
