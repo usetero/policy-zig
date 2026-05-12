@@ -28,6 +28,12 @@ pub const TransformOptions = struct {
     /// Scratch allocator for regex substitution output. Required for regex-
     /// redact; if null, regex rules degrade to no-op (they cannot allocate
     /// their substituted output).
+    ///
+    /// Must be an arena-style allocator (or otherwise long-lived): the
+    /// substituted bytes are handed to the mutator by reference and are not
+    /// freed by `applyRedact`. Callers that retain references past the call
+    /// must keep `scratch` alive at least that long, and should reset/deinit
+    /// the arena at a natural boundary (e.g. per log record).
     scratch: ?std.mem.Allocator = null,
 };
 
@@ -38,6 +44,11 @@ pub const RedactOptions = struct {
     compiled: ?*const redact_mod.Compiled = null,
     /// Scratch allocator for regex substitution output. Ignored when
     /// `compiled` is null; required (non-null) for the regex path to run.
+    ///
+    /// Must outlive any mutator-retained reference to the substituted bytes:
+    /// `applyRedact` allocates into `scratch` and hands the slice to the
+    /// mutator by reference without freeing it. Use an arena that the caller
+    /// resets at an appropriate boundary.
     scratch: ?std.mem.Allocator = null,
 };
 
@@ -131,7 +142,10 @@ pub fn applyRedact(
         const value = accessor(ctx, field_ref) orelse return false;
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(allocator);
+        // No deinit: `out.items` is handed to the mutator by reference and must
+        // remain valid after this function returns. The caller's `scratch` is
+        // documented as arena-lifetime; ownership of the bytes effectively
+        // transfers to that arena.
 
         // Cast away const for replaceAll which mutates engine state internally.
         const mut: *redact_mod.Compiled = @constCast(c);
@@ -416,6 +430,8 @@ test "applyRedact: returns false for non-existent field" {
 
 test "applyRedact: regex targeted replacement" {
     const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var ctx = TestContext.init(allocator);
     defer ctx.deinit();
 
@@ -432,7 +448,7 @@ test "applyRedact: regex targeted replacement" {
 
     const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
         .compiled = &compiled,
-        .scratch = allocator,
+        .scratch = arena.allocator(),
     });
     try testing.expect(result);
     try testing.expectEqualStrings("?user=alice&password=[REDACTED]&session=xyz", ctx.fields.get("body").?);
@@ -440,6 +456,8 @@ test "applyRedact: regex targeted replacement" {
 
 test "applyRedact: regex no-match is a no-op" {
     const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var ctx = TestContext.init(allocator);
     defer ctx.deinit();
 
@@ -456,14 +474,69 @@ test "applyRedact: regex no-match is a no-op" {
 
     const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
         .compiled = &compiled,
-        .scratch = allocator,
+        .scratch = arena.allocator(),
     });
     try testing.expect(!result);
     try testing.expectEqualStrings("no secrets here", ctx.fields.get("body").?);
 }
 
+test "applyRedact: regex output outlives applyRedact return" {
+    // Regression: applyRedact used to free its scratch ArrayList via `defer`
+    // before returning, while passing `out.items` by reference to the mutator.
+    // Consumers that store the slice by reference (rather than duping it) saw
+    // the bytes get poisoned/freed the instant applyRedact returned. This test
+    // uses a mutator that stores by reference and inspects the bytes after the
+    // call.
+    const allocator = testing.allocator;
+
+    const ByRefCtx = struct {
+        stored: ?[]const u8 = null,
+        fn accessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+            _ = field;
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return self.stored;
+        }
+        fn mutator(ctx: *anyopaque, op: MutateOp) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (op) {
+                .set => |s| {
+                    self.stored = s.value;
+                    return true;
+                },
+                else => return false,
+            }
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var ctx = ByRefCtx{ .stored = "?password=secret123&session=xyz" };
+
+    var rule = LogRedact{
+        .field = .{ .log_attribute = testAttrPath("body") },
+        .replacement = "$1[REDACTED]$2",
+        .regex = "([?&]password=)[^&\\s]+(&session=)",
+    };
+
+    var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
+    defer compiled.deinit();
+
+    const result = applyRedact(&rule, @ptrCast(&ctx), ByRefCtx.accessor, ByRefCtx.mutator, .{
+        .compiled = &compiled,
+        .scratch = arena.allocator(),
+    });
+    try testing.expect(result);
+
+    // After return, the slice handed to the mutator must still hold valid bytes.
+    // Pre-fix this assertion saw 0xAA-poisoned memory from the freed ArrayList.
+    try testing.expectEqualStrings("?password=[REDACTED]&session=xyz", ctx.stored.?);
+}
+
 test "applyRedact: regex on missing field is a no-op" {
     const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var ctx = TestContext.init(allocator);
     defer ctx.deinit();
 
@@ -478,7 +551,7 @@ test "applyRedact: regex on missing field is a no-op" {
 
     const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
         .compiled = &compiled,
-        .scratch = allocator,
+        .scratch = arena.allocator(),
     });
     try testing.expect(!result);
 }
