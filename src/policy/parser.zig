@@ -165,6 +165,13 @@ const RedactJson = struct {
     resource_attribute: ?std.json.Value = null,
     scope_attribute: ?std.json.Value = null,
     replacement: []const u8 = "[REDACTED]",
+    /// Optional RE2 regular expression for targeted replacement (v1.4.0). When
+    /// set, `replacement` is interpreted as a template with `$0`, `$1..$99`,
+    /// `${N}`, `${name}`, `$$` capture references. The regex operates on the
+    /// textual representation returned by the accessor — consumers that want
+    /// regex redact to no-op on non-string AnyValue variants should return null
+    /// from their accessor for those values.
+    regex: ?[]const u8 = null,
 };
 
 /// JSON schema for a rename transform
@@ -553,9 +560,12 @@ fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
         }
     };
 
+    const regex_copy: ?[]const u8 = if (jr.regex) |r| try allocator.dupe(u8, r) else null;
+
     return LogRedact{
         .field = field,
         .replacement = try allocator.dupe(u8, jr.replacement),
+        .regex = regex_copy,
     };
 }
 
@@ -1120,11 +1130,59 @@ test "parsePoliciesBytes: log policy with transform" {
     try std.testing.expect(redact.field.? == .log_attribute);
     try std.testing.expectEqualStrings("password", redact.field.?.log_attribute.path.items[0]);
     try std.testing.expectEqualStrings("***", redact.replacement);
+    try std.testing.expect(redact.regex == null);
 
     // Check remove
     const remove = transform.remove.items[0];
     try std.testing.expect(remove.field.? == .log_attribute);
     try std.testing.expectEqualStrings("secret_key", remove.field.?.log_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy with redact regex (v1.4.0 targeted redaction)" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "redact-password-query-param",
+        \\      "name": "Redact password query parameter in log body",
+        \\      "log": {
+        \\        "match": [
+        \\          { "log_field": "body", "regex": "password=" }
+        \\        ],
+        \\        "transform": {
+        \\          "redact": [
+        \\            {
+        \\              "log_field": "body",
+        \\              "regex": "([?&]password=)[^&\\s]+(&session_id=)",
+        \\              "replacement": "$1[REDACTED]$2"
+        \\            }
+        \\          ]
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const transform = log_target.transform.?;
+    const redact = transform.redact.items[0];
+    try std.testing.expect(redact.field.? == .log_field);
+    try std.testing.expectEqualStrings("$1[REDACTED]$2", redact.replacement);
+    try std.testing.expect(redact.regex != null);
+    try std.testing.expectEqualStrings("([?&]password=)[^&\\s]+(&session_id=)", redact.regex.?);
 }
 
 test "parsePoliciesBytes: mixed log and metric policies" {

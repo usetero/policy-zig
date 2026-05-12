@@ -602,6 +602,7 @@ pub const LogRemove = struct {
 /// LogRedact masks a field value.
 pub const LogRedact = struct {
     replacement: []const u8 = &.{},
+    regex: ?[]const u8 = null,
     field: ?field_union = null,
 
     pub const _field_case = enum {
@@ -625,6 +626,7 @@ pub const LogRedact = struct {
 
     pub const _desc_table = .{
         .replacement = fd(10, .{ .scalar = .string }),
+        .regex = fd(11, .{ .scalar = .string }),
         .field = fd(null, .{ .oneof = field_union }),
     };
 

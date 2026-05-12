@@ -146,6 +146,8 @@ pub const applyRedact = log_transform.applyRedact;
 pub const applyRename = log_transform.applyRename;
 pub const applyAdd = log_transform.applyAdd;
 
+pub const redact = @import("./redact.zig");
+
 // =============================================================================
 // Tests
 // =============================================================================

@@ -33,6 +33,7 @@ const policy_mod = @import("./root.zig");
 const policy_types = @import("./types.zig");
 const log_transform = @import("./log_transform.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
+const redact_mod = @import("./redact.zig");
 
 const o11y = @import("observability");
 const NoopEventBus = o11y.NoopEventBus;
@@ -608,7 +609,21 @@ pub const PolicyEngine = struct {
         const log_target = getLogTarget(policy) orelse return .{};
         const transform = log_target.transform orelse return .{};
 
-        const result = log_transform.applyTransforms(&transform, ctx, field_accessor, field_mutator);
+        const compiled_redacts: []const ?redact_mod.Compiled = blk: {
+            const info = snapshot.log_index.getPolicyByIndex(policy_index) orelse break :blk &.{};
+            break :blk info.compiled_redacts;
+        };
+
+        const result = log_transform.applyTransforms(
+            &transform,
+            ctx,
+            field_accessor,
+            field_mutator,
+            .{
+                .compiled_redacts = compiled_redacts,
+                .scratch = snapshot.allocator,
+            },
+        );
 
         if (result.totalApplied() > 0) {
             self.bus.debug(TransformApplied{
@@ -1793,6 +1808,99 @@ test "evaluate: policy with keep=all and redact transform" {
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have redacted 'service'
     try testing.expectEqualStrings("[REDACTED]", ctx.service.?);
+}
+
+test "evaluate: policy with regex-targeted redact transform (v1.4.0)" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .replacement = try allocator.dupe(u8, "$1[REDACTED]$2"),
+        .regex = try allocator.dupe(u8, "([?&]password=)[^&\\s]+(&session_id=)"),
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "redact-password-query-param"),
+        .name = try allocator.dupe(u8, "redact-password-query-param"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .match = .{ .regex = try allocator.dupe(u8, "password=") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    try ctx.setAttribute("url", "?user=alice&password=secret123&session_id=xyz");
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expect(result.was_transformed);
+    try testing.expectEqualStrings(
+        "?user=alice&password=[REDACTED]&session_id=xyz",
+        ctx.attributes.get("url").?,
+    );
+}
+
+test "evaluate: regex redact with no match leaves field unchanged" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .replacement = try allocator.dupe(u8, "X"),
+        .regex = try allocator.dupe(u8, "password=\\S+"),
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "p"),
+        .name = try allocator.dupe(u8, "p"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .match = .{ .exists = true },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    try ctx.setAttribute("url", "/no-secrets-here");
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expect(!result.was_transformed);
+    try testing.expectEqualStrings("/no-secrets-here", ctx.attributes.get("url").?);
 }
 
 test "evaluate: policy with keep=all and add transform" {

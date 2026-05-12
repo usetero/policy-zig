@@ -3,6 +3,7 @@ const proto = @import("proto");
 const provider_http = @import("./provider_http.zig");
 const provider_file = @import("./provider_file.zig");
 const policy_provider = @import("./provider.zig");
+const policy_source = @import("./source.zig");
 
 pub const Header = provider_http.Header;
 pub const PolicyStage = proto.policy.PolicyStage;
@@ -471,7 +472,7 @@ pub const TransformResult = struct {
 // =============================================================================
 
 const Policy = proto.policy.Policy;
-const SourceType = @import("./source.zig").SourceType;
+const SourceType = policy_source.SourceType;
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
 

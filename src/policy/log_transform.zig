@@ -1,6 +1,7 @@
 const std = @import("std");
 const proto = @import("proto");
 const types = @import("./types.zig");
+const redact_mod = @import("./redact.zig");
 
 const LogTransform = proto.policy.LogTransform;
 const LogRemove = proto.policy.LogRemove;
@@ -15,12 +16,38 @@ pub const LogFieldMutator = types.LogFieldMutator;
 pub const MutateOp = types.MutateOp;
 pub const TransformResult = types.TransformResult;
 
-/// Apply all transforms from a LogTransform in order: remove → redact → rename → add
+/// Optional configuration for transform application.
+///
+/// Defaults disable the regex-redact path: redacts behave as whole-value
+/// replacement when `compiled_redacts` is empty and `scratch` is null.
+pub const TransformOptions = struct {
+    /// Parallel slice over `transform.redact.items`. Each non-null entry holds
+    /// a pre-compiled regex + replacement template; null slots (or indices past
+    /// the end of this slice) fall through to whole-value redaction.
+    compiled_redacts: []const ?redact_mod.Compiled = &.{},
+    /// Scratch allocator for regex substitution output. Required for regex-
+    /// redact; if null, regex rules degrade to no-op (they cannot allocate
+    /// their substituted output).
+    scratch: ?std.mem.Allocator = null,
+};
+
+/// Optional configuration for a single redact rule.
+pub const RedactOptions = struct {
+    /// Pre-compiled regex + replacement template. When non-null, the regex
+    /// path runs; when null, whole-value replacement runs.
+    compiled: ?*const redact_mod.Compiled = null,
+    /// Scratch allocator for regex substitution output. Ignored when
+    /// `compiled` is null; required (non-null) for the regex path to run.
+    scratch: ?std.mem.Allocator = null,
+};
+
+/// Apply all transforms from a LogTransform in order: remove → redact → rename → add.
 pub fn applyTransforms(
     transform: *const LogTransform,
     ctx: *anyopaque,
     accessor: LogFieldAccessor,
     mutator: LogFieldMutator,
+    options: TransformOptions,
 ) TransformResult {
     var result = TransformResult{};
 
@@ -34,8 +61,16 @@ pub fn applyTransforms(
 
     // 2. Redact
     result.redacts_attempted = transform.redact.items.len;
-    for (transform.redact.items) |*rule| {
-        if (applyRedact(rule, ctx, accessor, mutator)) {
+    for (transform.redact.items, 0..) |*rule, idx| {
+        const compiled: ?*const redact_mod.Compiled = blk: {
+            if (idx >= options.compiled_redacts.len) break :blk null;
+            const slot = &options.compiled_redacts[idx];
+            break :blk if (slot.*) |*c| c else null;
+        };
+        if (applyRedact(rule, ctx, accessor, mutator, .{
+            .compiled = compiled,
+            .scratch = options.scratch,
+        })) {
             result.redacts_applied += 1;
         }
     }
@@ -70,26 +105,56 @@ pub fn applyRemove(
     return mutator(ctx, .{ .remove = field_ref });
 }
 
-/// Apply a single redact rule
-/// Replaces the field value with the replacement string
-/// Returns true if the field was redacted
+/// Apply a single redact rule.
+///
+/// When `options.compiled` is null, replaces the entire field value with
+/// `rule.replacement`. When non-null, runs the pre-compiled regex over the
+/// textual representation returned by `accessor` and substitutes each match
+/// using the pre-parsed replacement template. If the accessor returns null, or
+/// the regex finds no match, the operation is a no-op (returns false). Regex-
+/// redact operates on the textual representation returned by the accessor —
+/// consumers that want to skip non-string values can return null from their
+/// accessor for those `AnyValue` variants.
+///
+/// Returns true if the field was redacted.
 pub fn applyRedact(
     rule: *const LogRedact,
     ctx: *anyopaque,
     accessor: LogFieldAccessor,
     mutator: LogFieldMutator,
+    options: RedactOptions,
 ) bool {
     const field_ref = FieldRef.fromRedactField(rule.field) orelse return false;
 
-    // Only redact if the field exists
+    if (options.compiled) |c| {
+        const allocator = options.scratch orelse return false;
+        const value = accessor(ctx, field_ref) orelse return false;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+
+        // Cast away const for replaceAll which mutates engine state internally.
+        const mut: *redact_mod.Compiled = @constCast(c);
+        const count = mut.replaceAll(value, &out, allocator) catch return false;
+        if (count == 0) return false;
+
+        return mutator(ctx, .{
+            .set = .{
+                .field = field_ref,
+                .value = out.items,
+                .upsert = false,
+            },
+        });
+    }
+
+    // Whole-value redact: only fires if the field exists.
     if (accessor(ctx, field_ref) == null) return false;
 
-    // Replace the value with the replacement string
     return mutator(ctx, .{
         .set = .{
             .field = field_ref,
             .value = rule.replacement,
-            .upsert = false, // Must exist to redact
+            .upsert = false,
         },
     });
 }
@@ -330,7 +395,7 @@ test "applyRedact: replaces field value" {
         .replacement = "[REDACTED]",
     };
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{});
     try testing.expect(result);
     try testing.expectEqualStrings("[REDACTED]", ctx.fields.get("password").?);
 }
@@ -345,7 +410,76 @@ test "applyRedact: returns false for non-existent field" {
         .replacement = "[REDACTED]",
     };
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{});
+    try testing.expect(!result);
+}
+
+test "applyRedact: regex targeted replacement" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    try ctx.set("body", "?user=alice&password=secret123&session=xyz");
+
+    var rule = LogRedact{
+        .field = .{ .log_attribute = testAttrPath("body") },
+        .replacement = "$1[REDACTED]$2",
+        .regex = "([?&]password=)[^&\\s]+(&session=)",
+    };
+
+    var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
+    defer compiled.deinit();
+
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
+        .compiled = &compiled,
+        .scratch = allocator,
+    });
+    try testing.expect(result);
+    try testing.expectEqualStrings("?user=alice&password=[REDACTED]&session=xyz", ctx.fields.get("body").?);
+}
+
+test "applyRedact: regex no-match is a no-op" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    try ctx.set("body", "no secrets here");
+
+    var rule = LogRedact{
+        .field = .{ .log_attribute = testAttrPath("body") },
+        .replacement = "X",
+        .regex = "password=\\S+",
+    };
+
+    var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
+    defer compiled.deinit();
+
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
+        .compiled = &compiled,
+        .scratch = allocator,
+    });
+    try testing.expect(!result);
+    try testing.expectEqualStrings("no secrets here", ctx.fields.get("body").?);
+}
+
+test "applyRedact: regex on missing field is a no-op" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    var rule = LogRedact{
+        .field = .{ .log_attribute = testAttrPath("missing") },
+        .replacement = "X",
+        .regex = "\\d+",
+    };
+
+    var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
+    defer compiled.deinit();
+
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
+        .compiled = &compiled,
+        .scratch = allocator,
+    });
     try testing.expect(!result);
 }
 
@@ -499,6 +633,7 @@ test "applyTransforms: applies in correct order" {
         @ptrCast(&ctx),
         TestContext.fieldAccessor,
         TestContext.fieldMutator,
+        .{},
     );
 
     // Verify attempted counts
@@ -589,6 +724,7 @@ test "applyTransforms: counts attempted vs applied when some operations fail" {
         @ptrCast(&ctx),
         TestContext.fieldAccessor,
         TestContext.fieldMutator,
+        .{},
     );
 
     // Verify attempted counts (total rules defined)
@@ -624,6 +760,7 @@ test "applyTransforms: empty transform returns zero counts" {
         @ptrCast(&ctx),
         TestContext.fieldAccessor,
         TestContext.fieldMutator,
+        .{},
     );
 
     try testing.expectEqual(@as(usize, 0), result.removes_attempted);
@@ -681,6 +818,7 @@ test "applyTransforms: all operations fail returns zero applied" {
         &ctx,
         TestContext.fieldAccessor,
         TestContext.fieldMutator,
+        .{},
     );
 
     // All attempted

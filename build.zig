@@ -10,6 +10,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const regex_dep = b.dependency("regex", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Proto module for generated protobuf files
     const proto_mod = b.addModule("proto", .{
         .root_source_file = b.path("src/proto/root.zig"),
@@ -31,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "proto", .module = proto_mod },
             .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
             .{ .name = "observability", .module = o11y_mod },
+            .{ .name = "regex", .module = regex_dep.module("regex") },
         },
     });
 

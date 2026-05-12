@@ -23,6 +23,7 @@ const hyperscan = @import("./hyperscan.zig");
 const policy_types = @import("./types.zig");
 const probabilistic_sampler_mod = @import("./probabilistic_sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
+const redact_mod = @import("./redact.zig");
 const o11y = @import("observability");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -321,6 +322,11 @@ pub const PolicyInfo = struct {
     /// OTel-compliant probabilistic sampler. Pre-computed at index build time.
     /// Set for trace and log policies with percentage keep.
     sampler: ?ProbabilisticSampler = null,
+    /// Compiled redact rules for log policies. Parallel to the policy's
+    /// LogTransform.redact list (same length, same order). Each entry is
+    /// non-null only when its source rule has `regex` set. Empty slice for
+    /// non-log policies or log policies with no redacts.
+    compiled_redacts: []?redact_mod.Compiled = &.{},
 };
 
 // =============================================================================
@@ -831,6 +837,37 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => null,
             };
 
+            // Compile regex-based redact rules for log policies.
+            const compiled_redacts: []?redact_mod.Compiled = if (T == .log) blk: {
+                const transform = target.transform orelse break :blk &.{};
+                if (transform.redact.items.len == 0) break :blk &.{};
+
+                const slots = try self.allocator.alloc(?redact_mod.Compiled, transform.redact.items.len);
+                errdefer self.allocator.free(slots);
+                for (slots) |*s| s.* = null;
+
+                var compiled_count: usize = 0;
+                errdefer for (slots[0..compiled_count]) |*opt| {
+                    if (opt.*) |*c| c.deinit();
+                };
+
+                for (transform.redact.items, 0..) |*rule, idx| {
+                    const regex_str = rule.regex orelse continue;
+                    const compiled = redact_mod.Compiled.init(self.allocator, regex_str, rule.replacement) catch |err| {
+                        self.bus.warn(MatcherEmptyRegex{ .matcher_idx = idx });
+                        return err;
+                    };
+                    slots[idx] = compiled;
+                    compiled_count = idx + 1;
+                }
+
+                break :blk slots;
+            } else &.{};
+            errdefer if (compiled_redacts.len > 0) {
+                for (compiled_redacts) |*opt| if (opt.*) |*c| c.deinit();
+                self.allocator.free(compiled_redacts);
+            };
+
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
                 .index = self.policy_index,
@@ -842,6 +879,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .rate_limiter = rate_limiter,
                 .sample_key = sample_key,
                 .sampler = sampler,
+                .compiled_redacts = compiled_redacts,
             });
 
             self.bus.debug(PolicyStored{
@@ -987,10 +1025,16 @@ pub const LogMatcherIndex = struct {
         }
         self.databases.deinit();
 
-        // Free rate limiters
-        for (self.policies) |policy_info| {
+        // Free rate limiters and compiled redacts
+        for (self.policies) |*policy_info| {
             if (policy_info.rate_limiter) |rl| {
                 self.allocator.destroy(rl);
+            }
+            if (policy_info.compiled_redacts.len > 0) {
+                for (policy_info.compiled_redacts) |*opt| {
+                    if (opt.*) |*c| c.deinit();
+                }
+                self.allocator.free(policy_info.compiled_redacts);
             }
         }
         self.allocator.free(self.policies);
