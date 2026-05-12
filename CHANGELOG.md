@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/usetero/policy-zig/compare/v0.1.17...v0.2.0) (2026-04-06)
+
+
+### Features
+
+* add support for arbitrary rate limit windows ([#53](https://github.com/usetero/policy-zig/issues/53)) ([e7b8a81](https://github.com/usetero/policy-zig/commit/e7b8a81c3fae5c3a1c531bfc75b21cac58bbbbf6))
+
 ## [0.1.17](https://github.com/usetero/policy-zig/compare/v0.1.16...v0.1.17) (2026-03-04)
 
 
