@@ -86,15 +86,10 @@ pub const Header = types.Header;
 pub const FieldRef = types.FieldRef;
 pub const MetricFieldRef = types.MetricFieldRef;
 pub const TraceFieldRef = types.TraceFieldRef;
-pub const LogFieldAccessor = types.LogFieldAccessor;
-pub const LogFieldMutator = types.LogFieldMutator;
-pub const MetricFieldAccessor = types.MetricFieldAccessor;
-pub const MetricFieldMutator = types.MetricFieldMutator;
-pub const TraceFieldAccessor = types.TraceFieldAccessor;
-pub const TraceFieldMutator = types.TraceFieldMutator;
-pub const MutateOp = types.MutateOp;
-pub const MetricMutateOp = types.MetricMutateOp;
-pub const TraceMutateOp = types.TraceMutateOp;
+pub const LogAccessor = types.LogAccessor;
+pub const MetricAccessor = types.MetricAccessor;
+pub const TraceAccessor = types.TraceAccessor;
+pub const AccessorTemplates = types.AccessorTemplates;
 pub const TelemetryType = types.TelemetryType;
 
 // =============================================================================

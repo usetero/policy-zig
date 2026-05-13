@@ -8,12 +8,11 @@ const LogRemove = proto.policy.LogRemove;
 const LogRedact = proto.policy.LogRedact;
 const LogRename = proto.policy.LogRename;
 const LogAdd = proto.policy.LogAdd;
+const AttributePath = proto.policy.AttributePath;
 
 // Re-export types for convenience
 pub const FieldRef = types.FieldRef;
-pub const LogFieldAccessor = types.LogFieldAccessor;
-pub const LogFieldMutator = types.LogFieldMutator;
-pub const MutateOp = types.MutateOp;
+pub const LogAccessor = types.LogAccessor;
 pub const TransformResult = types.TransformResult;
 
 /// Optional configuration for transform application.
@@ -53,11 +52,16 @@ pub const RedactOptions = struct {
 };
 
 /// Apply all transforms from a LogTransform in order: remove → redact → rename → add.
+///
+/// The engine owns transform dispatch: it pre-checks existence, resolves
+/// upsert semantics, and calls accessor primitives directly. Snapshot-compile
+/// time validation guarantees that any primitive used here is wired on the
+/// accessor — unwrapping the optional function pointers (`accessor.set.?`,
+/// `accessor.delete.?`, `accessor.move.?`) is safe at runtime.
 pub fn applyTransforms(
     transform: *const LogTransform,
     ctx: *anyopaque,
-    accessor: LogFieldAccessor,
-    mutator: LogFieldMutator,
+    accessor: *const LogAccessor,
     options: TransformOptions,
 ) TransformResult {
     var result = TransformResult{};
@@ -65,7 +69,7 @@ pub fn applyTransforms(
     // 1. Remove
     result.removes_attempted = transform.remove.items.len;
     for (transform.remove.items) |*rule| {
-        if (applyRemove(rule, ctx, mutator)) {
+        if (applyRemove(rule, ctx, accessor)) {
             result.removes_applied += 1;
         }
     }
@@ -78,7 +82,7 @@ pub fn applyTransforms(
             const slot = &options.compiled_redacts[idx];
             break :blk if (slot.*) |*c| c else null;
         };
-        if (applyRedact(rule, ctx, accessor, mutator, .{
+        if (applyRedact(rule, ctx, accessor, .{
             .compiled = compiled,
             .scratch = options.scratch,
         })) {
@@ -89,7 +93,7 @@ pub fn applyTransforms(
     // 3. Rename
     result.renames_attempted = transform.rename.items.len;
     for (transform.rename.items) |*rule| {
-        if (applyRename(rule, ctx, accessor, mutator)) {
+        if (applyRename(rule, ctx, accessor)) {
             result.renames_applied += 1;
         }
     }
@@ -97,7 +101,7 @@ pub fn applyTransforms(
     // 4. Add
     result.adds_attempted = transform.add.items.len;
     for (transform.add.items) |*rule| {
-        if (applyAdd(rule, ctx, accessor, mutator)) {
+        if (applyAdd(rule, ctx, accessor)) {
             result.adds_applied += 1;
         }
     }
@@ -105,126 +109,114 @@ pub fn applyTransforms(
     return result;
 }
 
-/// Apply a single remove rule
-/// Returns true if the field was removed
+/// Apply a single remove rule. Returns true if the field existed and was removed.
 pub fn applyRemove(
     rule: *const LogRemove,
     ctx: *anyopaque,
-    mutator: LogFieldMutator,
+    accessor: *const LogAccessor,
 ) bool {
     const field_ref = FieldRef.fromRemoveField(rule.field) orelse return false;
-    return mutator(ctx, .{ .remove = field_ref });
+    return accessor.delete.?(ctx, field_ref);
 }
 
 /// Apply a single redact rule.
 ///
 /// When `options.compiled` is null, replaces the entire field value with
 /// `rule.replacement`. When non-null, runs the pre-compiled regex over the
-/// textual representation returned by `accessor` and substitutes each match
-/// using the pre-parsed replacement template. If the accessor returns null, or
-/// the regex finds no match, the operation is a no-op (returns false). Regex-
-/// redact operates on the textual representation returned by the accessor —
-/// consumers that want to skip non-string values can return null from their
-/// accessor for those `AnyValue` variants.
+/// textual representation returned by `accessor.value` and substitutes each
+/// match using the pre-parsed replacement template. If the accessor returns
+/// null (field missing or non-string), or the regex finds no match, the
+/// operation is a no-op.
 ///
 /// Returns true if the field was redacted.
 pub fn applyRedact(
     rule: *const LogRedact,
     ctx: *anyopaque,
-    accessor: LogFieldAccessor,
-    mutator: LogFieldMutator,
+    accessor: *const LogAccessor,
     options: RedactOptions,
 ) bool {
     const field_ref = FieldRef.fromRedactField(rule.field) orelse return false;
 
     if (options.compiled) |c| {
         const allocator = options.scratch orelse return false;
-        const value = accessor(ctx, field_ref) orelse return false;
+        const value = accessor.value(ctx, field_ref) orelse return false;
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
-        // No deinit: `out.items` is handed to the mutator by reference and must
-        // remain valid after this function returns. The caller's `scratch` is
-        // documented as arena-lifetime; ownership of the bytes effectively
-        // transfers to that arena.
+        // No deinit: `out.items` is handed to the accessor.set by reference
+        // and must remain valid after this function returns. The caller's
+        // `scratch` is documented as arena-lifetime; ownership of the bytes
+        // effectively transfers to that arena.
 
         // Cast away const for replaceAll which mutates engine state internally.
         const mut: *redact_mod.Compiled = @constCast(c);
         const count = mut.replaceAll(value, &out, allocator) catch return false;
         if (count == 0) return false;
 
-        return mutator(ctx, .{
-            .set = .{
-                .field = field_ref,
-                .value = out.items,
-                .upsert = false,
-            },
-        });
+        accessor.set.?(ctx, field_ref, out.items);
+        return true;
     }
 
     // Whole-value redact: only fires if the field exists.
-    if (accessor(ctx, field_ref) == null) return false;
+    if (accessor.value(ctx, field_ref) == null) return false;
 
-    return mutator(ctx, .{
-        .set = .{
-            .field = field_ref,
-            .value = rule.replacement,
-            .upsert = false,
-        },
-    });
+    accessor.set.?(ctx, field_ref, rule.replacement);
+    return true;
 }
 
-/// Apply a single rename rule
-/// Moves the value from one field to another
-/// Returns true if the field was renamed
+/// Apply a single rename rule. Moves the value from `rule.from` to a new
+/// attribute keyed by `rule.to` in the same field family. Handles upsert
+/// semantics engine-side: with `upsert=false`, no-ops when target exists;
+/// with `upsert=true`, deletes target first.
+///
+/// Returns true if the rename actually moved a value.
 pub fn applyRename(
     rule: *const LogRename,
     ctx: *anyopaque,
-    accessor: LogFieldAccessor,
-    mutator: LogFieldMutator,
+    accessor: *const LogAccessor,
 ) bool {
     const from_ref = FieldRef.fromRenameFrom(rule.from) orelse return false;
 
-    // Check the source value exists
-    if (accessor(ctx, from_ref) == null) {
-        // Source doesn't exist - nothing to rename
-        return false;
+    // Source must exist (presence check honors non-string values).
+    if (!accessor.callExists(ctx, from_ref)) return false;
+
+    // Construct the target FieldRef in the same family as `from`, keyed by
+    // `rule.to`. Only attribute families are renameable; log_field sources
+    // are rejected by the spec.
+    const to_path = [_][]const u8{rule.to};
+    const to_attr = AttributePath{ .path = .{ .items = @constCast(&to_path), .capacity = 1 } };
+    const to_ref: FieldRef = switch (from_ref) {
+        .log_field => return false,
+        .log_attribute => .{ .log_attribute = to_attr },
+        .resource_attribute => .{ .resource_attribute = to_attr },
+        .scope_attribute => .{ .scope_attribute = to_attr },
+    };
+
+    const target_exists = accessor.callExists(ctx, to_ref);
+    if (target_exists) {
+        if (!rule.upsert) return false;
+        _ = accessor.delete.?(ctx, to_ref);
     }
 
-    // Perform the rename operation
-    return mutator(ctx, .{
-        .rename = .{
-            .from = from_ref,
-            .to = rule.to,
-            .upsert = rule.upsert,
-        },
-    });
+    accessor.move.?(ctx, from_ref, rule.to);
+    return true;
 }
 
-/// Apply a single add rule
-/// Inserts a field with the given value
-/// If upsert is false, only adds if field doesn't exist
-/// Returns true if the field was added/updated
+/// Apply a single add rule. Inserts a field with the given value. If
+/// `upsert=false`, no-ops when the target already exists.
+///
+/// Returns true if the field was added/updated.
 pub fn applyAdd(
     rule: *const LogAdd,
     ctx: *anyopaque,
-    accessor: LogFieldAccessor,
-    mutator: LogFieldMutator,
+    accessor: *const LogAccessor,
 ) bool {
     const field_ref = FieldRef.fromAddField(rule.field) orelse return false;
 
-    // Check if field already exists
-    const exists = accessor(ctx, field_ref) != null;
-
-    // If not upsert and field exists, don't overwrite
+    const exists = accessor.callExists(ctx, field_ref);
     if (!rule.upsert and exists) return false;
 
-    return mutator(ctx, .{
-        .set = .{
-            .field = field_ref,
-            .value = rule.value,
-            .upsert = rule.upsert,
-        },
-    });
+    accessor.set.?(ctx, field_ref, rule.value);
+    return true;
 }
 
 // =============================================================================
@@ -276,78 +268,57 @@ const TestContext = struct {
         return path[0];
     }
 
-    fn fieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
-        const self: *const TestContext = @ptrCast(@alignCast(ctx));
-        const key: ?[]const u8 = switch (field) {
+    fn fieldKey(field: FieldRef) ?[]const u8 {
+        return switch (field) {
             .log_field => |f| @tagName(f),
             .log_attribute => |p| getFirstPathSegment(p.path.items),
             .resource_attribute => |p| getFirstPathSegment(p.path.items),
             .scope_attribute => |p| getFirstPathSegment(p.path.items),
         };
-        return if (key) |k| self.fields.get(k) else null;
     }
 
-    fn fieldMutator(ctx: *anyopaque, op: MutateOp) bool {
+    fn accessorValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+        const self: *const TestContext = @ptrCast(@alignCast(ctx));
+        const key = fieldKey(field) orelse return null;
+        return self.fields.get(key);
+    }
+
+    fn accessorSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
         const self: *TestContext = @ptrCast(@alignCast(ctx));
-        switch (op) {
-            .remove => |field| {
-                const key: ?[]const u8 = switch (field) {
-                    .log_field => |f| @tagName(f),
-                    .log_attribute => |p| getFirstPathSegment(p.path.items),
-                    .resource_attribute => |p| getFirstPathSegment(p.path.items),
-                    .scope_attribute => |p| getFirstPathSegment(p.path.items),
-                };
-                const k = key orelse return false;
-                if (self.fields.fetchRemove(k)) |removed| {
-                    self.allocator.free(removed.key);
-                    self.allocator.free(removed.value);
-                    return true;
-                }
-                return false;
-            },
-            .set => |s| {
-                const key: ?[]const u8 = switch (s.field) {
-                    .log_field => |f| @tagName(f),
-                    .log_attribute => |p| getFirstPathSegment(p.path.items),
-                    .resource_attribute => |p| getFirstPathSegment(p.path.items),
-                    .scope_attribute => |p| getFirstPathSegment(p.path.items),
-                };
-                const k = key orelse return false;
-                self.set(k, s.value) catch return false;
-                return true;
-            },
-            .rename => |r| {
-                const from_key: ?[]const u8 = switch (r.from) {
-                    .log_field => |f| @tagName(f),
-                    .log_attribute => |p| getFirstPathSegment(p.path.items),
-                    .resource_attribute => |p| getFirstPathSegment(p.path.items),
-                    .scope_attribute => |p| getFirstPathSegment(p.path.items),
-                };
-                const fk = from_key orelse return false;
-
-                // Get and remove the source value
-                const removed = self.fields.fetchRemove(fk) orelse return false;
-                defer self.allocator.free(removed.key);
-
-                // Check if target exists
-                const target_exists = self.fields.contains(r.to);
-                if (!r.upsert and target_exists) {
-                    // Put the value back since we can't rename
-                    self.fields.put(removed.key, removed.value) catch {};
-                    return false;
-                }
-
-                // Set the new field
-                self.set(r.to, removed.value) catch {
-                    // Put the value back on failure
-                    self.fields.put(removed.key, removed.value) catch {};
-                    return false;
-                };
-                self.allocator.free(removed.value);
-                return true;
-            },
-        }
+        const key = fieldKey(field) orelse return;
+        self.set(key, value) catch {};
     }
+
+    fn accessorDelete(ctx: *anyopaque, field: FieldRef) bool {
+        const self: *TestContext = @ptrCast(@alignCast(ctx));
+        const key = fieldKey(field) orelse return false;
+        if (self.fields.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value);
+            return true;
+        }
+        return false;
+    }
+
+    fn accessorMove(ctx: *anyopaque, from: FieldRef, to: []const u8) void {
+        const self: *TestContext = @ptrCast(@alignCast(ctx));
+        const from_key = fieldKey(from) orelse return;
+        const removed = self.fields.fetchRemove(from_key) orelse return;
+        defer self.allocator.free(removed.key);
+        self.set(to, removed.value) catch {
+            // restore on failure
+            self.fields.put(removed.key, removed.value) catch {};
+            return;
+        };
+        self.allocator.free(removed.value);
+    }
+
+    const accessor: LogAccessor = .{
+        .value = accessorValue,
+        .set = accessorSet,
+        .delete = accessorDelete,
+        .move = accessorMove,
+    };
 };
 
 /// Helper to create AttributePath for tests
@@ -366,7 +337,7 @@ test "applyRemove: removes existing field" {
         .field = .{ .log_attribute = testAttrPath("service") },
     };
 
-    const result = applyRemove(&rule, @ptrCast(&ctx), TestContext.fieldMutator);
+    const result = applyRemove(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(result);
     try testing.expect(ctx.fields.get("service") == null);
 }
@@ -380,7 +351,7 @@ test "applyRemove: returns false for non-existent field" {
         .field = .{ .log_attribute = testAttrPath("nonexistent") },
     };
 
-    const result = applyRemove(&rule, @ptrCast(&ctx), TestContext.fieldMutator);
+    const result = applyRemove(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(!result);
 }
 
@@ -409,7 +380,7 @@ test "applyRedact: replaces field value" {
         .replacement = "[REDACTED]",
     };
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{});
+    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{});
     try testing.expect(result);
     try testing.expectEqualStrings("[REDACTED]", ctx.fields.get("password").?);
 }
@@ -424,7 +395,7 @@ test "applyRedact: returns false for non-existent field" {
         .replacement = "[REDACTED]",
     };
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{});
+    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{});
     try testing.expect(!result);
 }
 
@@ -446,7 +417,7 @@ test "applyRedact: regex targeted replacement" {
     var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
     defer compiled.deinit();
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
+    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
     });
@@ -472,7 +443,7 @@ test "applyRedact: regex no-match is a no-op" {
     var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
     defer compiled.deinit();
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
+    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
     });
@@ -491,21 +462,26 @@ test "applyRedact: regex output outlives applyRedact return" {
 
     const ByRefCtx = struct {
         stored: ?[]const u8 = null,
-        fn accessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+        fn valueFn(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             _ = field;
             const self: *const @This() = @ptrCast(@alignCast(ctx));
             return self.stored;
         }
-        fn mutator(ctx: *anyopaque, op: MutateOp) bool {
+        fn setFn(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
+            _ = field;
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            switch (op) {
-                .set => |s| {
-                    self.stored = s.value;
-                    return true;
-                },
-                else => return false,
-            }
+            self.stored = value;
         }
+        fn deleteFn(_: *anyopaque, _: FieldRef) bool {
+            return false;
+        }
+        fn moveFn(_: *anyopaque, _: FieldRef, _: []const u8) void {}
+        const accessor: LogAccessor = .{
+            .value = valueFn,
+            .set = setFn,
+            .delete = deleteFn,
+            .move = moveFn,
+        };
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -522,7 +498,7 @@ test "applyRedact: regex output outlives applyRedact return" {
     var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
     defer compiled.deinit();
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), ByRefCtx.accessor, ByRefCtx.mutator, .{
+    const result = applyRedact(&rule, @ptrCast(&ctx), &ByRefCtx.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
     });
@@ -549,7 +525,7 @@ test "applyRedact: regex on missing field is a no-op" {
     var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
     defer compiled.deinit();
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator, .{
+    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
     });
@@ -569,7 +545,7 @@ test "applyRename: renames existing field" {
         .upsert = true,
     };
 
-    const result = applyRename(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyRename(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(result);
     try testing.expect(ctx.fields.get("old_name") == null);
     try testing.expectEqualStrings("value123", ctx.fields.get("new_name").?);
@@ -586,7 +562,7 @@ test "applyRename: returns false for non-existent source" {
         .upsert = true,
     };
 
-    const result = applyRename(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyRename(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(!result);
 }
 
@@ -601,7 +577,7 @@ test "applyAdd: adds new field" {
         .upsert = true,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(result);
     try testing.expectEqualStrings("new_value", ctx.fields.get("new_field").?);
 }
@@ -619,7 +595,7 @@ test "applyAdd: upsert=false skips existing field" {
         .upsert = false,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(!result);
     try testing.expectEqualStrings("original", ctx.fields.get("existing").?);
 }
@@ -635,7 +611,7 @@ test "applyAdd: upsert=false adds non-existent field" {
         .upsert = false,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(result);
     try testing.expectEqualStrings("hello", ctx.fields.get("new_field").?);
 }
@@ -653,7 +629,7 @@ test "applyAdd: upsert=true overwrites existing field" {
         .upsert = true,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.accessor);
     try testing.expect(result);
     try testing.expectEqualStrings("new_value", ctx.fields.get("existing").?);
 }
@@ -704,8 +680,7 @@ test "applyTransforms: applies in correct order" {
     const result = applyTransforms(
         &transform,
         @ptrCast(&ctx),
-        TestContext.fieldAccessor,
-        TestContext.fieldMutator,
+        &TestContext.accessor,
         .{},
     );
 
@@ -795,8 +770,7 @@ test "applyTransforms: counts attempted vs applied when some operations fail" {
     const result = applyTransforms(
         &transform,
         @ptrCast(&ctx),
-        TestContext.fieldAccessor,
-        TestContext.fieldMutator,
+        &TestContext.accessor,
         .{},
     );
 
@@ -831,8 +805,7 @@ test "applyTransforms: empty transform returns zero counts" {
     const result = applyTransforms(
         &transform,
         @ptrCast(&ctx),
-        TestContext.fieldAccessor,
-        TestContext.fieldMutator,
+        &TestContext.accessor,
         .{},
     );
 
@@ -889,8 +862,7 @@ test "applyTransforms: all operations fail returns zero applied" {
     const result = applyTransforms(
         &transform,
         &ctx,
-        TestContext.fieldAccessor,
-        TestContext.fieldMutator,
+        &TestContext.accessor,
         .{},
     );
 

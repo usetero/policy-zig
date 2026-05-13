@@ -253,63 +253,103 @@ pub const MetricFieldRef = union(enum) {
 };
 
 // =============================================================================
-// Log Field Accessor/Mutator Types
+// Log Accessor - Capability-tagged interface to consumer log records
 // =============================================================================
 
-/// Log field accessor function type - returns the value for a given log field
-/// Returns null if the field doesn't exist
-pub const LogFieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
+/// Read+write interface to a log record. The engine dispatches every read and
+/// write through these function pointers; ctx is the consumer-owned record
+/// the pointers operate on (passed positionally to evaluate()).
+///
+/// `value` is the only required field. Optional primitives are interpreted by
+/// the registry as capability advertisements: a policy whose transforms need a
+/// missing primitive is rejected at snapshot-compile time (via the provider's
+/// recordPolicyError path), so the engine never reaches a null function
+/// pointer at runtime.
+pub const LogAccessor = struct {
+    /// Read field as bytes for pattern matching.
+    /// Returns null when the field is absent OR its underlying value is not a
+    /// string. Consumers that want exists-matchers to fire on non-string
+    /// fields should wire `exists` to report presence independently.
+    value: *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8,
 
-/// Log field mutator function type - sets, removes, or renames a log field
-/// Returns true if the operation succeeded
-pub const LogFieldMutator = *const fn (ctx: *anyopaque, op: MutateOp) bool;
+    /// Returns true if the field is present, regardless of underlying type.
+    /// When null, the engine falls back to `value(...) != null`, preserving
+    /// the old "non-null means present" semantics.
+    exists: ?*const fn (ctx: *const anyopaque, field: FieldRef) bool = null,
 
-// =============================================================================
-// Metric Field Accessor/Mutator Types
-// =============================================================================
+    /// Upsert a field. The engine pre-validates existence via `value`/`exists`
+    /// and pre-checks `upsert=false` conflicts, so `set` is always called at
+    /// a point where the write is expected to succeed.
+    ///
+    /// Wiring this enables: log.redact, log.add. Lifetime: bytes passed to
+    /// `set` must outlive any reference the consumer retains; the engine
+    /// allocates them into the caller-supplied `scratch` allocator.
+    set: ?*const fn (ctx: *anyopaque, field: FieldRef, value: []const u8) void = null,
 
-/// Metric field accessor function type - returns the value for a given metric field
-/// Returns null if the field doesn't exist
-pub const MetricFieldAccessor = *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8;
+    /// Remove a field. Returns true iff the field existed (so the engine can
+    /// count `removes_applied` accurately).
+    ///
+    /// Wiring this enables: log.remove. Required (together with `move`) for
+    /// log.rename to function with `upsert=true`.
+    delete: ?*const fn (ctx: *anyopaque, field: FieldRef) bool = null,
 
-/// Metric field mutator function type - sets, removes, or renames a metric field
-/// Returns true if the operation succeeded
-pub const MetricFieldMutator = *const fn (ctx: *anyopaque, op: MetricMutateOp) bool;
+    /// Move a value from one field to another. The engine pre-checks source
+    /// existence and resolves upsert semantics (delete target first when
+    /// upsert=true; engine-side skip when upsert=false and target exists), so
+    /// `move` itself does not take an upsert flag.
+    ///
+    /// `to` is a key in the same family as `from` (matches the proto
+    /// `LogRename.to` shape: rename only targets attributes, single key).
+    ///
+    /// Wiring this enables: log.rename.
+    move: ?*const fn (ctx: *anyopaque, from: FieldRef, to: []const u8) void = null,
 
-/// Mutation operation for log field mutator
-pub const MutateOp = union(enum) {
-    /// Remove a field entirely
-    remove: FieldRef,
-    /// Set a field to a value (upsert controls insert vs update behavior)
-    set: struct {
-        field: FieldRef,
-        value: []const u8,
-        upsert: bool,
-    },
-    /// Rename a field (move value from one field to another)
-    rename: struct {
-        from: FieldRef,
-        to: []const u8,
-        upsert: bool,
-    },
+    /// Returns true if the field is present. Uses the wired `exists` primitive
+    /// when available, otherwise falls back to `value != null`.
+    pub fn callExists(self: *const LogAccessor, ctx: *const anyopaque, field: FieldRef) bool {
+        if (self.exists) |f| return f(ctx, field);
+        return self.value(ctx, field) != null;
+    }
 };
 
-/// Mutation operation for metric field mutator
-pub const MetricMutateOp = union(enum) {
-    /// Remove a field entirely
-    remove: MetricFieldRef,
-    /// Set a field to a value (upsert controls insert vs update behavior)
-    set: struct {
-        field: MetricFieldRef,
-        value: []const u8,
-        upsert: bool,
-    },
-    /// Rename a field (move value from one field to another)
-    rename: struct {
-        from: MetricFieldRef,
-        to: []const u8,
-        upsert: bool,
-    },
+/// Read+write interface to a metric record. Today no transforms touch metrics,
+/// so only `value` and `exists` are part of the interface.
+pub const MetricAccessor = struct {
+    value: *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8,
+
+    exists: ?*const fn (ctx: *const anyopaque, field: MetricFieldRef) bool = null,
+
+    pub fn callExists(self: *const MetricAccessor, ctx: *const anyopaque, field: MetricFieldRef) bool {
+        if (self.exists) |f| return f(ctx, field);
+        return self.value(ctx, field) != null;
+    }
+};
+
+/// Read+write interface to a trace/span record. The only writable target today
+/// is the W3C tracestate header (TRACE_FIELD_TRACE_STATE), which the engine
+/// writes when probabilistic sampling produces a threshold; consumers wire
+/// `set` to merge that threshold into their tracestate representation.
+pub const TraceAccessor = struct {
+    value: *const fn (ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8,
+
+    exists: ?*const fn (ctx: *const anyopaque, field: TraceFieldRef) bool = null,
+
+    /// Wiring this enables: trace sampling threshold writeback.
+    set: ?*const fn (ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void = null,
+
+    pub fn callExists(self: *const TraceAccessor, ctx: *const anyopaque, field: TraceFieldRef) bool {
+        if (self.exists) |f| return f(ctx, field);
+        return self.value(ctx, field) != null;
+    }
+};
+
+/// Static templates wired to the PolicyRegistry. A telemetry-type field set to
+/// null means the consumer doesn't handle that telemetry — all policies of
+/// that type are rejected at snapshot-compile time with a descriptive reason.
+pub const AccessorTemplates = struct {
+    log: ?LogAccessor = null,
+    metric: ?MetricAccessor = null,
+    trace: ?TraceAccessor = null,
 };
 
 // =============================================================================
@@ -401,36 +441,6 @@ pub const TraceFieldRef = union(enum) {
             .trace_field, .span_kind, .span_status => "",
         };
     }
-};
-
-// =============================================================================
-// Trace Field Accessor/Mutator Types
-// =============================================================================
-
-/// Trace field accessor function type - returns the value for a given trace/span field
-/// Returns null if the field doesn't exist
-pub const TraceFieldAccessor = *const fn (ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8;
-
-/// Trace field mutator function type - sets, removes, or renames a trace/span field
-/// Returns true if the operation succeeded
-pub const TraceFieldMutator = *const fn (ctx: *anyopaque, op: TraceMutateOp) bool;
-
-/// Mutation operation for trace field mutator
-pub const TraceMutateOp = union(enum) {
-    /// Remove a field entirely
-    remove: TraceFieldRef,
-    /// Set a field to a value (upsert controls insert vs update behavior)
-    set: struct {
-        field: TraceFieldRef,
-        value: []const u8,
-        upsert: bool,
-    },
-    /// Rename a field (move value from one field to another)
-    rename: struct {
-        from: TraceFieldRef,
-        to: []const u8,
-        upsert: bool,
-    },
 };
 
 // =============================================================================
