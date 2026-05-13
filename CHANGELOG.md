@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/usetero/policy-zig/compare/v0.2.0...v0.3.0) (2026-05-13)
+
+
+### Features
+
+* support regex replacements in redactions ([#55](https://github.com/usetero/policy-zig/issues/55)) ([e5fddf6](https://github.com/usetero/policy-zig/commit/e5fddf63800c667eb7a1f6ae3bc80cd64a9fed37))
+
 ## [0.2.0](https://github.com/usetero/policy-zig/compare/v0.1.17...v0.2.0) (2026-04-06)
 
 
