@@ -23,6 +23,8 @@ const hyperscan = @import("./hyperscan.zig");
 const policy_types = @import("./types.zig");
 const probabilistic_sampler_mod = @import("./probabilistic_sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
+const redact_mod = @import("./redact.zig");
+const log_transform = @import("./log_transform.zig");
 const o11y = @import("observability");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -82,8 +84,21 @@ pub const MAX_POLICIES: usize = 8192;
 // =============================================================================
 
 /// Key for indexing Hyperscan databases for log policies.
+///
+/// `exists_entries` is a per-policy list of exists-matchers on this field;
+/// it is not part of the hash/eql contract (only `field` is). Lookups in the
+/// `databases` HashMap therefore work with a key constructed via just the
+/// field. The engine reads `exists_entries` directly off the entry returned
+/// by `getMatcherKeys`.
+///
+/// `has_value_db` is set at build time when at least one positive or negated
+/// value pattern is compiled for this key. Exists-only keys have it false;
+/// the engine uses this to skip the `value()` + database lookup that would
+/// otherwise be dead work.
 pub const LogMatcherKey = struct {
     field: FieldRef,
+    exists_entries: []const ExistsEntry = &.{},
+    has_value_db: bool = false,
 
     const Self = @This();
 
@@ -99,6 +114,8 @@ pub const LogMatcherKey = struct {
 /// Key for indexing Hyperscan databases for metric policies.
 pub const MetricMatcherKey = struct {
     field: MetricFieldRef,
+    exists_entries: []const ExistsEntry = &.{},
+    has_value_db: bool = false,
 
     const Self = @This();
 
@@ -198,6 +215,8 @@ pub const MetricMatcherKeyContext = struct {
 /// Key for indexing Hyperscan databases for trace policies.
 pub const TraceMatcherKey = struct {
     field: TraceFieldRef,
+    exists_entries: []const ExistsEntry = &.{},
+    has_value_db: bool = false,
 
     const Self = @This();
 
@@ -239,6 +258,19 @@ pub const KeepValue = union(enum) {
     per_second: RateLimit,
     per_minute: RateLimit,
 
+    /// Maximum rate-limit window expressed in the policy unit. The runtime
+    /// converts `per_second` to milliseconds (×1_000) and `per_minute` to
+    /// milliseconds (×60_000), so the cap is chosen to keep the converted
+    /// value well within u32 (max 4_294_967_295).
+    ///
+    /// - per_second: 1_000_000 → 1_000_000_000 ms (~11.5 days), well under u32 max
+    /// - per_minute: 50_000   → 3_000_000_000 ms (~34.7 days), under u32 max
+    ///
+    /// We cap per_second at 1M and per_minute at 50K — both produce sane
+    /// windows; values above either are clamped to the cap.
+    pub const MAX_RATE_LIMIT_DURATION_SECONDS: u32 = 1_000_000;
+    pub const MAX_RATE_LIMIT_DURATION_MINUTES: u32 = 50_000;
+
     pub fn parse(s: []const u8) KeepValue {
         if (s.len == 0 or std.mem.eql(u8, s, "all")) return .all;
         if (std.mem.eql(u8, s, "none")) return .none;
@@ -256,11 +288,16 @@ pub const KeepValue = union(enum) {
             const after_slash = s[slash_pos + 1 ..];
             const unit = after_slash[after_slash.len - 1];
             if (unit != 's' and unit != 'm') return .all;
-            const duration: u32 = if (after_slash.len == 1)
+            const duration_raw: u32 = if (after_slash.len == 1)
                 1
             else
                 std.fmt.parseInt(u32, after_slash[0 .. after_slash.len - 1], 10) catch return .all;
-            if (duration == 0) return .all;
+            if (duration_raw == 0) return .all;
+
+            // Clamp the window so the later ms conversion (×1_000 / ×60_000)
+            // can't overflow u32 in storePolicyInfo.
+            const max: u32 = if (unit == 's') MAX_RATE_LIMIT_DURATION_SECONDS else MAX_RATE_LIMIT_DURATION_MINUTES;
+            const duration = if (duration_raw > max) max else duration_raw;
             const rl = RateLimit{ .count = count, .duration = duration };
             return if (unit == 's') .{ .per_second = rl } else .{ .per_minute = rl };
         }
@@ -321,6 +358,12 @@ pub const PolicyInfo = struct {
     /// OTel-compliant probabilistic sampler. Pre-computed at index build time.
     /// Set for trace and log policies with percentage keep.
     sampler: ?ProbabilisticSampler = null,
+    /// Compiled redact rules for log policies, paired with their source rule.
+    /// Length matches `LogTransform.redact.items.len`; ordering matches the
+    /// rule list. Each entry's `compiled` is non-null only when the source
+    /// rule carries a `regex`. Empty slice for non-log policies or log
+    /// policies with no redacts.
+    compiled_redacts: []log_transform.CompiledRedact = &.{},
 };
 
 // =============================================================================
@@ -336,6 +379,15 @@ const PatternCollector = struct {
     pattern: []const u8,
     match_type: MatchType = .regex,
     case_insensitive: bool = false,
+};
+
+/// Per-policy entry for an exists matcher on a given field.
+/// `negate` already reflects the spec-level combination of `matcher.negate`
+/// and `exists` value: the engine treats this as a Hyperscan-style negated
+/// pattern (initial seed +1, decrement when condition fires).
+pub const ExistsEntry = struct {
+    policy_index: PolicyIndex,
+    negate: bool,
 };
 
 // =============================================================================
@@ -549,6 +601,10 @@ pub fn MatcherIndexType(comptime T: TelemetryType) type {
 const PatternsPerKey = struct {
     positive: std.ArrayListUnmanaged(PatternCollector),
     negated: std.ArrayListUnmanaged(PatternCollector),
+    /// Exists-matchers are bucketed separately so the engine can dispatch them
+    /// via `accessor.callExists` (presence-regardless-of-type) instead of
+    /// scanning the value bytes through Hyperscan.
+    exists: std.ArrayListUnmanaged(ExistsEntry),
 };
 
 // =============================================================================
@@ -670,12 +726,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     .regex = "",
                     .negate = matcher.negate,
                 });
-                const matcher_key = MatcherKeyT{ .field = field_ref };
-                try self.addPattern(matcher_key, .{
-                    .pattern = "",
-                    .match_type = .exists,
-                    .case_insensitive = false,
-                }, matcher.negate, field_ref);
+                try self.addExists(MatcherKeyT{ .field = field_ref }, matcher.negate, field_ref);
                 return;
             }
 
@@ -684,16 +735,32 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 return;
             };
 
+            // Exists matchers go to the exists bucket — they fire on field
+            // presence regardless of underlying value type.
+            switch (m) {
+                .exists => |exists| {
+                    const negate = matcher.negate != !exists;
+                    self.bus.debug(MatcherDetail{
+                        .matcher_idx = matcher_idx,
+                        .regex = "",
+                        .negate = negate,
+                    });
+                    try self.addExists(MatcherKeyT{ .field = field_ref }, negate, field_ref);
+                    return;
+                },
+                else => {},
+            }
+
             const pattern, const match_type, const negate = switch (m) {
                 .regex => |r| .{ r, MatchType.regex, matcher.negate },
                 .exact => |e| .{ e, MatchType.exact, matcher.negate },
-                .exists => |exists| .{ "", MatchType.exists, matcher.negate != !exists },
+                .exists => unreachable,
                 .starts_with => |s| .{ s, MatchType.starts_with, matcher.negate },
                 .ends_with => |s| .{ s, MatchType.ends_with, matcher.negate },
                 .contains => |s| .{ s, MatchType.contains, matcher.negate },
             };
 
-            if (pattern.len == 0 and match_type != .exists) {
+            if (pattern.len == 0) {
                 self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
                 return;
             }
@@ -732,7 +799,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const gop = try self.patterns_by_key.getOrPut(key);
             if (!gop.found_existing) {
                 try self.dupeKeyIfNeeded(gop.key_ptr, field_ref);
-                gop.value_ptr.* = .{ .positive = .{}, .negated = .{} };
+                gop.value_ptr.* = .{ .positive = .{}, .negated = .{}, .exists = .{} };
             }
 
             const collector = PatternCollector{
@@ -746,6 +813,29 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             } else {
                 try gop.value_ptr.positive.append(self.temp_allocator, collector);
             }
+        }
+
+        /// Register an exists matcher on the given key. Exists matchers
+        /// contribute to required_match_count (and negated_count when
+        /// `negate=true`) but are not compiled into Hyperscan; the engine
+        /// dispatches them via `accessor.callExists` at scan time.
+        fn addExists(self: *Self, key: MatcherKeyT, negate: bool, field_ref: FieldRefT) !void {
+            if (negate) {
+                self.current_negated_count += 1;
+            } else {
+                self.current_positive_count += 1;
+            }
+
+            const gop = try self.patterns_by_key.getOrPut(key);
+            if (!gop.found_existing) {
+                try self.dupeKeyIfNeeded(gop.key_ptr, field_ref);
+                gop.value_ptr.* = .{ .positive = .{}, .negated = .{}, .exists = .{} };
+            }
+
+            try gop.value_ptr.exists.append(self.temp_allocator, .{
+                .policy_index = self.policy_index,
+                .negate = negate,
+            });
         }
 
         fn dupeKeyIfNeeded(self: *Self, key_ptr: *MatcherKeyT, field_ref: FieldRefT) !void {
@@ -831,6 +921,19 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => null,
             };
 
+            // Compile regex-based redact rules for log policies. Delegated
+            // to `log_transform.compileRedactRules` so the cleanup path lives
+            // in one place; on success this returns a slice of
+            // `{rule, compiled}` pairs keyed structurally to the rule list.
+            const compiled_redacts: []log_transform.CompiledRedact = if (T == .log) blk: {
+                const transform = target.transform orelse break :blk &.{};
+                break :blk log_transform.compileRedactRules(self.allocator, &transform) catch |err| {
+                    self.bus.warn(MatcherEmptyRegex{ .matcher_idx = 0 });
+                    return err;
+                };
+            } else &.{};
+            errdefer log_transform.deinitCompiledRedacts(self.allocator, compiled_redacts);
+
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
                 .index = self.policy_index,
@@ -842,6 +945,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .rate_limiter = rate_limiter,
                 .sample_key = sample_key,
                 .sampler = sampler,
+                .compiled_redacts = compiled_redacts,
             });
 
             self.bus.debug(PolicyStored{
@@ -873,11 +977,33 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 const matcher_key = entry.key_ptr.*;
                 const patterns = entry.value_ptr.*;
 
-                if (patterns.positive.items.len == 0 and patterns.negated.items.len == 0) continue;
+                // Skip keys that ended up with nothing wired (defensive — the
+                // builder only inserts a key when adding a pattern or exists).
+                if (patterns.positive.items.len == 0 and
+                    patterns.negated.items.len == 0 and
+                    patterns.exists.items.len == 0) continue;
 
-                const db = try compileDatabase(self.allocator, self.bus, patterns.positive.items, patterns.negated.items);
-                try databases.put(matcher_key, db);
-                try keys_list.append(self.temp_allocator, matcher_key);
+                // Only compile a Hyperscan DB when there are value-match
+                // patterns. Exists-only keys live in `matcher_keys` without
+                // a corresponding database entry.
+                const has_value_db = patterns.positive.items.len > 0 or patterns.negated.items.len > 0;
+                if (has_value_db) {
+                    const db = try compileDatabase(self.allocator, self.bus, patterns.positive.items, patterns.negated.items);
+                    try databases.put(matcher_key, db);
+                }
+
+                // Materialize exists entries into long-lived storage; the
+                // temp_allocator-backed list is dropped at builder end.
+                const exists_entries: []const ExistsEntry = if (patterns.exists.items.len == 0)
+                    &.{}
+                else
+                    try self.allocator.dupe(ExistsEntry, patterns.exists.items);
+
+                try keys_list.append(self.temp_allocator, .{
+                    .field = matcher_key.field,
+                    .exists_entries = exists_entries,
+                    .has_value_db = has_value_db,
+                });
             }
 
             const matcher_keys = try self.allocator.dupe(MatcherKeyT, keys_list.items);
@@ -968,7 +1094,9 @@ pub const LogMatcherIndex = struct {
     }
 
     pub fn isEmpty(self: *const Self) bool {
-        return self.databases.count() == 0;
+        // Either Hyperscan-backed value matchers or exists-bucket matchers
+        // make the index non-empty; both feed evaluation.
+        return self.matcher_keys.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const Self) usize {
@@ -987,14 +1115,21 @@ pub const LogMatcherIndex = struct {
         }
         self.databases.deinit();
 
-        // Free rate limiters
-        for (self.policies) |policy_info| {
+        // Free rate limiters and compiled redacts
+        for (self.policies) |*policy_info| {
             if (policy_info.rate_limiter) |rl| {
                 self.allocator.destroy(rl);
+            }
+            if (policy_info.compiled_redacts.len > 0) {
+                log_transform.deinitCompiledRedacts(self.allocator, policy_info.compiled_redacts);
             }
         }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
+        // Free exists-entry slices owned by each matcher key.
+        for (self.matcher_keys) |key| {
+            if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
+        }
         self.allocator.free(self.matcher_keys);
 
         for (self.path_storage.items) |path| {
@@ -1084,7 +1219,9 @@ pub const MetricMatcherIndex = struct {
     }
 
     pub fn isEmpty(self: *const Self) bool {
-        return self.databases.count() == 0;
+        // Either Hyperscan-backed value matchers or exists-bucket matchers
+        // make the index non-empty; both feed evaluation.
+        return self.matcher_keys.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const Self) usize {
@@ -1111,6 +1248,10 @@ pub const MetricMatcherIndex = struct {
         }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
+        // Free exists-entry slices owned by each matcher key.
+        for (self.matcher_keys) |key| {
+            if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
+        }
         self.allocator.free(self.matcher_keys);
 
         for (self.path_storage.items) |path| {
@@ -1200,7 +1341,9 @@ pub const TraceMatcherIndex = struct {
     }
 
     pub fn isEmpty(self: *const Self) bool {
-        return self.databases.count() == 0;
+        // Either Hyperscan-backed value matchers or exists-bucket matchers
+        // make the index non-empty; both feed evaluation.
+        return self.matcher_keys.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const Self) usize {
@@ -1227,6 +1370,10 @@ pub const TraceMatcherIndex = struct {
         }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
+        // Free exists-entry slices owned by each matcher key.
+        for (self.matcher_keys) |key| {
+            if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
+        }
         self.allocator.free(self.matcher_keys);
 
         for (self.path_storage.items) |path| {
@@ -1316,13 +1463,16 @@ fn compileDatabase(
 }
 
 fn compilePatterns(allocator: std.mem.Allocator, collectors: []const PatternCollector) !struct { db: hyperscan.Database, meta: []PatternMeta } {
-    // Calculate buffer size: max len+2 per pattern (for anchors)
+    // Calculate buffer size: max len+2 per pattern (for anchors).
+    // Exists matchers never enter Hyperscan — they are dispatched separately
+    // by the engine via accessor.callExists.
     var buf_size: usize = 0;
     for (collectors) |c| {
         buf_size += switch (c.match_type) {
-            .regex, .exists, .contains => 0,
+            .regex, .contains => 0,
             .exact => c.pattern.len + 2,
             .starts_with, .ends_with => c.pattern.len + 1,
+            .exists => unreachable,
         };
     }
 
@@ -1353,11 +1503,11 @@ fn compilePatterns(allocator: std.mem.Allocator, collectors: []const PatternColl
 fn formatPattern(buf: *[]u8, pattern: []const u8, match_type: MatchType) []const u8 {
     const anchor_start, const anchor_end = switch (match_type) {
         .regex => return pattern,
-        .exists => return "^.+$",
         .exact => .{ true, true },
         .starts_with => .{ true, false },
         .ends_with => .{ false, true },
         .contains => return pattern,
+        .exists => unreachable, // exists is dispatched outside the Hyperscan path
     };
 
     const out = std.fmt.bufPrint(buf.*, "{s}{s}{s}", .{
@@ -1445,6 +1595,23 @@ test "KeepValue: parse" {
     try testing.expectEqual(KeepValue.all, KeepValue.parse("/s")); // missing count
     try testing.expectEqual(KeepValue.all, KeepValue.parse("abc/5s")); // non-integer count
     try testing.expectEqual(KeepValue.all, KeepValue.parse("1/abcs")); // non-integer duration
+}
+
+test "KeepValue: rate-limit duration is clamped to avoid u32 ms-overflow" {
+    // 5_000_000 minutes would translate to 3e11 ms — overflows u32 when
+    // multiplied by 60_000 in storePolicyInfo. The parser clamps to
+    // MAX_RATE_LIMIT_DURATION_MINUTES.
+    const huge_min = KeepValue.parse("10/5000000m");
+    try testing.expect(huge_min == .per_minute);
+    try testing.expect(huge_min.per_minute.duration <= KeepValue.MAX_RATE_LIMIT_DURATION_MINUTES);
+
+    // 5_000_000_000 seconds would similarly overflow when ×1_000.
+    const huge_sec = KeepValue.parse("10/5000000000s");
+    try testing.expect(huge_sec == .all or huge_sec.per_second.duration <= KeepValue.MAX_RATE_LIMIT_DURATION_SECONDS);
+
+    // u32::MAX exactly. Either rejected via parseInt or clamped — either is fine.
+    const u32_max = KeepValue.parse("10/4294967295s");
+    try testing.expect(u32_max == .all or u32_max.per_second.duration <= KeepValue.MAX_RATE_LIMIT_DURATION_SECONDS);
 }
 
 test "KeepValue: restrictiveness comparison" {
@@ -1651,7 +1818,7 @@ test "LogMatcherIndex: scan database" {
     try testing.expectEqual(@as(usize, 0), no_match_result.count);
 }
 
-test "LogMatcherIndex: exists=true matcher uses ^.+$ pattern" {
+test "LogMatcherIndex: exists=true matcher is bucketed into exists_entries" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -1664,7 +1831,6 @@ test "LogMatcherIndex: exists=true matcher uses ^.+$ pattern" {
             .keep = try allocator.dupe(u8, "all"),
         } },
     };
-    // Create AttributePath with "trace_id" as single path segment
     var attr_path = AttributePath{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "trace_id"));
     try policy.target.?.log.match.append(allocator, .{
@@ -1676,23 +1842,20 @@ test "LogMatcherIndex: exists=true matcher uses ^.+$ pattern" {
     var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    // exists=true should create a database with ^.+$ pattern
+    // exists matchers no longer compile to Hyperscan patterns; they live in
+    // the matcher key's exists_entries slice and are dispatched by the engine
+    // via accessor.callExists.
     try testing.expect(!index.isEmpty());
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
 
-    // The database should match any non-empty string
     const keys = index.getMatcherKeys();
     try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqual(@as(usize, 1), keys[0].exists_entries.len);
+    try testing.expect(!keys[0].exists_entries[0].negate);
 
-    const db = index.getDatabase(keys[0]).?;
-    var result_buf: [MAX_POLICIES]u32 = undefined;
-    var result = db.scanPositive("some-trace-id-value", &result_buf);
-    try testing.expectEqual(@as(usize, 1), result.count);
-
-    // Empty string should not match
-    result = db.scanPositive("", &result_buf);
-    try testing.expectEqual(@as(usize, 0), result.count);
+    // No Hyperscan database is compiled for an exists-only key.
+    try testing.expect(index.getDatabase(keys[0]) == null);
+    try testing.expectEqual(@as(usize, 0), index.getDatabaseCount());
 }
 
 test "LogMatcherIndex: exists=false matcher creates negated pattern" {
@@ -1720,16 +1883,15 @@ test "LogMatcherIndex: exists=false matcher creates negated pattern" {
     var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    // exists=false should create a negated pattern entry
+    // exists=false lives in exists_entries with negate=true; no Hyperscan DB.
     try testing.expect(!index.isEmpty());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
 
-    // Verify the pattern is in the negated database
-    const key = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"trace_id"}) } } } };
-    const db = index.getDatabase(key);
-    try testing.expect(db != null);
-    try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
-    try testing.expectEqual(@as(usize, 0), db.?.positive_patterns.len);
+    const keys = index.getMatcherKeys();
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqual(@as(usize, 1), keys[0].exists_entries.len);
+    try testing.expect(keys[0].exists_entries[0].negate);
+    try testing.expect(index.getDatabase(keys[0]) == null);
 }
 
 test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
@@ -1809,9 +1971,15 @@ test "TraceMatcherIndex: span_kind null match with second resource_attribute mat
 
     try testing.expect(!index.isEmpty());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
-    // Two matchers -> two databases, required_match_count = 2
-    try testing.expectEqual(@as(usize, 2), index.getDatabaseCount());
+    // span_kind null match → exists entry (no DB); resource_attribute exact
+    // match → one Hyperscan DB. required_match_count counts both.
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
     try testing.expectEqual(@as(u16, 2), index.policies[0].required_match_count);
+
+    // Verify the exists bucket holds the span_kind entry.
+    var exists_total: usize = 0;
+    for (index.getMatcherKeys()) |k| exists_total += k.exists_entries.len;
+    try testing.expectEqual(@as(usize, 1), exists_total);
 }
 
 test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
@@ -1844,13 +2012,17 @@ test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
 
+    // Implicit exists lives in exists_entries; no Hyperscan DB.
+    try testing.expectEqual(@as(usize, 0), index.getDatabaseCount());
     try testing.expectEqual(@as(u16, 1), index.policies[0].required_match_count);
+    const keys = index.getMatcherKeys();
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqual(@as(usize, 1), keys[0].exists_entries.len);
 }
 
-test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
+test "MetricMatcherIndex: exists=true matcher is bucketed into exists_entries" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -1863,7 +2035,6 @@ test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
             .keep = false,
         } },
     };
-    // Create AttributePath with "service.name" as single path segment
     var attr_path = AttributePath{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try policy.target.?.metric.match.append(allocator, .{
@@ -1875,29 +2046,22 @@ test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
     var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    // exists=true should create a database with ^.+$ pattern
+    // exists=true is dispatched via accessor.callExists, not Hyperscan.
     try testing.expect(!index.isEmpty());
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+    try testing.expectEqual(@as(usize, 0), index.getDatabaseCount());
 
-    // The database should match any non-empty string
     const keys = index.getMatcherKeys();
     try testing.expectEqual(@as(usize, 1), keys.len);
-
-    const db = index.getDatabase(keys[0]).?;
-    var result_buf: [MAX_POLICIES]u32 = undefined;
-    var result = db.scanPositive("my-service", &result_buf);
-    try testing.expectEqual(@as(usize, 1), result.count);
-
-    // Empty string should not match
-    result = db.scanPositive("", &result_buf);
-    try testing.expectEqual(@as(usize, 0), result.count);
+    try testing.expectEqual(@as(usize, 1), keys[0].exists_entries.len);
+    try testing.expect(!keys[0].exists_entries[0].negate);
+    try testing.expect(index.getDatabase(keys[0]) == null);
 }
 
-test "MetricMatcherIndex: metric_type field creates Hyperscan database" {
-    // metric_type is matched as a string via Hyperscan. The field accessor returns
-    // the type as a string (e.g., "gauge", "sum", "histogram") which is then matched
-    // against the regex pattern.
+test "MetricMatcherIndex: metric_type exists is bucketed into exists_entries" {
+    // metric_type with exists=true used to compile to a `^.+$` Hyperscan
+    // pattern. After the accessor split, the exists semantic is dispatched
+    // directly via accessor.callExists and lives in exists_entries.
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -1912,8 +2076,6 @@ test "MetricMatcherIndex: metric_type field creates Hyperscan database" {
             .keep = false,
         } },
     };
-    // Match on metric_type with exists=true (uses ^.+$ pattern)
-    // The proto field uses the enum value, but we only care that it's metric_type
     try policy.target.?.metric.match.append(allocator, .{
         .field = .{ .metric_type = MetricType.METRIC_TYPE_GAUGE },
         .match = .{ .exists = true },
@@ -1923,33 +2085,18 @@ test "MetricMatcherIndex: metric_type field creates Hyperscan database" {
     var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    // metric_type field should create a database with ^.+$ pattern
     try testing.expect(!index.isEmpty());
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 0), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
 
-    // The policy should have 1 required match
     const policy_info = index.getPolicy("policy-1");
     try testing.expect(policy_info != null);
     try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
 
-    // The database should match metric type strings
     const keys = index.getMatcherKeys();
     try testing.expectEqual(@as(usize, 1), keys.len);
-
-    const db = index.getDatabase(keys[0]).?;
-    var result_buf: [MAX_POLICIES]u32 = undefined;
-
-    // Should match any non-empty metric type string
-    var result = db.scanPositive("gauge", &result_buf);
-    try testing.expectEqual(@as(usize, 1), result.count);
-
-    result = db.scanPositive("histogram", &result_buf);
-    try testing.expectEqual(@as(usize, 1), result.count);
-
-    // Empty string should not match
-    result = db.scanPositive("", &result_buf);
-    try testing.expectEqual(@as(usize, 0), result.count);
+    try testing.expectEqual(@as(usize, 1), keys[0].exists_entries.len);
+    try testing.expect(index.getDatabase(keys[0]) == null);
 }
 
 test "MetricMatcherIndex: metric_type with regex pattern" {
@@ -2112,12 +2259,9 @@ test "formatPattern: regex returns pattern unchanged" {
     try testing.expectEqualStrings("^hello.*world$", result);
 }
 
-test "formatPattern: exists returns fixed pattern" {
-    var buf: [64]u8 = undefined;
-    var slice: []u8 = &buf;
-    const result = formatPattern(&slice, "", .exists);
-    try testing.expectEqualStrings("^.+$", result);
-}
+// exists matchers are no longer dispatched through Hyperscan / formatPattern,
+// so there is no `.exists` pattern fixture to assert. Coverage lives in
+// `*MatcherIndex: exists ... is bucketed into exists_entries`.
 
 test "formatPattern: exact adds both anchors" {
     var buf: [64]u8 = undefined;

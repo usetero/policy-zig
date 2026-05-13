@@ -33,6 +33,7 @@ const policy_mod = @import("./root.zig");
 const policy_types = @import("./types.zig");
 const log_transform = @import("./log_transform.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
+const redact_mod = @import("./redact.zig");
 
 const o11y = @import("observability");
 const NoopEventBus = o11y.NoopEventBus;
@@ -53,16 +54,11 @@ pub const PolicySnapshot = policy_mod.Snapshot;
 // Re-export types for callers
 pub const FieldRef = policy_types.FieldRef;
 pub const MetricFieldRef = policy_types.MetricFieldRef;
-pub const LogFieldAccessor = policy_types.LogFieldAccessor;
-pub const LogFieldMutator = policy_types.LogFieldMutator;
-pub const MetricFieldAccessor = policy_types.MetricFieldAccessor;
-pub const MetricFieldMutator = policy_types.MetricFieldMutator;
 pub const TraceFieldRef = policy_types.TraceFieldRef;
-pub const TraceFieldAccessor = policy_types.TraceFieldAccessor;
-pub const TraceFieldMutator = policy_types.TraceFieldMutator;
-pub const MutateOp = policy_types.MutateOp;
-pub const MetricMutateOp = policy_types.MetricMutateOp;
-pub const TraceMutateOp = policy_types.TraceMutateOp;
+pub const LogAccessor = policy_types.LogAccessor;
+pub const MetricAccessor = policy_types.MetricAccessor;
+pub const TraceAccessor = policy_types.TraceAccessor;
+pub const AccessorTemplates = policy_types.AccessorTemplates;
 pub const TelemetryType = policy_types.TelemetryType;
 
 // Proto types
@@ -163,23 +159,28 @@ fn FieldRefType(comptime T: TelemetryType) type {
     };
 }
 
-/// Returns the field accessor function type for the given telemetry type
-fn FieldAccessorType(comptime T: TelemetryType) type {
+/// Returns the accessor struct type for the given telemetry type.
+fn AccessorType(comptime T: TelemetryType) type {
     return switch (T) {
-        .log => LogFieldAccessor,
-        .metric => MetricFieldAccessor,
-        .trace => TraceFieldAccessor,
+        .log => LogAccessor,
+        .metric => MetricAccessor,
+        .trace => TraceAccessor,
     };
 }
 
-/// Returns the field mutator function type for the given telemetry type
-fn FieldMutatorType(comptime T: TelemetryType) type {
-    return switch (T) {
-        .log => LogFieldMutator,
-        .metric => MetricFieldMutator,
-        .trace => TraceFieldMutator,
-    };
-}
+/// Optional inputs to `PolicyEngine.evaluate`.
+///
+/// `scratch` is consumed by regex-redact transforms (logs) for substitution
+/// output. It must outlive any accessor-retained references to the substituted
+/// bytes — typically a per-record arena owned by the caller. When `null`,
+/// regex-redact rules degrade to no-ops.
+///
+/// The accessor itself is configured statically on the registry; capability
+/// validation runs at snapshot-compile time, so by the time the engine
+/// dispatches a transform it is guaranteed the required primitive is wired.
+pub const EvaluateOptions = struct {
+    scratch: ?std.mem.Allocator = null,
+};
 
 // =============================================================================
 // Observability Events
@@ -287,10 +288,27 @@ pub const PolicyEngine = struct {
         self: *const Self,
         comptime T: TelemetryType,
         ctx: *anyopaque,
-        field_accessor: FieldAccessorType(T),
-        field_mutator: ?FieldMutatorType(T),
         policy_id_buf: [][]const u8,
+        options: EvaluateOptions,
     ) PolicyResult {
+        // Pull the accessor from the registry. Snapshot-compile-time
+        // validation guarantees that any policy reaching the engine only uses
+        // primitives the accessor wires, so unwrapping here is safe.
+        const accessor: *const AccessorType(T) = switch (T) {
+            .log => if (self.registry.accessors.log) |*la| la else {
+                self.bus.debug(EvaluateEmpty{});
+                return PolicyResult.unmatched;
+            },
+            .metric => if (self.registry.accessors.metric) |*ma| ma else {
+                self.bus.debug(EvaluateEmpty{});
+                return PolicyResult.unmatched;
+            },
+            .trace => if (self.registry.accessors.trace) |*ta| ta else {
+                self.bus.debug(EvaluateEmpty{});
+                return PolicyResult.unmatched;
+            },
+        };
+
         // Get current snapshot from registry (lock-free)
         const snapshot = self.registry.getSnapshot() orelse {
             self.bus.debug(EvaluateEmpty{});
@@ -313,11 +331,11 @@ pub const PolicyEngine = struct {
 
         // Phase 1: Scan all matcher keys and compute match counts
         var scan_state: ScanState = undefined;
-        self.scanMatcherKeys(T, ctx, field_accessor, index, &scan_state);
+        self.scanMatcherKeys(T, ctx, accessor, index, &scan_state);
 
         // Phase 2: Find matching policies and determine decision
         var match_state: MatchState = undefined;
-        self.findMatchingPolicies(T, ctx, field_accessor, field_mutator, index, &scan_state, policy_id_buf, &match_state);
+        self.findMatchingPolicies(T, ctx, accessor, index, &scan_state, policy_id_buf, &match_state);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
 
@@ -331,23 +349,20 @@ pub const PolicyEngine = struct {
         // Phase 3: Apply transforms (log only) and record stats
         var was_transformed = match_state.was_trace_sampled;
         if (T == .log) {
-            if (field_mutator) |mutator| {
-                for (0..match_state.matched_count) |i| {
-                    const policy_index = match_state.matched_indices[i];
-                    const result = self.applyLogTransforms(
-                        ctx,
-                        field_accessor,
-                        mutator,
-                        snapshot,
-                        policy_index,
-                        policy_id_buf[i],
-                    );
-                    if (result.totalApplied() > 0) {
-                        was_transformed = true;
-                        // Record transform stats using lock-free atomics
-                        if (snapshot.getStats(match_state.matched_policies[i].stats_index)) |stats| {
-                            stats.addTransform(@intCast(result.totalApplied()));
-                        }
+            for (0..match_state.matched_count) |i| {
+                const policy_index = match_state.matched_indices[i];
+                const result = self.applyLogTransforms(
+                    ctx,
+                    accessor,
+                    snapshot,
+                    policy_index,
+                    policy_id_buf[i],
+                    options.scratch,
+                );
+                if (result.totalApplied() > 0) {
+                    was_transformed = true;
+                    if (snapshot.getStats(match_state.matched_policies[i].stats_index)) |stats| {
+                        stats.addTransform(@intCast(result.totalApplied()));
                     }
                 }
             }
@@ -366,7 +381,7 @@ pub const PolicyEngine = struct {
         self: *const Self,
         comptime T: TelemetryType,
         ctx: *anyopaque,
-        field_accessor: FieldAccessorType(T),
+        accessor: *const AccessorType(T),
         index: *const matcher_index.MatcherIndexType(T),
         state: *ScanState,
     ) void {
@@ -397,7 +412,38 @@ pub const PolicyEngine = struct {
         for (index.getMatcherKeys()) |matcher_key| {
             const field_ref = matcher_key.field;
 
-            const value = field_accessor(ctx, field_ref) orelse {
+            // Apply exists-bucket entries first: their truth depends on field
+            // presence regardless of underlying value type, so they consult
+            // accessor.callExists rather than scanning value bytes.
+            //
+            // Counting mirrors the Hyperscan path:
+            //  - positive (negate=false): +1 when present (pattern matched).
+            //  - negated  (negate=true):  the negated-init pass pre-seeded +1;
+            //    decrement when present (pattern matched, negation failed),
+            //    leave alone when absent (negation succeeded).
+            if (matcher_key.exists_entries.len > 0) {
+                const is_present = accessor.callExists(ctx, field_ref);
+                for (matcher_key.exists_entries) |entry| {
+                    if (is_present) {
+                        if (entry.negate) {
+                            state.match_counts[entry.policy_index] -= 1;
+                        } else {
+                            state.match_counts[entry.policy_index] += 1;
+                        }
+                    }
+                    if (!state.is_active[entry.policy_index]) {
+                        state.is_active[entry.policy_index] = true;
+                        state.active_policies[state.active_count] = entry.policy_index;
+                        state.active_count += 1;
+                    }
+                }
+            }
+
+            // Skip the value-match path entirely for exists-only keys —
+            // they have no Hyperscan DB and don't read the field value.
+            if (!matcher_key.has_value_db) continue;
+
+            const value = accessor.value(ctx, field_ref) orelse {
                 if (self.bus.isEnabled(.debug)) {
                     self.bus.debug(MatcherKeyFieldNotPresent{
                         .telemetry_type = T,
@@ -423,12 +469,8 @@ pub const PolicyEngine = struct {
                 });
             }
 
-            const db = index.getDatabase(matcher_key) orelse {
-                if (self.bus.isEnabled(.debug)) {
-                    self.bus.debug(MatcherKeyNoDatabase{});
-                }
-                continue;
-            };
+            // has_value_db guarantees getDatabase returns non-null.
+            const db = index.getDatabase(matcher_key).?;
 
             // Scan positive patterns - increment match counts
             const positive_result = db.scanPositive(value, &result_buf);
@@ -473,22 +515,22 @@ pub const PolicyEngine = struct {
     }
 
     /// Get sampling input bytes for probabilistic sampling.
-    /// - Traces: raw trace ID bytes from field accessor
-    /// - Logs with sample_key: sample key field value from field accessor
-    /// - Otherwise: null (falls through to non-percentage keep handling)
+    /// - Traces: raw trace ID bytes from the trace accessor.
+    /// - Logs with sample_key: sample key field value from the log accessor.
+    /// - Otherwise: null (falls through to non-percentage keep handling).
     inline fn getSamplingInput(
         comptime T: TelemetryType,
         ctx: *anyopaque,
-        field_accessor: FieldAccessorType(T),
+        accessor: *const AccessorType(T),
         policy_info: PolicyInfo,
     ) ?[]const u8 {
         if (T == .trace) {
             const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
-            return field_accessor(ctx, trace_id_ref);
+            return accessor.value(ctx, trace_id_ref);
         } else if (T == .log) {
             if (policy_info.sample_key) |sample_key| {
                 if (FieldRef.fromSampleKeyField(sample_key.field)) |field_ref| {
-                    return field_accessor(ctx, field_ref);
+                    return accessor.value(ctx, field_ref);
                 }
             }
         }
@@ -498,16 +540,16 @@ pub const PolicyEngine = struct {
     /// Find all matching policies, apply sampling/rate limiting, and determine final decision.
     /// Drop always beats keep: if any policy returns drop, final decision is drop.
     ///
-    /// For trace telemetry with probabilistic sampling, reads tracestate via field_accessor
-    /// and writes the sampling threshold back via field_mutator (if provided). The threshold
-    /// hex value is written to TRACE_FIELD_TRACE_STATE; the host is responsible for merging
-    /// it into the actual W3C tracestate header as `ot=th:VALUE`.
+    /// For trace telemetry with probabilistic sampling, reads tracestate via
+    /// the trace accessor and writes the sampling threshold back through
+    /// `accessor.set`. The threshold hex value is written to
+    /// TRACE_FIELD_TRACE_STATE; the host is responsible for merging it into
+    /// the actual W3C tracestate header as `ot=th:VALUE`.
     inline fn findMatchingPolicies(
         self: *const Self,
         comptime T: TelemetryType,
         ctx: *anyopaque,
-        field_accessor: FieldAccessorType(T),
-        field_mutator: ?FieldMutatorType(T),
+        accessor: *const AccessorType(T),
         index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
         policy_id_buf: [][]const u8,
@@ -545,24 +587,21 @@ pub const PolicyEngine = struct {
                         }
                     }
                     if (policy_info.sampler) |s| {
-                        const input = getSamplingInput(T, ctx, field_accessor, policy_info) orelse "";
+                        const input = getSamplingInput(T, ctx, accessor, policy_info) orelse "";
 
                         if (T == .trace) {
                             // Trace sampling: read tracestate, run full sample(), write threshold back
                             const ts_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_STATE };
-                            const tracestate = field_accessor(ctx, ts_ref) orelse "";
+                            const tracestate = accessor.value(ctx, ts_ref) orelse "";
                             const sr = s.sample(input, tracestate);
 
                             if (sr.keep) {
-                                if (field_mutator) |mutator| {
-                                    if (sr.new_threshold) |th| {
-                                        _ = mutator(ctx, .{ .set = .{
-                                            .field = .{ .trace_field = .TRACE_FIELD_TRACE_STATE },
-                                            .value = th,
-                                            .upsert = true,
-                                        } });
-                                        state.was_trace_sampled = true;
-                                    }
+                                if (sr.new_threshold) |th| {
+                                    // Capability filtering at snapshot-compile
+                                    // time guarantees `set` is wired when any
+                                    // trace policy has a sampler.
+                                    accessor.set.?(ctx, .{ .trace_field = .TRACE_FIELD_TRACE_STATE }, th);
+                                    state.was_trace_sampled = true;
                                 }
                             }
 
@@ -598,17 +637,30 @@ pub const PolicyEngine = struct {
     inline fn applyLogTransforms(
         self: *const Self,
         ctx: *anyopaque,
-        field_accessor: LogFieldAccessor,
-        field_mutator: LogFieldMutator,
+        accessor: *const LogAccessor,
         snapshot: *const PolicySnapshot,
         policy_index: PolicyIndex,
         policy_id: []const u8,
+        scratch: ?std.mem.Allocator,
     ) log_transform.TransformResult {
         const policy = snapshot.getPolicy(policy_index) orelse return .{};
         const log_target = getLogTarget(policy) orelse return .{};
         const transform = log_target.transform orelse return .{};
 
-        const result = log_transform.applyTransforms(&transform, ctx, field_accessor, field_mutator);
+        const compiled_redacts: []const log_transform.CompiledRedact = blk: {
+            const info = snapshot.log_index.getPolicyByIndex(policy_index) orelse break :blk &.{};
+            break :blk info.compiled_redacts;
+        };
+
+        const result = log_transform.applyTransforms(
+            &transform,
+            ctx,
+            accessor,
+            .{
+                .compiled_redacts = compiled_redacts,
+                .scratch = scratch,
+            },
+        );
 
         if (result.totalApplied() > 0) {
             self.bus.debug(TransformApplied{
@@ -743,6 +795,8 @@ const TestLogContext = struct {
             .resource_attribute, .scope_attribute => null,
         };
     }
+
+    pub const accessor: LogAccessor = .{ .value = fieldAccessor };
 };
 
 test "PolicyEngine: empty registry returns unset" {
@@ -750,7 +804,7 @@ test "PolicyEngine: empty registry returns unset" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
@@ -758,7 +812,7 @@ test "PolicyEngine: empty registry returns unset" {
     var test_log = TestLogContext{ .message = "hello" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
@@ -783,7 +837,7 @@ test "PolicyEngine: single policy drop match" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -793,14 +847,14 @@ test "PolicyEngine: single policy drop match" {
     var error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &error_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
     // Dropped results don't include policy IDs (no transform needed)
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
 
     // Non-matching log should be unset (no policy matched)
     var info_log = TestLogContext{ .message = "all good" };
-    const result2 = engine.evaluate(.log, &info_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.log, &info_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -823,7 +877,7 @@ test "PolicyEngine: single policy keep match returns policy ID" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -833,7 +887,7 @@ test "PolicyEngine: single policy keep match returns policy ID" {
     var error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &error_log, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
@@ -864,7 +918,7 @@ test "PolicyEngine: multiple matchers AND logic" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -873,15 +927,15 @@ test "PolicyEngine: multiple matchers AND logic" {
 
     // Both match - dropped
     var payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &payment_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &payment_error, &policy_id_buf, .{}).decision);
 
     // Only message matches - unset
     var other_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &other_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &other_error, &policy_id_buf, .{}).decision);
 
     // Only service matches - unset
     var payment_info = TestLogContext{ .message = "request completed", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &payment_info, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &payment_info, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: negated matcher" {
@@ -905,7 +959,7 @@ test "PolicyEngine: negated matcher" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -914,11 +968,11 @@ test "PolicyEngine: negated matcher" {
 
     // Non-important log should be dropped (negate: pattern NOT found = success)
     var boring = TestLogContext{ .message = "just a regular log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &boring, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &boring, &policy_id_buf, .{}).decision);
 
     // Important log should be unset (negate: pattern found = failure, no match)
     var important = TestLogContext{ .message = "this is important data" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &important, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &important, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: mixed negated and non-negated matchers" {
@@ -948,7 +1002,7 @@ test "PolicyEngine: mixed negated and non-negated matchers" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -957,15 +1011,15 @@ test "PolicyEngine: mixed negated and non-negated matchers" {
 
     // Error from staging - dropped (error matches, prod not found = both conditions satisfied)
     var staging_error = TestLogContext{ .message = "an error occurred", .env = "staging" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &staging_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &staging_error, &policy_id_buf, .{}).decision);
 
     // Error from production - unset (error matches, but prod IS found = negation failed)
     var prod_error = TestLogContext{ .message = "an error occurred", .env = "production" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &prod_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &prod_error, &policy_id_buf, .{}).decision);
 
     // Non-error from staging - unset (error doesn't match)
     var staging_info = TestLogContext{ .message = "all good", .env = "staging" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &staging_info, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &staging_info, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: most restrictive wins - drop beats keep" {
@@ -1007,7 +1061,7 @@ test "PolicyEngine: most restrictive wins - drop beats keep" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
@@ -1016,11 +1070,11 @@ test "PolicyEngine: most restrictive wins - drop beats keep" {
 
     // Error from payment - both policies match, most restrictive (DROP) wins
     var payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &payment_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &payment_error, &policy_id_buf, .{}).decision);
 
     // Error from auth - only keep_policy matches (KEEP)
     var auth_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    const result = engine.evaluate(.log, &auth_error, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &auth_error, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
 }
@@ -1044,7 +1098,7 @@ test "PolicyEngine: disabled policies are skipped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -1053,7 +1107,7 @@ test "PolicyEngine: disabled policies are skipped" {
 
     // Would match but policy is disabled - unset
     var error_log = TestLogContext{ .message = "an error occurred" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &error_log, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: regex pattern matching" {
@@ -1076,7 +1130,7 @@ test "PolicyEngine: regex pattern matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -1085,14 +1139,14 @@ test "PolicyEngine: regex pattern matching" {
 
     // Various error formats should match
     var error1 = TestLogContext{ .message = "an error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error1, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error1, &policy_id_buf, .{}).decision);
 
     var error2 = TestLogContext{ .message = "Error: something went wrong" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error2, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error2, &policy_id_buf, .{}).decision);
 
     // Non-matching should be unset
     var info = TestLogContext{ .message = "everything is fine" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &info, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &info, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: missing field with negated matcher succeeds" {
@@ -1116,7 +1170,7 @@ test "PolicyEngine: missing field with negated matcher succeeds" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -1125,15 +1179,15 @@ test "PolicyEngine: missing field with negated matcher succeeds" {
 
     // No service attribute = pattern cannot be found = negation succeeds = dropped
     var no_service = TestLogContext{ .message = "hello" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &no_service, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &no_service, &policy_id_buf, .{}).decision);
 
     // Service without "critical" = negation succeeds = dropped
     var non_critical = TestLogContext{ .message = "hello", .service = "normal-service" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &non_critical, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &non_critical, &policy_id_buf, .{}).decision);
 
     // Service with "critical" = negation fails = unset
     var critical = TestLogContext{ .message = "hello", .service = "critical-service" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &critical, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &critical, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: multiple policies with different matcher keys" {
@@ -1171,7 +1225,7 @@ test "PolicyEngine: multiple policies with different matcher keys" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
@@ -1180,15 +1234,15 @@ test "PolicyEngine: multiple policies with different matcher keys" {
 
     // Matches policy1
     var error_log = TestLogContext{ .message = "an error occurred", .service = "payment" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, &policy_id_buf, .{}).decision);
 
     // Matches policy2
     var debug_log = TestLogContext{ .message = "all good", .service = "debug-service" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &debug_log, &policy_id_buf, .{}).decision);
 
     // Matches neither
     var normal_log = TestLogContext{ .message = "all good", .service = "payment" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &normal_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &normal_log, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: evaluate with null mutator" {
@@ -1210,7 +1264,7 @@ test "PolicyEngine: evaluate with null mutator" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -1219,10 +1273,10 @@ test "PolicyEngine: evaluate with null mutator" {
     // Test evaluate with null mutator returns full PolicyResult
     var error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, &policy_id_buf, .{}).decision);
 
     var info_log = TestLogContext{ .message = "all good" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &info_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &info_log, &policy_id_buf, .{}).decision);
 }
 
 test "FilterDecision: shouldContinue" {
@@ -1266,7 +1320,7 @@ test "PolicyEngine: all policies positive only - none start active" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
@@ -1275,15 +1329,15 @@ test "PolicyEngine: all policies positive only - none start active" {
 
     // No match - no policies become active
     var normal = TestLogContext{ .message = "all good" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &normal, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &normal, &policy_id_buf, .{}).decision);
 
     // Match policy1 only
     var error_log = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, &policy_id_buf, .{}).decision);
 
     // Match policy2 only
     var warning_log = TestLogContext{ .message = "warning issued" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &warning_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &warning_log, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: all policies negated only - all start active" {
@@ -1319,7 +1373,7 @@ test "PolicyEngine: all policies negated only - all start active" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
@@ -1328,19 +1382,19 @@ test "PolicyEngine: all policies negated only - all start active" {
 
     // Neither "important" nor "critical" - both policies match
     var boring = TestLogContext{ .message = "just a normal log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &boring, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &boring, &policy_id_buf, .{}).decision);
 
     // Contains "important" - policy1 fails, policy2 still matches
     var important = TestLogContext{ .message = "important data here" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &important, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &important, &policy_id_buf, .{}).decision);
 
     // Contains "critical" - policy1 still matches, policy2 fails
     var critical = TestLogContext{ .message = "critical issue" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &critical, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &critical, &policy_id_buf, .{}).decision);
 
     // Contains both - both policies fail
     var both = TestLogContext{ .message = "important and critical" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &both, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &both, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: mix of positive-only and negated policies" {
@@ -1377,7 +1431,7 @@ test "PolicyEngine: mix of positive-only and negated policies" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ positive_policy, negated_policy }, "file-provider", .file);
 
@@ -1386,19 +1440,19 @@ test "PolicyEngine: mix of positive-only and negated policies" {
 
     // No "error", no "debug" - negated policy matches (drops)
     var normal = TestLogContext{ .message = "normal log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &normal, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &normal, &policy_id_buf, .{}).decision);
 
     // Contains "error", no "debug" - both policies match
     var error_log = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_log, &policy_id_buf, .{}).decision);
 
     // Contains "debug" - negated policy fails, positive policy doesn't match
     var debug_log = TestLogContext{ .message = "debug info" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &debug_log, &policy_id_buf, .{}).decision);
 
     // Contains both "error" and "debug" - positive matches, negated fails
     var error_debug = TestLogContext{ .message = "error in debug mode" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_debug, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_debug, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: multiple negated patterns same policy" {
@@ -1426,7 +1480,7 @@ test "PolicyEngine: multiple negated patterns same policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -1435,19 +1489,19 @@ test "PolicyEngine: multiple negated patterns same policy" {
 
     // Neither word - both negations pass - policy matches
     var normal = TestLogContext{ .message = "normal message" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &normal, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &normal, &policy_id_buf, .{}).decision);
 
     // Contains "skip" - first negation fails - policy doesn't match
     var skip = TestLogContext{ .message = "skip this one" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &skip, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &skip, &policy_id_buf, .{}).decision);
 
     // Contains "ignore" - second negation fails - policy doesn't match
     var ignore = TestLogContext{ .message = "ignore this" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &ignore, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &ignore, &policy_id_buf, .{}).decision);
 
     // Contains both - both negations fail - policy doesn't match
     var both = TestLogContext{ .message = "skip and ignore" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &both, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &both, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: policy becomes active via positive then fails via negated" {
@@ -1475,7 +1529,7 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -1484,7 +1538,7 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
 
     // Has "error", no "debug" - positive matches, negation passes - policy matches
     var error_only = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_only, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &error_only, &policy_id_buf, .{}).decision);
 
     // Has both "error" and "debug" - positive matches but negation fails
     // required_match_count = 2 (1 positive + 1 negated)
@@ -1493,17 +1547,17 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
     // negated match: -1 -> 1
     // Final: 1 != 2 - policy doesn't match
     var error_debug = TestLogContext{ .message = "debug error message" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &error_debug, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &error_debug, &policy_id_buf, .{}).decision);
 
     // Has "debug" but no "error" - positive doesn't match, negation fails
     // match_counts starts at 1, negated match: -1 -> 0, final: 0 != 2
     var debug_only = TestLogContext{ .message = "debug info" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &debug_only, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &debug_only, &policy_id_buf, .{}).decision);
 
     // Has neither - positive doesn't match, negation passes
     // match_counts stays at 1 (negated_count), final: 1 != 2
     var neither = TestLogContext{ .message = "normal log" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &neither, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &neither, &policy_id_buf, .{}).decision);
 }
 
 // =============================================================================
@@ -1583,84 +1637,70 @@ const MutableTestLogContext = struct {
         };
     }
 
-    pub fn fieldMutator(ctx_ptr: *anyopaque, op: policy_types.MutateOp) bool {
-        const self: *MutableTestLogContext = @ptrCast(@alignCast(ctx_ptr));
-        switch (op) {
-            .remove => |field| {
-                switch (field) {
-                    .log_attribute => |attr_path| {
-                        const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return false;
-                        // Handle fixed fields
-                        if (std.mem.eql(u8, key, "service")) {
-                            if (self.service != null) {
-                                self.service = null;
-                                return true;
-                            }
-                            return false;
-                        }
-                        if (std.mem.eql(u8, key, "env")) {
-                            if (self.env != null) {
-                                self.env = null;
-                                return true;
-                            }
-                            return false;
-                        }
-                        // Handle dynamic attributes
-                        return self.removeAttribute(key);
-                    },
-                    else => return false,
-                }
-            },
-            .set => |s| {
-                switch (s.field) {
-                    .log_attribute => |attr_path| {
-                        const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return false;
-                        // For fixed fields, just update the pointer
-                        if (std.mem.eql(u8, key, "service")) {
-                            self.service = s.value;
-                            return true;
-                        }
-                        if (std.mem.eql(u8, key, "env")) {
-                            self.env = s.value;
-                            return true;
-                        }
-                        // For dynamic attributes, store a copy
-                        self.setAttribute(key, s.value) catch return false;
-                        return true;
-                    },
-                    else => return false,
-                }
-            },
-            .rename => |r| {
-                switch (r.from) {
-                    .log_attribute => |attr_path| {
-                        const from_key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return false;
-                        // Get the source value
-                        var value: ?[]const u8 = null;
-                        if (std.mem.eql(u8, from_key, "service")) {
-                            value = self.service;
-                            if (value != null) self.service = null;
-                        } else if (std.mem.eql(u8, from_key, "env")) {
-                            value = self.env;
-                            if (value != null) self.env = null;
-                        } else {
-                            if (self.attributes.get(from_key)) |v| {
-                                value = v;
-                                _ = self.removeAttribute(from_key);
-                            }
-                        }
-
-                        if (value == null) return false;
-
-                        // Set the target
-                        self.setAttribute(r.to, value.?) catch return false;
-                        return true;
-                    },
-                    else => return false,
-                }
-            },
-        }
+    fn attrKey(field: FieldRef) ?[]const u8 {
+        return switch (field) {
+            .log_attribute => |p| if (p.path.items.len > 0) p.path.items[0] else null,
+            else => null,
+        };
     }
+
+    pub fn accessorDelete(ctx_ptr: *anyopaque, field: FieldRef) bool {
+        const self: *MutableTestLogContext = @ptrCast(@alignCast(ctx_ptr));
+        const key = attrKey(field) orelse return false;
+        if (std.mem.eql(u8, key, "service")) {
+            if (self.service != null) {
+                self.service = null;
+                return true;
+            }
+            return false;
+        }
+        if (std.mem.eql(u8, key, "env")) {
+            if (self.env != null) {
+                self.env = null;
+                return true;
+            }
+            return false;
+        }
+        return self.removeAttribute(key);
+    }
+
+    pub fn accessorSet(ctx_ptr: *anyopaque, field: FieldRef, value: []const u8) void {
+        const self: *MutableTestLogContext = @ptrCast(@alignCast(ctx_ptr));
+        const key = attrKey(field) orelse return;
+        if (std.mem.eql(u8, key, "service")) {
+            self.service = value;
+            return;
+        }
+        if (std.mem.eql(u8, key, "env")) {
+            self.env = value;
+            return;
+        }
+        self.setAttribute(key, value) catch {};
+    }
+
+    pub fn accessorMove(ctx_ptr: *anyopaque, from: FieldRef, to: []const u8) void {
+        const self: *MutableTestLogContext = @ptrCast(@alignCast(ctx_ptr));
+        const from_key = attrKey(from) orelse return;
+        var value: ?[]const u8 = null;
+        if (std.mem.eql(u8, from_key, "service")) {
+            value = self.service;
+            if (value != null) self.service = null;
+        } else if (std.mem.eql(u8, from_key, "env")) {
+            value = self.env;
+            if (value != null) self.env = null;
+        } else if (self.attributes.get(from_key)) |v| {
+            value = v;
+            _ = self.removeAttribute(from_key);
+        }
+        if (value) |v| self.setAttribute(to, v) catch {};
+    }
+
+    pub const accessor: LogAccessor = .{
+        .value = fieldAccessor,
+        .set = accessorSet,
+        .delete = accessorDelete,
+        .move = accessorMove,
+    };
 };
 
 test "evaluate: policy with keep=all and no transform" {
@@ -1682,7 +1722,7 @@ test "evaluate: policy with keep=all and no transform" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -1694,7 +1734,7 @@ test "evaluate: policy with keep=all and no transform" {
     ctx.service = "payment-api";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
@@ -1728,7 +1768,7 @@ test "evaluate: policy with keep=all and remove transform" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -1741,7 +1781,7 @@ test "evaluate: policy with keep=all and remove transform" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have removed 'env'
@@ -1776,7 +1816,7 @@ test "evaluate: policy with keep=all and redact transform" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -1788,11 +1828,108 @@ test "evaluate: policy with keep=all and redact transform" {
     ctx.service = "secret-service";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have redacted 'service'
     try testing.expectEqualStrings("[REDACTED]", ctx.service.?);
+}
+
+test "evaluate: policy with regex-targeted redact transform (v1.4.0)" {
+    const allocator = testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    var transform = proto.policy.LogTransform{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .replacement = try allocator.dupe(u8, "$1[REDACTED]$2"),
+        .regex = try allocator.dupe(u8, "([?&]password=)[^&\\s]+(&session_id=)"),
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "redact-password-query-param"),
+        .name = try allocator.dupe(u8, "redact-password-query-param"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .match = .{ .regex = try allocator.dupe(u8, "password=") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    try ctx.setAttribute("url", "?user=alice&password=secret123&session_id=xyz");
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{ .scratch = scratch.allocator() });
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expect(result.was_transformed);
+    try testing.expectEqualStrings(
+        "?user=alice&password=[REDACTED]&session_id=xyz",
+        ctx.attributes.get("url").?,
+    );
+}
+
+test "evaluate: regex redact with no match leaves field unchanged" {
+    const allocator = testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    var transform = proto.policy.LogTransform{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .replacement = try allocator.dupe(u8, "X"),
+        .regex = try allocator.dupe(u8, "password=\\S+"),
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "p"),
+        .name = try allocator.dupe(u8, "p"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "url") },
+        .match = .{ .exists = true },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    try ctx.setAttribute("url", "/no-secrets-here");
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{ .scratch = scratch.allocator() });
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expect(!result.was_transformed);
+    try testing.expectEqualStrings("/no-secrets-here", ctx.attributes.get("url").?);
 }
 
 test "evaluate: policy with keep=all and add transform" {
@@ -1822,7 +1959,7 @@ test "evaluate: policy with keep=all and add transform" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -1833,7 +1970,7 @@ test "evaluate: policy with keep=all and add transform" {
     ctx.message = "an error occurred";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have added 'processed'
@@ -1867,7 +2004,7 @@ test "evaluate: policy with no keep (drop) skips transform" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -1879,7 +2016,7 @@ test "evaluate: policy with no keep (drop) skips transform" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
     // Transform should NOT have been applied (log is dropped)
@@ -1936,7 +2073,7 @@ test "evaluate: multiple policies with different transforms" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "test", .file);
 
@@ -1950,7 +2087,7 @@ test "evaluate: multiple policies with different transforms" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 2), result.matched_policy_ids.len);
@@ -1989,7 +2126,7 @@ test "evaluate: policy with unset keep applies transform" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -2000,7 +2137,7 @@ test "evaluate: policy with unset keep applies transform" {
     ctx.message = "info log message";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     // When keep is not specified, it defaults to "all" which means keep
     try testing.expectEqual(FilterDecision.keep, result.decision);
@@ -2008,50 +2145,11 @@ test "evaluate: policy with unset keep applies transform" {
     try testing.expectEqualStrings("yes", ctx.attributes.get("tagged").?);
 }
 
-test "evaluate: null mutator skips transforms" {
-    const allocator = testing.allocator;
-
-    var transform = proto.policy.LogTransform{};
-    try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "env") },
-    });
-
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "transform-policy"),
-        .name = try allocator.dupe(u8, "remove-env"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "all"),
-            .transform = transform,
-        } },
-    };
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "error") },
-    });
-    defer policy.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, "test", .file);
-
-    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
-
-    var ctx = MutableTestLogContext.init(allocator);
-    defer ctx.deinit();
-    ctx.message = "an error occurred";
-    ctx.env = "production";
-
-    var policy_id_buf: [16][]const u8 = undefined;
-    // Pass null for mutator - transforms should be skipped
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, null, &policy_id_buf);
-
-    try testing.expectEqual(FilterDecision.keep, result.decision);
-    // Transform should NOT have been applied (null mutator)
-    try testing.expectEqualStrings("production", ctx.env.?);
-}
+// The previous "null mutator skips transforms" test exercised a code path
+// that no longer exists: passing a null field_mutator to evaluate() to opt
+// out of transforms. In the accessor-template model, a read-only consumer
+// signals its capability set by wiring only `value` on LogAccessor; any
+// policy with a transform is rejected at snapshot-compile time.
 
 test "evaluate: policy without transform field" {
     const allocator = testing.allocator;
@@ -2075,7 +2173,7 @@ test "evaluate: policy without transform field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -2087,7 +2185,7 @@ test "evaluate: policy without transform field" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // No transform, env unchanged
@@ -2146,7 +2244,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = MutableTestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ drop_policy, keep_policy }, "test", .file);
 
@@ -2159,7 +2257,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
         ctx.message = "debug message";
 
         var policy_id_buf: [16][]const u8 = undefined;
-        const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+        const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
         try testing.expectEqual(FilterDecision.drop, result.decision);
         // Transform should NOT be applied for drop
@@ -2173,7 +2271,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
         ctx.message = "error occurred";
 
         var policy_id_buf: [16][]const u8 = undefined;
-        const result = engine.evaluate(.log, &ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+        const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{});
 
         try testing.expectEqual(FilterDecision.keep, result.decision);
         // Transform should be applied for keep
@@ -2216,7 +2314,7 @@ test "PolicyEngine stats: single winner among equally-restrictive DROP policies"
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ drop_policy1, drop_policy2 }, "file-provider", .file);
 
@@ -2225,7 +2323,7 @@ test "PolicyEngine stats: single winner among equally-restrictive DROP policies"
     // Log matches both DROP policies
     var test_log = TestLogContext{ .message = "critical error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
@@ -2271,7 +2369,7 @@ test "PolicyEngine stats: all KEEP policies get hits" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy1, keep_policy2 }, "file-provider", .file);
 
@@ -2280,7 +2378,7 @@ test "PolicyEngine stats: all KEEP policies get hits" {
     // Log matches both KEEP policies
     var test_log = TestLogContext{ .message = "critical error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
 
@@ -2329,7 +2427,7 @@ test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
@@ -2338,7 +2436,7 @@ test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses
     // Log matches both policies (KEEP and DROP)
     var test_log = TestLogContext{ .message = "critical error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     // DROP wins (most restrictive)
     try testing.expectEqual(FilterDecision.drop, result.decision);
@@ -2376,7 +2474,7 @@ test "PolicyEngine stats: single policy match gets hit" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2384,7 +2482,7 @@ test "PolicyEngine stats: single policy match gets hit" {
 
     var test_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    _ = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     // Single policy should get a hit via lock-free atomic stats
     const snapshot = registry.getSnapshot().?;
@@ -2449,7 +2547,7 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - single DROP winner, KEEPs g
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy1, keep_policy2, drop_policy1, drop_policy2 }, "file-provider", .file);
 
@@ -2458,7 +2556,7 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - single DROP winner, KEEPs g
     // Log matches all 4 policies (2 KEEP, 2 DROP)
     var test_log = TestLogContext{ .message = "critical error with warning and debug info" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     // DROP wins (most restrictive)
     try testing.expectEqual(FilterDecision.drop, result.decision);
@@ -2503,7 +2601,7 @@ test "PolicyEngine stats: no match records no stats" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2512,7 +2610,7 @@ test "PolicyEngine stats: no match records no stats" {
     // Log doesn't match the policy
     var test_log = TestLogContext{ .message = "all good here" };
     var policy_id_buf: [16][]const u8 = undefined;
-    _ = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     // No stats should be recorded - policy should have 0 hits and 0 misses
     const snapshot = registry.getSnapshot().?;
@@ -2553,7 +2651,7 @@ test "PolicyEngine stats: drop with none + percentage - only none gets hit" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ none_policy, pct_policy }, "file-provider", .file);
 
@@ -2561,7 +2659,7 @@ test "PolicyEngine stats: drop with none + percentage - only none gets hit" {
 
     var test_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
@@ -2609,7 +2707,7 @@ test "PolicyEngine stats: drop with percentage + all - percentage gets hit, all 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ all_policy, pct_policy }, "file-provider", .file);
 
@@ -2617,7 +2715,7 @@ test "PolicyEngine stats: drop with percentage + all - percentage gets hit, all 
 
     var test_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     // 0% drops, so final decision is drop
     try testing.expectEqual(FilterDecision.drop, result.decision);
@@ -2666,7 +2764,7 @@ test "PolicyEngine stats: keep with percentage + all - both get hits" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ all_policy, pct_policy }, "file-provider", .file);
 
@@ -2674,7 +2772,7 @@ test "PolicyEngine stats: keep with percentage + all - both get hits" {
 
     var test_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     // Both keep, so final decision is keep
     try testing.expectEqual(FilterDecision.keep, result.decision);
@@ -2742,6 +2840,8 @@ const TestMetricContext = struct {
             .aggregation_temporality => null,
         };
     }
+
+    pub const accessor: MetricAccessor = .{ .value = fieldAccessor };
 };
 
 test "MetricPolicyEngine: empty registry returns unset" {
@@ -2749,7 +2849,7 @@ test "MetricPolicyEngine: empty registry returns unset" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
@@ -2757,7 +2857,7 @@ test "MetricPolicyEngine: empty registry returns unset" {
     var test_metric = TestMetricContext{ .name = "http_requests_total" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &test_metric, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
@@ -2782,7 +2882,7 @@ test "MetricPolicyEngine: single policy drop match" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2809,12 +2909,12 @@ test "MetricPolicyEngine: single policy drop match" {
 
     // Matching metric should be dropped
     var debug_metric = TestMetricContext{ .name = "debug_memory_usage" };
-    const result = engine.evaluate(.metric, &debug_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &debug_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     // Non-matching metric should pass
     var normal_metric = TestMetricContext{ .name = "http_requests_total" };
-    const result2 = engine.evaluate(.metric, &normal_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &normal_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -2837,7 +2937,7 @@ test "MetricPolicyEngine: single policy keep match returns policy ID" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2846,7 +2946,7 @@ test "MetricPolicyEngine: single policy keep match returns policy ID" {
     var test_metric = TestMetricContext{ .name = "http_requests_total" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &test_metric, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
@@ -2878,7 +2978,7 @@ test "MetricPolicyEngine: multiple matchers AND logic" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2887,17 +2987,17 @@ test "MetricPolicyEngine: multiple matchers AND logic" {
 
     // Both match - should drop
     var both_match = TestMetricContext{ .name = "request_duration", .unit = "seconds" };
-    const result1 = engine.evaluate(.metric, &both_match, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.metric, &both_match, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result1.decision);
 
     // Only name matches - should pass (unit "milliseconds" doesn't match "^seconds$")
     var name_only = TestMetricContext{ .name = "request_duration", .unit = "milliseconds" };
-    const result2 = engine.evaluate(.metric, &name_only, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &name_only, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 
     // Only unit matches - should pass (name "response_size" doesn't match "^request_duration$")
     var unit_only = TestMetricContext{ .name = "response_size", .unit = "seconds" };
-    const result3 = engine.evaluate(.metric, &unit_only, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result3 = engine.evaluate(.metric, &unit_only, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result3.decision);
 }
 
@@ -2922,7 +3022,7 @@ test "MetricPolicyEngine: negated matcher" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2931,12 +3031,12 @@ test "MetricPolicyEngine: negated matcher" {
 
     // Internal metric matches pattern, negation fails -> policy doesn't match -> passes
     var internal_metric = TestMetricContext{ .name = "internal_queue_size" };
-    const result1 = engine.evaluate(.metric, &internal_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.metric, &internal_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result1.decision);
 
     // Non-internal metric doesn't match pattern, negation succeeds -> policy matches -> drops
     var public_metric = TestMetricContext{ .name = "http_requests_total" };
-    const result2 = engine.evaluate(.metric, &public_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &public_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result2.decision);
 }
 
@@ -2959,7 +3059,7 @@ test "MetricPolicyEngine: datapoint attribute matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -2975,7 +3075,7 @@ test "MetricPolicyEngine: datapoint attribute matching" {
         .name = "http_response",
         .datapoint_attributes = dp_attrs,
     };
-    const result1 = engine.evaluate(.metric, &error_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.metric, &error_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result1.decision);
 
     // Metric with 200 status should pass
@@ -2987,7 +3087,7 @@ test "MetricPolicyEngine: datapoint attribute matching" {
         .name = "http_response",
         .datapoint_attributes = ok_attrs,
     };
-    const result2 = engine.evaluate(.metric, &ok_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &ok_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -3010,7 +3110,7 @@ test "MetricPolicyEngine: resource attribute matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3026,7 +3126,7 @@ test "MetricPolicyEngine: resource attribute matching" {
         .name = "http_requests_total",
         .resource_attributes = test_attrs,
     };
-    const result1 = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.metric, &test_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result1.decision);
 
     // Metric from production environment should pass
@@ -3038,7 +3138,7 @@ test "MetricPolicyEngine: resource attribute matching" {
         .name = "http_requests_total",
         .resource_attributes = prod_attrs,
     };
-    const result2 = engine.evaluate(.metric, &prod_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &prod_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -3062,7 +3162,7 @@ test "MetricPolicyEngine: log policies don't affect metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{log_policy}, "file-provider", .file);
 
@@ -3071,7 +3171,7 @@ test "MetricPolicyEngine: log policies don't affect metrics" {
 
     // Metric evaluation should not be affected by log policies
     var test_metric = TestMetricContext{ .name = "error_count" };
-    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &test_metric, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
@@ -3097,7 +3197,7 @@ test "MetricPolicyEngine: metric policies don't affect logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{metric_policy}, "file-provider", .file);
 
@@ -3106,7 +3206,7 @@ test "MetricPolicyEngine: metric policies don't affect logs" {
 
     // Log evaluation should not be affected by metric policies
     var test_log = TestLogContext{ .message = "debug_info: something happened" };
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
@@ -3147,7 +3247,7 @@ test "MetricPolicyEngine: most restrictive wins - drop beats keep" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
@@ -3156,12 +3256,12 @@ test "MetricPolicyEngine: most restrictive wins - drop beats keep" {
 
     // http_errors matches both policies - drop should win
     var error_metric = TestMetricContext{ .name = "http_errors" };
-    const result1 = engine.evaluate(.metric, &error_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.metric, &error_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result1.decision);
 
     // http_requests matches only keep policy
     var requests_metric = TestMetricContext{ .name = "http_requests_total" };
-    const result2 = engine.evaluate(.metric, &requests_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &requests_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.keep, result2.decision);
 }
 
@@ -3184,7 +3284,7 @@ test "MetricPolicyEngine: disabled policies are skipped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3193,7 +3293,7 @@ test "MetricPolicyEngine: disabled policies are skipped" {
 
     // Even though the pattern matches, the disabled policy should be skipped
     var test_metric = TestMetricContext{ .name = "any_metric_name" };
-    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &test_metric, &policy_id_buf, .{});
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
 }
@@ -3233,7 +3333,7 @@ test "MetricPolicyEngine: mixed log and metric policies" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{ metric_policy, log_policy }, "file-provider", .file);
 
@@ -3242,22 +3342,22 @@ test "MetricPolicyEngine: mixed log and metric policies" {
 
     // Debug metric should be dropped by metric policy
     var debug_metric = TestMetricContext{ .name = "debug_memory" };
-    const result1 = engine.evaluate(.metric, &debug_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.metric, &debug_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result1.decision);
 
     // Debug log should be dropped by log policy
     var debug_log = TestLogContext{ .message = "DEBUG: test message" };
-    const result2 = engine.evaluate(.log, &debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.log, &debug_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result2.decision);
 
     // Non-debug metric should pass
     var normal_metric = TestMetricContext{ .name = "http_requests" };
-    const result3 = engine.evaluate(.metric, &normal_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result3 = engine.evaluate(.metric, &normal_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result3.decision);
 
     // Non-debug log should pass
     var normal_log = TestLogContext{ .message = "INFO: test message" };
-    const result4 = engine.evaluate(.log, &normal_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result4 = engine.evaluate(.log, &normal_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result4.decision);
 }
 
@@ -3281,7 +3381,7 @@ test "MetricPolicyEngine: regex pattern matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3290,15 +3390,15 @@ test "MetricPolicyEngine: regex pattern matching" {
 
     // Matches: starts with internal_
     var m1 = TestMetricContext{ .name = "internal_queue_size" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.metric, &m1, TestMetricContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.metric, &m1, &policy_id_buf, .{}).decision);
 
     // Matches: ends with _debug
     var m2 = TestMetricContext{ .name = "http_latency_debug" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.metric, &m2, TestMetricContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.metric, &m2, &policy_id_buf, .{}).decision);
 
     // Does not match
     var m3 = TestMetricContext{ .name = "http_requests_total" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.metric, &m3, TestMetricContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.metric, &m3, &policy_id_buf, .{}).decision);
 }
 
 test "MetricPolicyEngine: stats recording for matched policies" {
@@ -3321,7 +3421,7 @@ test "MetricPolicyEngine: stats recording for matched policies" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3330,7 +3430,7 @@ test "MetricPolicyEngine: stats recording for matched policies" {
 
     // Matching metric - should record stats
     var test_metric = TestMetricContext{ .name = "test_counter" };
-    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &test_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     // Verify stats were recorded via lock-free atomics
@@ -3363,7 +3463,7 @@ test "PolicyEngine: percentage sampling - 0% drops all" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3372,7 +3472,7 @@ test "PolicyEngine: percentage sampling - 0% drops all" {
 
     // 0% sampling should drop all matching logs
     var test_log = TestLogContext{ .message = "test message" };
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 }
 
@@ -3395,7 +3495,7 @@ test "PolicyEngine: percentage sampling - 100% keeps all" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3404,7 +3504,7 @@ test "PolicyEngine: percentage sampling - 100% keeps all" {
 
     // 100% sampling should keep all matching logs
     var test_log = TestLogContext{ .message = "test message" };
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.keep, result.decision);
 }
 
@@ -3427,7 +3527,7 @@ test "PolicyEngine: percentage sampling - deterministic per context" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3436,8 +3536,8 @@ test "PolicyEngine: percentage sampling - deterministic per context" {
 
     // Same context should produce same decision (deterministic)
     var test_log = TestLogContext{ .message = "test message" };
-    const result1 = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
-    const result2 = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result1 = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
+    const result2 = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
     try testing.expectEqual(result1.decision, result2.decision);
 }
 
@@ -3460,7 +3560,7 @@ test "PolicyEngine: rate limiting - respects limit" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3471,7 +3571,7 @@ test "PolicyEngine: rate limiting - respects limit" {
     var kept_count: u32 = 0;
     for (0..10) |_| {
         var test_log = TestLogContext{ .message = "test message" };
-        const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+        const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
         if (result.decision == .keep) {
             kept_count += 1;
         }
@@ -3500,7 +3600,7 @@ test "PolicyEngine: rate limiting per minute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3511,7 +3611,7 @@ test "PolicyEngine: rate limiting per minute" {
     var kept_count: u32 = 0;
     for (0..10) |_| {
         var test_log = TestLogContext{ .message = "test message" };
-        const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+        const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
         if (result.decision == .keep) {
             kept_count += 1;
         }
@@ -3540,7 +3640,7 @@ test "PolicyEngine: rate limiting with zero limit drops all" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3549,7 +3649,7 @@ test "PolicyEngine: rate limiting with zero limit drops all" {
 
     // 0/s rate limit should drop all
     var test_log = TestLogContext{ .message = "test message" };
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 }
 
@@ -3572,7 +3672,7 @@ test "PolicyEngine: sampling does not affect non-matching logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3581,7 +3681,7 @@ test "PolicyEngine: sampling does not affect non-matching logs" {
 
     // Non-matching log should return unset (not affected by sampling)
     var test_log = TestLogContext{ .message = "different message" };
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result.decision);
 }
 
@@ -3616,7 +3716,7 @@ test "PolicyEngine: more matching policies than policy_id_buf capacity" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&policies, "file-provider", .file);
 
@@ -3626,7 +3726,7 @@ test "PolicyEngine: more matching policies than policy_id_buf capacity" {
     var small_policy_id_buf: [2][]const u8 = undefined;
 
     var test_log = TestLogContext{ .message = "test message" };
-    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &small_policy_id_buf);
+    const result = engine.evaluate(.log, &test_log, &small_policy_id_buf, .{});
 
     // Decision should be KEEP (all 5 policies want to keep)
     try testing.expectEqual(FilterDecision.keep, result.decision);
@@ -3655,7 +3755,7 @@ test "PolicyEngine: exists=false matches when field is missing or empty" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3664,11 +3764,11 @@ test "PolicyEngine: exists=false matches when field is missing or empty" {
 
     // No trace_id attribute = field missing = exists:false matches = dropped
     var no_trace = TestLogContext{ .message = "log without trace" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &no_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &no_trace, &policy_id_buf, .{}).decision);
 
     // Has trace_id = field exists = exists:false does NOT match = unset
     var with_trace = TestLogContext{ .message = "log with trace", .trace_id = "abc123" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &with_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &with_trace, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: exists=false with negate=true matches when field exists" {
@@ -3692,7 +3792,7 @@ test "PolicyEngine: exists=false with negate=true matches when field exists" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3701,11 +3801,11 @@ test "PolicyEngine: exists=false with negate=true matches when field exists" {
 
     // Has trace_id = field exists = exists:false+negate:true matches = dropped
     var with_trace = TestLogContext{ .message = "log with trace", .trace_id = "abc123" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &with_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &with_trace, &policy_id_buf, .{}).decision);
 
     // No trace_id = field missing = exists:false+negate:true does NOT match = unset
     var no_trace = TestLogContext{ .message = "log without trace" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &no_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &no_trace, &policy_id_buf, .{}).decision);
 }
 
 test "PolicyEngine: sample_key provides deterministic sampling" {
@@ -3729,7 +3829,7 @@ test "PolicyEngine: sample_key provides deterministic sampling" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3738,13 +3838,13 @@ test "PolicyEngine: sample_key provides deterministic sampling" {
 
     // Same trace_id should always get the same decision
     var log1 = TestLogContext{ .message = "log one", .trace_id = "trace-abc-123" };
-    const decision1 = engine.evaluate(.log, &log1, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision1 = engine.evaluate(.log, &log1, &policy_id_buf, .{}).decision;
 
     var log2 = TestLogContext{ .message = "log two", .trace_id = "trace-abc-123" };
-    const decision2 = engine.evaluate(.log, &log2, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision2 = engine.evaluate(.log, &log2, &policy_id_buf, .{}).decision;
 
     var log3 = TestLogContext{ .message = "log three", .trace_id = "trace-abc-123" };
-    const decision3 = engine.evaluate(.log, &log3, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision3 = engine.evaluate(.log, &log3, &policy_id_buf, .{}).decision;
 
     // All logs with same trace_id get same decision
     try testing.expectEqual(decision1, decision2);
@@ -3753,8 +3853,8 @@ test "PolicyEngine: sample_key provides deterministic sampling" {
     // Different trace_id may get different decision (though not guaranteed with only 2 values)
     // But the decision for each trace_id is consistent
     var log4 = TestLogContext{ .message = "log four", .trace_id = "trace-xyz-789" };
-    const decision4a = engine.evaluate(.log, &log4, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
-    const decision4b = engine.evaluate(.log, &log4, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision4a = engine.evaluate(.log, &log4, &policy_id_buf, .{}).decision;
+    const decision4b = engine.evaluate(.log, &log4, &policy_id_buf, .{}).decision;
     try testing.expectEqual(decision4a, decision4b);
 }
 
@@ -3779,7 +3879,7 @@ test "PolicyEngine: sample_key with log_field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3788,10 +3888,10 @@ test "PolicyEngine: sample_key with log_field" {
 
     // Same message body should always get the same decision
     var log1 = TestLogContext{ .message = "exact same message" };
-    const decision1 = engine.evaluate(.log, &log1, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision1 = engine.evaluate(.log, &log1, &policy_id_buf, .{}).decision;
 
     var log2 = TestLogContext{ .message = "exact same message" };
-    const decision2 = engine.evaluate(.log, &log2, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision2 = engine.evaluate(.log, &log2, &policy_id_buf, .{}).decision;
 
     try testing.expectEqual(decision1, decision2);
 }
@@ -3817,7 +3917,7 @@ test "PolicyEngine: sample_key missing field falls back to default" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3826,7 +3926,7 @@ test "PolicyEngine: sample_key missing field falls back to default" {
 
     // Should still work (falls back to context pointer hash)
     var log1 = TestLogContext{ .message = "test message" };
-    const result = engine.evaluate(.log, &log1, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &log1, &policy_id_buf, .{});
 
     // Should get a decision (either keep or drop based on hash)
     try testing.expect(result.decision == .keep or result.decision == .drop);
@@ -3851,7 +3951,7 @@ test "PolicyEngine: log resource_schema_url matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3859,11 +3959,11 @@ test "PolicyEngine: log resource_schema_url matching" {
     var policy_id_buf: [16][]const u8 = undefined;
 
     var old_log = TestLogContext{ .message = "test", .resource_schema_url = "https://old.schema/v1" };
-    const result = engine.evaluate(.log, &old_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &old_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     var new_log = TestLogContext{ .message = "test", .resource_schema_url = "https://new.schema/v2" };
-    const result2 = engine.evaluate(.log, &new_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.log, &new_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -3886,7 +3986,7 @@ test "PolicyEngine: log scope_schema_url matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3894,11 +3994,11 @@ test "PolicyEngine: log scope_schema_url matching" {
     var policy_id_buf: [16][]const u8 = undefined;
 
     var match_log = TestLogContext{ .message = "test", .scope_schema_url = "https://scope.schema/v1" };
-    const result = engine.evaluate(.log, &match_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.log, &match_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     var no_match_log = TestLogContext{ .message = "test", .scope_schema_url = "https://other.schema/v2" };
-    const result2 = engine.evaluate(.log, &no_match_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.log, &no_match_log, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -3921,7 +4021,7 @@ test "MetricPolicyEngine: resource_schema_url matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3929,11 +4029,11 @@ test "MetricPolicyEngine: resource_schema_url matching" {
     var policy_id_buf: [16][]const u8 = undefined;
 
     var old_metric = TestMetricContext{ .name = "cpu", .resource_schema_url = "https://old.schema/v1" };
-    const result = engine.evaluate(.metric, &old_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &old_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     var new_metric = TestMetricContext{ .name = "cpu", .resource_schema_url = "https://new.schema/v2" };
-    const result2 = engine.evaluate(.metric, &new_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &new_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -3956,7 +4056,7 @@ test "MetricPolicyEngine: scope_schema_url matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3964,11 +4064,11 @@ test "MetricPolicyEngine: scope_schema_url matching" {
     var policy_id_buf: [16][]const u8 = undefined;
 
     var match_metric = TestMetricContext{ .name = "cpu", .scope_schema_url = "https://scope.schema/v1" };
-    const result = engine.evaluate(.metric, &match_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &match_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     var no_match = TestMetricContext{ .name = "cpu", .scope_schema_url = "https://other/v2" };
-    const result2 = engine.evaluate(.metric, &no_match, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &no_match, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -3991,7 +4091,7 @@ test "MetricPolicyEngine: scope_version matching" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = TestMetricContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
@@ -3999,11 +4099,11 @@ test "MetricPolicyEngine: scope_version matching" {
     var policy_id_buf: [16][]const u8 = undefined;
 
     var old_metric = TestMetricContext{ .name = "cpu", .scope_version = "1.0.0" };
-    const result = engine.evaluate(.metric, &old_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(.metric, &old_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
     var new_metric = TestMetricContext{ .name = "cpu", .scope_version = "2.0.0" };
-    const result2 = engine.evaluate(.metric, &new_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.metric, &new_metric, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -4037,23 +4137,22 @@ const TestTraceContext = struct {
         };
     }
 
-    pub fn fieldMutator(ctx_ptr: *anyopaque, op: TraceMutateOp) bool {
+    pub fn accessorSet(ctx_ptr: *anyopaque, field: TraceFieldRef, value: []const u8) void {
         const self: *TestTraceContext = @ptrCast(@alignCast(ctx_ptr));
-        switch (op) {
-            .set => |s| {
-                switch (s.field) {
-                    .trace_field => |tf| {
-                        self.last_mutate_field = tf;
-                    },
-                    else => {},
-                }
-                self.last_mutate_value = s.value;
-                self.mutate_count += 1;
-                return true;
+        switch (field) {
+            .trace_field => |tf| {
+                self.last_mutate_field = tf;
             },
-            else => return false,
+            else => {},
         }
+        self.last_mutate_value = value;
+        self.mutate_count += 1;
     }
+
+    pub const accessor: TraceAccessor = .{
+        .value = fieldAccessor,
+        .set = accessorSet,
+    };
 };
 
 test "PolicyEngine: trace sampling writes threshold via mutator" {
@@ -4076,7 +4175,7 @@ test "PolicyEngine: trace sampling writes threshold via mutator" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4092,7 +4191,7 @@ test "PolicyEngine: trace sampling writes threshold via mutator" {
         .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
     };
 
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expect(result.was_transformed);
     try testing.expectEqual(@as(usize, 1), ctx.mutate_count);
@@ -4120,7 +4219,7 @@ test "PolicyEngine: trace sampling drop does not write threshold" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4135,48 +4234,16 @@ test "PolicyEngine: trace sampling drop does not write threshold" {
         .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
     try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
 }
 
-test "PolicyEngine: trace sampling without mutator still returns correct decision" {
-    const allocator = testing.allocator;
-
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "trace-sample-50"),
-        .name = try allocator.dupe(u8, "sample-50"),
-        .enabled = true,
-        .target = .{ .trace = .{
-            .keep = .{ .percentage = 50.0 },
-        } },
-    };
-    try policy.target.?.trace.match.append(allocator, .{
-        .field = .{ .trace_field = .TRACE_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, ".+") },
-    });
-    defer policy.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, "test", .file);
-
-    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
-    var policy_id_buf: [16][]const u8 = undefined;
-
-    // High R → keep, but no mutator provided
-    var ctx = TestTraceContext{
-        .name = "test-span",
-        .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
-    };
-
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, null, &policy_id_buf);
-    try testing.expectEqual(FilterDecision.keep, result.decision);
-    // was_transformed should be false since no mutator was provided
-    try testing.expect(!result.was_transformed);
-}
+// The previous "trace sampling without mutator" test exercised an opt-out
+// of tracestate writeback by passing null `field_mutator`. The new model
+// derives writeback capability from the accessor itself: a consumer that
+// doesn't want writeback simply doesn't wire `TraceAccessor.set`, and any
+// trace policy with a sampler is rejected at snapshot-compile time.
 
 test "PolicyEngine: trace proportional sampling reads incoming tracestate" {
     const allocator = testing.allocator;
@@ -4201,7 +4268,7 @@ test "PolicyEngine: trace proportional sampling reads incoming tracestate" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4218,7 +4285,7 @@ test "PolicyEngine: trace proportional sampling reads incoming tracestate" {
         .trace_state = "ot=th:8",
     };
 
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expect(result.was_transformed);
     try testing.expectEqual(@as(usize, 1), ctx.mutate_count);
@@ -4245,7 +4312,7 @@ test "PolicyEngine: trace sampling 0% drops all" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4258,7 +4325,7 @@ test "PolicyEngine: trace sampling 0% drops all" {
         .trace_id = &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
     };
 
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
     try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
 }
@@ -4285,7 +4352,7 @@ test "PolicyEngine: trace sampling fail_closed=true drops span with no trace ID"
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4297,7 +4364,7 @@ test "PolicyEngine: trace sampling fail_closed=true drops span with no trace ID"
         .name = "test-span",
     };
 
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.drop, result.decision);
 }
 
@@ -4323,7 +4390,7 @@ test "PolicyEngine: trace sampling fail_closed=false keeps span with no trace ID
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4335,7 +4402,7 @@ test "PolicyEngine: trace sampling fail_closed=false keeps span with no trace ID
         .name = "test-span",
     };
 
-    const result = engine.evaluate(.trace, &ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
     try testing.expectEqual(FilterDecision.keep, result.decision);
 }
 
@@ -4393,7 +4460,11 @@ test "PolicyEngine: mixed signal policies scope stats to own signal type" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{
+        .log = TestLogContext.accessor,
+        .metric = TestMetricContext.accessor,
+        .trace = TestTraceContext.accessor,
+    });
     defer registry.deinit();
 
     // Register all three policies together (indices 0, 1, 2 in global stats)
@@ -4404,18 +4475,18 @@ test "PolicyEngine: mixed signal policies scope stats to own signal type" {
 
     // --- Evaluate a matching LOG ---
     var log_ctx = TestLogContext{ .message = "an error occurred" };
-    _ = engine.evaluate(.log, &log_ctx, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(.log, &log_ctx, &policy_id_buf, .{});
 
     // --- Evaluate a matching METRIC ---
     var metric_ctx = TestMetricContext{ .name = "internal.debug.counter" };
-    _ = engine.evaluate(.metric, &metric_ctx, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(.metric, &metric_ctx, &policy_id_buf, .{});
 
     // --- Evaluate a matching TRACE ---
     var trace_ctx = TestTraceContext{
         .name = "GET /health/ready",
         .trace_id = &[16]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
     };
-    _ = engine.evaluate(.trace, &trace_ctx, TestTraceContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(.trace, &trace_ctx, &policy_id_buf, .{});
 
     // --- Verify stats ---
     const snapshot = registry.getSnapshot().?;
@@ -4453,7 +4524,7 @@ test "PolicyEngine: hex trace_id (protojson) sampling produces same decision as 
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = TestLogContext.accessor, .trace = TestTraceContext.accessor });
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
@@ -4471,8 +4542,8 @@ test "PolicyEngine: hex trace_id (protojson) sampling produces same decision as 
         .trace_id = "010203040506070809ffffffffffffff",
     };
 
-    const bin_keep = engine.evaluate(.trace, &bin_keep_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
-    const hex_keep = engine.evaluate(.trace, &hex_keep_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const bin_keep = engine.evaluate(.trace, &bin_keep_ctx, &policy_id_buf, .{});
+    const hex_keep = engine.evaluate(.trace, &hex_keep_ctx, &policy_id_buf, .{});
     try testing.expectEqual(bin_keep.decision, hex_keep.decision);
     try testing.expectEqual(FilterDecision.keep, hex_keep.decision);
 
@@ -4487,8 +4558,8 @@ test "PolicyEngine: hex trace_id (protojson) sampling produces same decision as 
         .trace_id = "01020304050607080900000000000000",
     };
 
-    const bin_drop = engine.evaluate(.trace, &bin_drop_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
-    const hex_drop = engine.evaluate(.trace, &hex_drop_ctx, TestTraceContext.fieldAccessor, TestTraceContext.fieldMutator, &policy_id_buf);
+    const bin_drop = engine.evaluate(.trace, &bin_drop_ctx, &policy_id_buf, .{});
+    const hex_drop = engine.evaluate(.trace, &hex_drop_ctx, &policy_id_buf, .{});
     try testing.expectEqual(bin_drop.decision, hex_drop.decision);
     try testing.expectEqual(FilterDecision.drop, hex_drop.decision);
 }

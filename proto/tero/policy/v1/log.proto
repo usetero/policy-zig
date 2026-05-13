@@ -12,7 +12,8 @@ option go_package = "github.com/usetero/policy/gen/go/tero/policy/v1";
 
 // LogTarget defines matching and actions for logs.
 message LogTarget {
-  // Matchers to identify which logs this policy applies to (AND logic)
+  // Matchers to identify which logs this policy applies to (AND logic).
+  // Implementations MUST reject policies with an empty match list.
   repeated LogMatcher match = 1;
 
   // The keep field controls whether matching telemetry survives. It unifies
@@ -23,8 +24,13 @@ message LogTarget {
   //   "all"  - Keep everything (default, can be omitted)
   //   "none" - Drop everything
   //   "N%"   - Keep N percent (0-100), e.g. "50%"
-  //   "N/s"  - Keep at most N per second, e.g. "100/s"
-  //   "N/m"  - Keep at most N per minute, e.g. "1000/m"
+  //   "N/s"  - Keep at most N per second (shorthand for "N/1s"), e.g. "100/s"
+  //   "N/m"  - Keep at most N per minute (shorthand for "N/1m"), e.g. "1000/m"
+  //   "N/Ds" - Keep at most N per D-second window, e.g. "1/5s"
+  //   "N/Dm" - Keep at most N per D-minute window, e.g. "1/5m"
+  //
+  // For rate limiting, both N and D must be positive integers. Fractional
+  // values are invalid and should be rejected by implementations.
   string keep = 2;
 
   // Transform operations to apply
@@ -35,7 +41,7 @@ message LogTarget {
   // keep/drop decision. Use for lifecycle events (request_id, trace_id, job_id)
   // to avoid sampling individual log lines independently.
   //
-  // Only applies when keep is a sampling value (N%, N/s, N/m).
+  // Only applies when keep is a sampling value (N%, N/s, N/m, N/Ds, N/Dm).
   // Example: sample_key = log_attribute["request_id"] with keep = "10%" means
   // 10% of requests are kept, with all logs from each kept request preserved.
   LogSampleKey sample_key = 4;
@@ -196,8 +202,17 @@ message LogRedact {
     AttributePath scope_attribute = 4;
   }
 
-  // Replacement value (e.g., "[REDACTED]")
+  // Replacement value (e.g., "[REDACTED]"). When regex is set, this is
+  // interpreted as a replacement template.
   string replacement = 10;
+
+  // Optional RE2 regular expression for targeted replacement. If unset, the
+  // entire field value is replaced. If set and no match is present, no
+  // modification is applied. If set and a match is present, all non-overlapping
+  // instances of the full regular expression match are replaced. Capture groups
+  // may be referenced from the replacement string, but do not change the
+  // replacement range.
+  optional string regex = 11;
 }
 
 // LogRename changes a field name.
