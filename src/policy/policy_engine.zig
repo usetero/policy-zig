@@ -647,7 +647,7 @@ pub const PolicyEngine = struct {
         const log_target = getLogTarget(policy) orelse return .{};
         const transform = log_target.transform orelse return .{};
 
-        const compiled_redacts: []const ?redact_mod.Compiled = blk: {
+        const compiled_redacts: []const log_transform.CompiledRedact = blk: {
             const info = snapshot.log_index.getPolicyByIndex(policy_index) orelse break :blk &.{};
             break :blk info.compiled_redacts;
         };

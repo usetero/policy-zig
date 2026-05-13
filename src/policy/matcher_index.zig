@@ -24,6 +24,7 @@ const policy_types = @import("./types.zig");
 const probabilistic_sampler_mod = @import("./probabilistic_sampler.zig");
 const rate_limiter_mod = @import("./rate_limiter.zig");
 const redact_mod = @import("./redact.zig");
+const log_transform = @import("./log_transform.zig");
 const o11y = @import("observability");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -257,6 +258,19 @@ pub const KeepValue = union(enum) {
     per_second: RateLimit,
     per_minute: RateLimit,
 
+    /// Maximum rate-limit window expressed in the policy unit. The runtime
+    /// converts `per_second` to milliseconds (×1_000) and `per_minute` to
+    /// milliseconds (×60_000), so the cap is chosen to keep the converted
+    /// value well within u32 (max 4_294_967_295).
+    ///
+    /// - per_second: 1_000_000 → 1_000_000_000 ms (~11.5 days), well under u32 max
+    /// - per_minute: 50_000   → 3_000_000_000 ms (~34.7 days), under u32 max
+    ///
+    /// We cap per_second at 1M and per_minute at 50K — both produce sane
+    /// windows; values above either are clamped to the cap.
+    pub const MAX_RATE_LIMIT_DURATION_SECONDS: u32 = 1_000_000;
+    pub const MAX_RATE_LIMIT_DURATION_MINUTES: u32 = 50_000;
+
     pub fn parse(s: []const u8) KeepValue {
         if (s.len == 0 or std.mem.eql(u8, s, "all")) return .all;
         if (std.mem.eql(u8, s, "none")) return .none;
@@ -274,11 +288,16 @@ pub const KeepValue = union(enum) {
             const after_slash = s[slash_pos + 1 ..];
             const unit = after_slash[after_slash.len - 1];
             if (unit != 's' and unit != 'm') return .all;
-            const duration: u32 = if (after_slash.len == 1)
+            const duration_raw: u32 = if (after_slash.len == 1)
                 1
             else
                 std.fmt.parseInt(u32, after_slash[0 .. after_slash.len - 1], 10) catch return .all;
-            if (duration == 0) return .all;
+            if (duration_raw == 0) return .all;
+
+            // Clamp the window so the later ms conversion (×1_000 / ×60_000)
+            // can't overflow u32 in storePolicyInfo.
+            const max: u32 = if (unit == 's') MAX_RATE_LIMIT_DURATION_SECONDS else MAX_RATE_LIMIT_DURATION_MINUTES;
+            const duration = if (duration_raw > max) max else duration_raw;
             const rl = RateLimit{ .count = count, .duration = duration };
             return if (unit == 's') .{ .per_second = rl } else .{ .per_minute = rl };
         }
@@ -339,11 +358,12 @@ pub const PolicyInfo = struct {
     /// OTel-compliant probabilistic sampler. Pre-computed at index build time.
     /// Set for trace and log policies with percentage keep.
     sampler: ?ProbabilisticSampler = null,
-    /// Compiled redact rules for log policies. Parallel to the policy's
-    /// LogTransform.redact list (same length, same order). Each entry is
-    /// non-null only when its source rule has `regex` set. Empty slice for
-    /// non-log policies or log policies with no redacts.
-    compiled_redacts: []?redact_mod.Compiled = &.{},
+    /// Compiled redact rules for log policies, paired with their source rule.
+    /// Length matches `LogTransform.redact.items.len`; ordering matches the
+    /// rule list. Each entry's `compiled` is non-null only when the source
+    /// rule carries a `regex`. Empty slice for non-log policies or log
+    /// policies with no redacts.
+    compiled_redacts: []log_transform.CompiledRedact = &.{},
 };
 
 // =============================================================================
@@ -901,36 +921,18 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => null,
             };
 
-            // Compile regex-based redact rules for log policies.
-            const compiled_redacts: []?redact_mod.Compiled = if (T == .log) blk: {
+            // Compile regex-based redact rules for log policies. Delegated
+            // to `log_transform.compileRedactRules` so the cleanup path lives
+            // in one place; on success this returns a slice of
+            // `{rule, compiled}` pairs keyed structurally to the rule list.
+            const compiled_redacts: []log_transform.CompiledRedact = if (T == .log) blk: {
                 const transform = target.transform orelse break :blk &.{};
-                if (transform.redact.items.len == 0) break :blk &.{};
-
-                const slots = try self.allocator.alloc(?redact_mod.Compiled, transform.redact.items.len);
-                errdefer self.allocator.free(slots);
-                for (slots) |*s| s.* = null;
-
-                var compiled_count: usize = 0;
-                errdefer for (slots[0..compiled_count]) |*opt| {
-                    if (opt.*) |*c| c.deinit();
+                break :blk log_transform.compileRedactRules(self.allocator, &transform) catch |err| {
+                    self.bus.warn(MatcherEmptyRegex{ .matcher_idx = 0 });
+                    return err;
                 };
-
-                for (transform.redact.items, 0..) |*rule, idx| {
-                    const regex_str = rule.regex orelse continue;
-                    const compiled = redact_mod.Compiled.init(self.allocator, regex_str, rule.replacement) catch |err| {
-                        self.bus.warn(MatcherEmptyRegex{ .matcher_idx = idx });
-                        return err;
-                    };
-                    slots[idx] = compiled;
-                    compiled_count = idx + 1;
-                }
-
-                break :blk slots;
             } else &.{};
-            errdefer if (compiled_redacts.len > 0) {
-                for (compiled_redacts) |*opt| if (opt.*) |*c| c.deinit();
-                self.allocator.free(compiled_redacts);
-            };
+            errdefer log_transform.deinitCompiledRedacts(self.allocator, compiled_redacts);
 
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
@@ -1119,10 +1121,7 @@ pub const LogMatcherIndex = struct {
                 self.allocator.destroy(rl);
             }
             if (policy_info.compiled_redacts.len > 0) {
-                for (policy_info.compiled_redacts) |*opt| {
-                    if (opt.*) |*c| c.deinit();
-                }
-                self.allocator.free(policy_info.compiled_redacts);
+                log_transform.deinitCompiledRedacts(self.allocator, policy_info.compiled_redacts);
             }
         }
         self.allocator.free(self.policies);
@@ -1596,6 +1595,23 @@ test "KeepValue: parse" {
     try testing.expectEqual(KeepValue.all, KeepValue.parse("/s")); // missing count
     try testing.expectEqual(KeepValue.all, KeepValue.parse("abc/5s")); // non-integer count
     try testing.expectEqual(KeepValue.all, KeepValue.parse("1/abcs")); // non-integer duration
+}
+
+test "KeepValue: rate-limit duration is clamped to avoid u32 ms-overflow" {
+    // 5_000_000 minutes would translate to 3e11 ms — overflows u32 when
+    // multiplied by 60_000 in storePolicyInfo. The parser clamps to
+    // MAX_RATE_LIMIT_DURATION_MINUTES.
+    const huge_min = KeepValue.parse("10/5000000m");
+    try testing.expect(huge_min == .per_minute);
+    try testing.expect(huge_min.per_minute.duration <= KeepValue.MAX_RATE_LIMIT_DURATION_MINUTES);
+
+    // 5_000_000_000 seconds would similarly overflow when ×1_000.
+    const huge_sec = KeepValue.parse("10/5000000000s");
+    try testing.expect(huge_sec == .all or huge_sec.per_second.duration <= KeepValue.MAX_RATE_LIMIT_DURATION_SECONDS);
+
+    // u32::MAX exactly. Either rejected via parseInt or clamped — either is fine.
+    const u32_max = KeepValue.parse("10/4294967295s");
+    try testing.expect(u32_max == .all or u32_max.per_second.duration <= KeepValue.MAX_RATE_LIMIT_DURATION_SECONDS);
 }
 
 test "KeepValue: restrictiveness comparison" {

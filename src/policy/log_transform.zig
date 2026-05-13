@@ -15,24 +15,79 @@ pub const FieldRef = types.FieldRef;
 pub const LogAccessor = types.LogAccessor;
 pub const TransformResult = types.TransformResult;
 
+/// A snapshot-owned redact rule paired with its compiled regex (when the
+/// rule carries one). Storing rule + compiled side-by-side eliminates the
+/// fragile parallel-array contract between `transform.redact.items` and
+/// `compiled_redacts` that existed previously: the engine iterates one
+/// structure instead of zipping two.
+///
+/// `rule` points into the snapshot's policy slice and is valid for the
+/// snapshot's lifetime. `compiled` is null when `rule.regex == null`, in
+/// which case `applyRedact` falls through to whole-value replacement.
+pub const CompiledRedact = struct {
+    rule: *const LogRedact,
+    compiled: ?redact_mod.Compiled,
+};
+
+/// Build the per-rule `CompiledRedact` list for a `LogTransform`. Compiles
+/// each rule's regex (when present) and ties it to the source rule. Caller
+/// owns the returned slice and is responsible for `deinitCompiledRedacts`.
+///
+/// On failure, partial state is cleaned up before returning the error.
+pub fn compileRedactRules(
+    allocator: std.mem.Allocator,
+    transform: *const LogTransform,
+) ![]CompiledRedact {
+    const rules = transform.redact.items;
+    if (rules.len == 0) return &.{};
+
+    const out = try allocator.alloc(CompiledRedact, rules.len);
+    // Stamp every slot with .rule and .compiled = null up front so the
+    // errdefer below can call deinitCompiledRedacts on any partial state
+    // without separately tracking how many we've filled.
+    for (rules, 0..) |*rule, i| {
+        out[i] = .{ .rule = rule, .compiled = null };
+    }
+    errdefer deinitCompiledRedacts(allocator, out);
+
+    for (rules, 0..) |*rule, i| {
+        const regex_str = rule.regex orelse continue;
+        out[i].compiled = try redact_mod.Compiled.init(allocator, regex_str, rule.replacement);
+    }
+    return out;
+}
+
+/// Free the slice returned by `compileRedactRules`, including any compiled
+/// regexes. Safe to call on partially-initialized slices (null `compiled`
+/// slots are skipped).
+pub fn deinitCompiledRedacts(allocator: std.mem.Allocator, items: []CompiledRedact) void {
+    for (items) |*cr| {
+        if (cr.compiled) |*c| c.deinit();
+    }
+    allocator.free(items);
+}
+
 /// Optional configuration for transform application.
 ///
-/// Defaults disable the regex-redact path: redacts behave as whole-value
-/// replacement when `compiled_redacts` is empty and `scratch` is null.
+/// When `compiled_redacts` is empty, all redact rules in the transform are
+/// applied as whole-value replacement; when populated, the engine iterates
+/// `compiled_redacts` directly (instead of `transform.redact.items`), so
+/// each rule's regex/template state is paired with the rule by structure
+/// rather than by index.
 pub const TransformOptions = struct {
-    /// Parallel slice over `transform.redact.items`. Each non-null entry holds
-    /// a pre-compiled regex + replacement template; null slots (or indices past
-    /// the end of this slice) fall through to whole-value redaction.
-    compiled_redacts: []const ?redact_mod.Compiled = &.{},
+    /// Per-rule compiled state. When empty, no regex-redact runs and the
+    /// engine falls back to iterating `transform.redact.items` for
+    /// whole-value redaction.
+    compiled_redacts: []const CompiledRedact = &.{},
     /// Scratch allocator for regex substitution output. Required for regex-
     /// redact; if null, regex rules degrade to no-op (they cannot allocate
     /// their substituted output).
     ///
     /// Must be an arena-style allocator (or otherwise long-lived): the
-    /// substituted bytes are handed to the mutator by reference and are not
-    /// freed by `applyRedact`. Callers that retain references past the call
-    /// must keep `scratch` alive at least that long, and should reset/deinit
-    /// the arena at a natural boundary (e.g. per log record).
+    /// substituted bytes are handed to `accessor.set` by reference and are
+    /// not freed by `applyRedact`. Callers that retain references past the
+    /// call must keep `scratch` alive at least that long, and should
+    /// reset/deinit the arena at a natural boundary (e.g. per log record).
     scratch: ?std.mem.Allocator = null,
 };
 
@@ -74,19 +129,24 @@ pub fn applyTransforms(
         }
     }
 
-    // 2. Redact
-    result.redacts_attempted = transform.redact.items.len;
-    for (transform.redact.items, 0..) |*rule, idx| {
-        const compiled: ?*const redact_mod.Compiled = blk: {
-            if (idx >= options.compiled_redacts.len) break :blk null;
-            const slot = &options.compiled_redacts[idx];
-            break :blk if (slot.*) |*c| c else null;
-        };
-        if (applyRedact(rule, ctx, accessor, .{
-            .compiled = compiled,
-            .scratch = options.scratch,
-        })) {
-            result.redacts_applied += 1;
+    // 2. Redact — prefer the paired CompiledRedact list when present so the
+    // engine never has to zip rule and compiled state by index.
+    if (options.compiled_redacts.len > 0) {
+        result.redacts_attempted = options.compiled_redacts.len;
+        for (options.compiled_redacts) |*cr| {
+            if (applyRedact(cr.rule, ctx, accessor, .{
+                .compiled = if (cr.compiled) |*c| c else null,
+                .scratch = options.scratch,
+            })) {
+                result.redacts_applied += 1;
+            }
+        }
+    } else {
+        result.redacts_attempted = transform.redact.items.len;
+        for (transform.redact.items) |*rule| {
+            if (applyRedact(rule, ctx, accessor, .{ .scratch = options.scratch })) {
+                result.redacts_applied += 1;
+            }
         }
     }
 
@@ -147,7 +207,12 @@ pub fn applyRedact(
         // `scratch` is documented as arena-lifetime; ownership of the bytes
         // effectively transfers to that arena.
 
-        // Cast away const for replaceAll which mutates engine state internally.
+        // Cast away const for replaceAll: the third-party regex engine
+        // mutates per-iteration state, and `Compiled` carries a `Mutex` that
+        // serializes concurrent callers. The snapshot still hands us a
+        // `*const Compiled` because the *policy data* is immutable — only
+        // the engine's internal scratch state is mutable, and the Mutex
+        // makes that safe across threads.
         const mut: *redact_mod.Compiled = @constCast(c);
         const count = mut.replaceAll(value, &out, allocator) catch return false;
         if (count == 0) return false;
