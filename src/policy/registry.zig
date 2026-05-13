@@ -572,26 +572,32 @@ pub const PolicyRegistry = struct {
         // consumer didn't wire. Rejected policies are reported via the
         // provider error path and excluded from the snapshot; the engine
         // never reaches a missing primitive at runtime.
-        var kept_count: usize = 0;
-        for (self.policies.items) |*p| {
-            if (validateCapabilities(p, self.accessors)) |reason| {
+        //
+        // Single-pass filter: allocate worst-case, walk once, then realloc
+        // down. In the common case (no rejections) the realloc is a no-op
+        // because the requested size already matches the allocation.
+        const worst_case = try self.allocator.alloc(Policy, self.policies.items.len);
+        var policies_buf = worst_case;
+        errdefer self.allocator.free(policies_buf);
+
+        var kept: usize = 0;
+        for (self.policies.items) |p| {
+            if (validateCapabilities(&p, self.accessors)) |reason| {
                 // createSnapshot is called from updatePolicies, which already
                 // holds self.mutex; use the unlocked variant to avoid deadlock.
                 self.recordPolicyErrorLocked(p.id, reason);
                 continue;
             }
-            kept_count += 1;
+            policies_buf[kept] = p;
+            kept += 1;
         }
 
-        const policies_slice = try self.allocator.alloc(Policy, kept_count);
-        errdefer self.allocator.free(policies_slice);
-
-        var dst: usize = 0;
-        for (self.policies.items) |p| {
-            if (validateCapabilities(&p, self.accessors) != null) continue;
-            policies_slice[dst] = p;
-            dst += 1;
+        if (kept != policies_buf.len) {
+            // realloc to the exact kept length so the snapshot's later
+            // `allocator.free(policies)` matches the allocation header.
+            policies_buf = try self.allocator.realloc(policies_buf, kept);
         }
+        const policies_slice = policies_buf;
 
         // Sort policies by ID so that policy index order = alphanumeric ID order.
         // The spec requires transforms to be applied in alphanumeric order by policy ID.

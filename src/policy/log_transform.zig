@@ -166,7 +166,8 @@ pub fn applyRedact(
 /// Apply a single rename rule. Moves the value from `rule.from` to a new
 /// attribute keyed by `rule.to` in the same field family. Handles upsert
 /// semantics engine-side: with `upsert=false`, no-ops when target exists;
-/// with `upsert=true`, deletes target first.
+/// with `upsert=true`, deletes target first (delete is a no-op when target
+/// is missing, so we don't need to pre-check).
 ///
 /// Returns true if the rename actually moved a value.
 pub fn applyRename(
@@ -179,9 +180,9 @@ pub fn applyRename(
     // Source must exist (presence check honors non-string values).
     if (!accessor.callExists(ctx, from_ref)) return false;
 
-    // Construct the target FieldRef in the same family as `from`, keyed by
-    // `rule.to`. Only attribute families are renameable; log_field sources
-    // are rejected by the spec.
+    // The synthetic target AttributePath lives on this stack frame and
+    // is borrowed by `to_ref` for the duration of the call — do not move
+    // its construction into a helper that returns the FieldRef by value.
     const to_path = [_][]const u8{rule.to};
     const to_attr = AttributePath{ .path = .{ .items = @constCast(&to_path), .capacity = 1 } };
     const to_ref: FieldRef = switch (from_ref) {
@@ -191,10 +192,11 @@ pub fn applyRename(
         .scope_attribute => .{ .scope_attribute = to_attr },
     };
 
-    const target_exists = accessor.callExists(ctx, to_ref);
-    if (target_exists) {
-        if (!rule.upsert) return false;
+    if (rule.upsert) {
+        // delete is a no-op on missing target; skip the extra presence call.
         _ = accessor.delete.?(ctx, to_ref);
+    } else if (accessor.callExists(ctx, to_ref)) {
+        return false;
     }
 
     accessor.move.?(ctx, from_ref, rule.to);

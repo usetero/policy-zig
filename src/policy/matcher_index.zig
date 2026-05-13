@@ -89,9 +89,15 @@ pub const MAX_POLICIES: usize = 8192;
 /// `databases` HashMap therefore work with a key constructed via just the
 /// field. The engine reads `exists_entries` directly off the entry returned
 /// by `getMatcherKeys`.
+///
+/// `has_value_db` is set at build time when at least one positive or negated
+/// value pattern is compiled for this key. Exists-only keys have it false;
+/// the engine uses this to skip the `value()` + database lookup that would
+/// otherwise be dead work.
 pub const LogMatcherKey = struct {
     field: FieldRef,
     exists_entries: []const ExistsEntry = &.{},
+    has_value_db: bool = false,
 
     const Self = @This();
 
@@ -108,6 +114,7 @@ pub const LogMatcherKey = struct {
 pub const MetricMatcherKey = struct {
     field: MetricFieldRef,
     exists_entries: []const ExistsEntry = &.{},
+    has_value_db: bool = false,
 
     const Self = @This();
 
@@ -208,6 +215,7 @@ pub const MetricMatcherKeyContext = struct {
 pub const TraceMatcherKey = struct {
     field: TraceFieldRef,
     exists_entries: []const ExistsEntry = &.{},
+    has_value_db: bool = false,
 
     const Self = @This();
 
@@ -976,7 +984,8 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 // Only compile a Hyperscan DB when there are value-match
                 // patterns. Exists-only keys live in `matcher_keys` without
                 // a corresponding database entry.
-                if (patterns.positive.items.len > 0 or patterns.negated.items.len > 0) {
+                const has_value_db = patterns.positive.items.len > 0 or patterns.negated.items.len > 0;
+                if (has_value_db) {
                     const db = try compileDatabase(self.allocator, self.bus, patterns.positive.items, patterns.negated.items);
                     try databases.put(matcher_key, db);
                 }
@@ -991,6 +1000,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 try keys_list.append(self.temp_allocator, .{
                     .field = matcher_key.field,
                     .exists_entries = exists_entries,
+                    .has_value_db = has_value_db,
                 });
             }
 

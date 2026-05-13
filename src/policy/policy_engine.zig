@@ -439,6 +439,10 @@ pub const PolicyEngine = struct {
                 }
             }
 
+            // Skip the value-match path entirely for exists-only keys —
+            // they have no Hyperscan DB and don't read the field value.
+            if (!matcher_key.has_value_db) continue;
+
             const value = accessor.value(ctx, field_ref) orelse {
                 if (self.bus.isEnabled(.debug)) {
                     self.bus.debug(MatcherKeyFieldNotPresent{
@@ -465,12 +469,8 @@ pub const PolicyEngine = struct {
                 });
             }
 
-            const db = index.getDatabase(matcher_key) orelse {
-                if (self.bus.isEnabled(.debug)) {
-                    self.bus.debug(MatcherKeyNoDatabase{});
-                }
-                continue;
-            };
+            // has_value_db guarantees getDatabase returns non-null.
+            const db = index.getDatabase(matcher_key).?;
 
             // Scan positive patterns - increment match counts
             const positive_result = db.scanPositive(value, &result_buf);
