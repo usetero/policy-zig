@@ -108,11 +108,14 @@ pub const RedactOptions = struct {
 
 /// Apply all transforms from a LogTransform in order: remove → redact → rename → add.
 ///
-/// The engine owns transform dispatch: it pre-checks existence, resolves
-/// upsert semantics, and calls accessor primitives directly. Snapshot-compile
-/// time validation guarantees that any primitive used here is wired on the
-/// accessor — unwrapping the optional function pointers (`accessor.set.?`,
-/// `accessor.delete.?`, `accessor.move.?`) is safe at runtime.
+/// The engine owns transform dispatch: it pre-checks existence and resolves
+/// upsert semantics, then calls accessor primitives directly. Each `apply*`
+/// gates on the primitive it needs (`set`, `delete`, `move`); when the
+/// caller's accessor doesn't wire a primitive, the corresponding transform
+/// silently no-ops and is not counted as applied. This lets a single
+/// PolicySnapshot serve multiple consumers with different capability
+/// profiles — each consumer simply skips transforms its accessor can't
+/// honor.
 pub fn applyTransforms(
     transform: *const LogTransform,
     ctx: *anyopaque,
@@ -170,13 +173,15 @@ pub fn applyTransforms(
 }
 
 /// Apply a single remove rule. Returns true if the field existed and was removed.
+/// No-op when the accessor doesn't wire `delete`.
 pub fn applyRemove(
     rule: *const LogRemove,
     ctx: *anyopaque,
     accessor: *const LogAccessor,
 ) bool {
     const field_ref = FieldRef.fromRemoveField(rule.field) orelse return false;
-    return accessor.delete.?(ctx, field_ref);
+    const delete_fn = accessor.delete orelse return false;
+    return delete_fn(ctx, field_ref);
 }
 
 /// Apply a single redact rule.
@@ -196,6 +201,7 @@ pub fn applyRedact(
     options: RedactOptions,
 ) bool {
     const field_ref = FieldRef.fromRedactField(rule.field) orelse return false;
+    const set_fn = accessor.set orelse return false;
 
     if (options.compiled) |c| {
         const allocator = options.scratch orelse return false;
@@ -217,14 +223,14 @@ pub fn applyRedact(
         const count = mut.replaceAll(value, &out, allocator) catch return false;
         if (count == 0) return false;
 
-        accessor.set.?(ctx, field_ref, out.items);
+        set_fn(ctx, field_ref, out.items);
         return true;
     }
 
     // Whole-value redact: only fires if the field exists.
     if (accessor.value(ctx, field_ref) == null) return false;
 
-    accessor.set.?(ctx, field_ref, rule.replacement);
+    set_fn(ctx, field_ref, rule.replacement);
     return true;
 }
 
@@ -241,6 +247,11 @@ pub fn applyRename(
     accessor: *const LogAccessor,
 ) bool {
     const from_ref = FieldRef.fromRenameFrom(rule.from) orelse return false;
+    const move_fn = accessor.move orelse return false;
+    // delete is only needed for `upsert=true`, but the rename API has no
+    // way to express "upsert is unsupported," so we require it whenever
+    // the rule could touch the target. Simpler to gate up front.
+    const delete_fn = accessor.delete orelse return false;
 
     // Source must exist (presence check honors non-string values).
     if (!accessor.callExists(ctx, from_ref)) return false;
@@ -259,12 +270,12 @@ pub fn applyRename(
 
     if (rule.upsert) {
         // delete is a no-op on missing target; skip the extra presence call.
-        _ = accessor.delete.?(ctx, to_ref);
+        _ = delete_fn(ctx, to_ref);
     } else if (accessor.callExists(ctx, to_ref)) {
         return false;
     }
 
-    accessor.move.?(ctx, from_ref, rule.to);
+    move_fn(ctx, from_ref, rule.to);
     return true;
 }
 
@@ -278,11 +289,12 @@ pub fn applyAdd(
     accessor: *const LogAccessor,
 ) bool {
     const field_ref = FieldRef.fromAddField(rule.field) orelse return false;
+    const set_fn = accessor.set orelse return false;
 
     const exists = accessor.callExists(ctx, field_ref);
     if (!rule.upsert and exists) return false;
 
-    accessor.set.?(ctx, field_ref, rule.value);
+    set_fn(ctx, field_ref, rule.value);
     return true;
 }
 

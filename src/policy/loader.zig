@@ -300,7 +300,7 @@ test "PolicyLoader: init and deinit" {
     stdio_bus.init();
     const bus = stdio_bus.eventBus();
 
-    var registry = Registry.init(allocator, bus, .{});
+    var registry = Registry.init(allocator, bus);
     defer registry.deinit();
 
     const configs = [_]ProviderConfig{};

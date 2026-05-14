@@ -203,28 +203,6 @@ const testing = std.testing;
 const Registry = @import("./registry.zig").PolicyRegistry;
 const NoopEventBus = o11y.NoopEventBus;
 
-/// Stub accessors — these tests exercise FileProvider/Registry mechanics by
-/// loading log-target policies from JSON. Capability validation needs a log
-/// accessor to be wired; the tests never call evaluate, so all primitives are
-/// no-ops.
-const _types = @import("./types.zig");
-fn _stubLogValue(_: *const anyopaque, _: _types.FieldRef) ?[]const u8 {
-    return null;
-}
-fn _stubLogSet(_: *anyopaque, _: _types.FieldRef, _: []const u8) void {}
-fn _stubLogDelete(_: *anyopaque, _: _types.FieldRef) bool {
-    return false;
-}
-fn _stubLogMove(_: *anyopaque, _: _types.FieldRef, _: []const u8) void {}
-const test_accessors: _types.AccessorTemplates = .{
-    .log = .{
-        .value = _stubLogValue,
-        .set = _stubLogSet,
-        .delete = _stubLogDelete,
-        .move = _stubLogMove,
-    },
-};
-
 test "FileProvider: init and deinit" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
@@ -350,7 +328,7 @@ test "FileProvider: registry remains usable after provider fails to load" {
     noop_bus.init();
 
     // Create registry
-    var registry = Registry.init(allocator, noop_bus.eventBus(), test_accessors);
+    var registry = Registry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Try to load a provider with a non-existent file
@@ -436,7 +414,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = Registry.init(allocator, noop_bus.eventBus(), test_accessors);
+    var registry = Registry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a valid policy file
@@ -581,7 +559,7 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var registry = Registry.init(allocator, noop_bus.eventBus(), test_accessors);
+    var registry = Registry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a valid policy file
