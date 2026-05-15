@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/usetero/policy-zig/compare/v0.3.0...v0.3.1) (2026-05-15)
+
+
+### Bug Fixes
+
+* registry shouldn't need the accessors ([#57](https://github.com/usetero/policy-zig/issues/57)) ([16dd81d](https://github.com/usetero/policy-zig/commit/16dd81d7dcb4415a5994bef91222ae5a1c89aeff))
+
 ## [0.3.0](https://github.com/usetero/policy-zig/compare/v0.2.0...v0.3.0) (2026-05-13)
 
 
