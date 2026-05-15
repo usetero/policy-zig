@@ -256,15 +256,16 @@ pub const MetricFieldRef = union(enum) {
 // Log Accessor - Capability-tagged interface to consumer log records
 // =============================================================================
 
-/// Read+write interface to a log record. The engine dispatches every read and
-/// write through these function pointers; ctx is the consumer-owned record
-/// the pointers operate on (passed positionally to evaluate()).
+/// Read+write interface to a log record. Callers construct one of these and
+/// pass it to `engine.evaluate(.log, ctx, buf, .{ .accessor = &acc, ... })`;
+/// the engine dispatches every read and write through these function
+/// pointers, with ctx being the consumer-owned record the pointers operate on.
 ///
-/// `value` is the only required field. Optional primitives are interpreted by
-/// the registry as capability advertisements: a policy whose transforms need a
-/// missing primitive is rejected at snapshot-compile time (via the provider's
-/// recordPolicyError path), so the engine never reaches a null function
-/// pointer at runtime.
+/// `value` is the only required field. Optional primitives advertise consumer
+/// capability: when an `apply*` transform needs a primitive that's null, the
+/// transform no-ops (does not count toward `*_applied`) — so a consumer that
+/// doesn't wire `set` simply won't apply redact/add even if a matching policy
+/// fires.
 pub const LogAccessor = struct {
     /// Read field as bytes for pattern matching.
     /// Returns null when the field is absent OR its underlying value is not a
@@ -277,13 +278,14 @@ pub const LogAccessor = struct {
     /// the old "non-null means present" semantics.
     exists: ?*const fn (ctx: *const anyopaque, field: FieldRef) bool = null,
 
-    /// Upsert a field. The engine pre-validates existence via `value`/`exists`
-    /// and pre-checks `upsert=false` conflicts, so `set` is always called at
-    /// a point where the write is expected to succeed.
+    /// Upsert a field. The engine pre-checks `upsert=false` conflicts via
+    /// `callExists`, so `set` is always called at a point where the write is
+    /// expected to succeed.
     ///
-    /// Wiring this enables: log.redact, log.add. Lifetime: bytes passed to
-    /// `set` must outlive any reference the consumer retains; the engine
-    /// allocates them into the caller-supplied `scratch` allocator.
+    /// Wiring this enables: log.redact, log.add. When null, both transforms
+    /// silently no-op for callers passing this accessor. Lifetime: bytes
+    /// passed to `set` must outlive any reference the consumer retains; the
+    /// engine allocates them into the caller-supplied `scratch` allocator.
     set: ?*const fn (ctx: *anyopaque, field: FieldRef, value: []const u8) void = null,
 
     /// Remove a field. Returns true iff the field existed (so the engine can
@@ -341,15 +343,6 @@ pub const TraceAccessor = struct {
         if (self.exists) |f| return f(ctx, field);
         return self.value(ctx, field) != null;
     }
-};
-
-/// Static templates wired to the PolicyRegistry. A telemetry-type field set to
-/// null means the consumer doesn't handle that telemetry — all policies of
-/// that type are rejected at snapshot-compile time with a descriptive reason.
-pub const AccessorTemplates = struct {
-    log: ?LogAccessor = null,
-    metric: ?MetricAccessor = null,
-    trace: ?TraceAccessor = null,
 };
 
 // =============================================================================

@@ -92,7 +92,7 @@ your_module.addImport("policy_zig", policy_dep.module("policy_zig"));
 ```zig
 const policy = @import("policy_zig");
 
-// Create a registry
+// Create a registry — capability-agnostic; can serve multiple consumers.
 var registry = policy.Registry.init(allocator, bus);
 defer registry.deinit();
 
@@ -104,6 +104,21 @@ const file_provider = try policy.FileProvider.init(allocator, bus, .{
 defer file_provider.deinit();
 
 try registry.subscribe(.{ .file = file_provider });
+
+// Evaluate telemetry. The accessor is a comptime parameter: declare it as
+// a module-scope const, then pass &my_log_accessor positionally. Each
+// consumer (OTLP, Datadog, Prometheus, …) supplies its own accessor at
+// its evaluate site, so one registry can serve many consumers.
+const engine = policy.PolicyEngine.init(bus, &registry);
+var policy_id_buf: [16][]const u8 = undefined;
+const result = engine.evaluate(.log, &my_log_accessor, &my_log_ctx, &policy_id_buf, .{
+    .scratch = arena.allocator(),
+});
+
+// Transforms whose required primitive (set/delete/move) is unwired on the
+// accessor are *eliminated at compile time* for that callsite — no
+// runtime branch, no code emitted. Different consumers can apply
+// different subsets of a policy with zero per-call overhead.
 
 // Periodically flush per-policy stats to providers
 registry.flushStats();

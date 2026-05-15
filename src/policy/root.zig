@@ -13,6 +13,14 @@
 //! var registry = policy.Registry.init(allocator, bus);
 //! defer registry.deinit();
 //!
+//! // Construct an accessor for your record type and pass it to evaluate():
+//! //   engine.evaluate(.log, &my_log_accessor, &log, &policy_id_buf, .{});
+//! // A single Registry can serve multiple consumers — each call passes the
+//! // accessor appropriate to its record shape. The accessor is comptime,
+//! // so transforms requiring a primitive (set/delete/move) that the
+//! // accessor doesn't wire are eliminated at compile time for that
+//! // callsite (no runtime branch, no emitted code).
+//!
 //! // Create and register a file provider
 //! const file_provider = try policy.FileProvider.init(allocator, bus, .{ .id = "local", .path = "policies.json" });
 //! defer file_provider.deinit();
@@ -89,7 +97,6 @@ pub const TraceFieldRef = types.TraceFieldRef;
 pub const LogAccessor = types.LogAccessor;
 pub const MetricAccessor = types.MetricAccessor;
 pub const TraceAccessor = types.TraceAccessor;
-pub const AccessorTemplates = types.AccessorTemplates;
 pub const TelemetryType = types.TelemetryType;
 
 // =============================================================================
