@@ -24,6 +24,8 @@ const SpanKind = proto.policy.SpanKind;
 const SpanStatusCode = proto.policy.SpanStatusCode;
 const AttributePath = proto.policy.AttributePath;
 const LogSampleKey = proto.policy.LogSampleKey;
+const Value = proto.policy.Value;
+const NumericValue = proto.policy.NumericValue;
 
 /// Parse an AttributePath from a JSON value.
 /// Supports three formats:
@@ -102,6 +104,8 @@ fn makeAttributePath(allocator: std.mem.Allocator, key: []const u8) !AttributePa
 /// Example: { "log_attribute": ["http", "method"], "regex": "GET" }
 /// Example: { "log_attribute": {"path": ["http", "method"]}, "regex": "GET" }
 /// Example: { "log_field": "body", "starts_with": "ERROR", "case_insensitive": true }
+/// Example: { "log_attribute": "cache.hit", "equals": true }
+/// Example: { "log_attribute": ["http.response.status_code"], "gte": 500 }
 const LogMatcherJson = struct {
     // Field selectors (one of these should be set)
     log_field: ?[]const u8 = null, // "body", "severity_text", etc.
@@ -116,6 +120,17 @@ const LogMatcherJson = struct {
     starts_with: ?[]const u8 = null,
     ends_with: ?[]const u8 = null,
     contains: ?[]const u8 = null,
+    // Typed match types (v1.5.0). Using std.json.Value for shorthand inference:
+    //   equals: true   → bool_value
+    //   equals: 200    → int_value
+    //   equals: 0.5    → double_value
+    //   equals: { hex_value: "deadbeef" }  → canonical
+    // gt/gte/lt/lte accept integer or float literals only.
+    equals: ?std.json.Value = null,
+    gt: ?std.json.Value = null,
+    gte: ?std.json.Value = null,
+    lt: ?std.json.Value = null,
+    lte: ?std.json.Value = null,
 
     // Optional flags
     negate: bool = false,
@@ -144,6 +159,12 @@ const MetricMatcherJson = struct {
     starts_with: ?[]const u8 = null,
     ends_with: ?[]const u8 = null,
     contains: ?[]const u8 = null,
+    // Typed match types (v1.5.0).
+    equals: ?std.json.Value = null,
+    gt: ?std.json.Value = null,
+    gte: ?std.json.Value = null,
+    lt: ?std.json.Value = null,
+    lte: ?std.json.Value = null,
 
     // Optional flags
     negate: bool = false,
@@ -263,6 +284,12 @@ const TraceMatcherJson = struct {
     starts_with: ?[]const u8 = null,
     ends_with: ?[]const u8 = null,
     contains: ?[]const u8 = null,
+    // Typed match types (v1.5.0).
+    equals: ?std.json.Value = null,
+    gt: ?std.json.Value = null,
+    gte: ?std.json.Value = null,
+    lt: ?std.json.Value = null,
+    lte: ?std.json.Value = null,
 
     // Optional flags
     negate: bool = false,
@@ -465,6 +492,16 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
             break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
         } else if (jm.contains) |pattern| {
             break :blk .{ .contains = try allocator.dupe(u8, pattern) };
+        } else if (jm.equals) |v| {
+            break :blk .{ .equals = try parseValue(allocator, v) };
+        } else if (jm.gt) |v| {
+            break :blk .{ .gt = try parseNumericValue(v) };
+        } else if (jm.gte) |v| {
+            break :blk .{ .gte = try parseNumericValue(v) };
+        } else if (jm.lt) |v| {
+            break :blk .{ .lt = try parseNumericValue(v) };
+        } else if (jm.lte) |v| {
+            break :blk .{ .lte = try parseNumericValue(v) };
         } else {
             return error.MissingMatch;
         }
@@ -475,6 +512,79 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
         .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
+    };
+}
+
+// =============================================================================
+// Typed Value Parsing (v1.5.0)
+// =============================================================================
+
+/// Parse a Value from a JSON value using shorthand inference:
+///   bool   → bool_value
+///   int    → int_value
+///   float  → double_value
+///   object with hex_value/bytes_value/bool_value/int_value/double_value → canonical
+/// A bare string literal is rejected per spec (use `exact` for strings).
+fn parseValue(allocator: std.mem.Allocator, json_val: std.json.Value) !Value {
+    switch (json_val) {
+        .bool => |b| return Value{ .value = .{ .bool_value = b } },
+        .integer => |i| return Value{ .value = .{ .int_value = i } },
+        .float => |f| return Value{ .value = .{ .double_value = f } },
+        .object => |obj| {
+            if (obj.get("bool_value")) |v| {
+                return Value{ .value = .{ .bool_value = v.bool } };
+            }
+            if (obj.get("int_value")) |v| {
+                return Value{ .value = .{ .int_value = v.integer } };
+            }
+            if (obj.get("double_value")) |v| {
+                return Value{ .value = .{ .double_value = v.float } };
+            }
+            if (obj.get("hex_value")) |v| {
+                const hex_str = v.string;
+                const bytes = try hexDecode(allocator, hex_str);
+                return Value{ .value = .{ .bytes_value = bytes } };
+            }
+            if (obj.get("bytes_value")) |v| {
+                const bytes = try allocator.dupe(u8, v.string);
+                return Value{ .value = .{ .bytes_value = bytes } };
+            }
+            return error.InvalidValue;
+        },
+        .string => return error.InvalidValue, // use `exact` for strings
+        else => return error.InvalidValue,
+    }
+}
+
+/// Parse a NumericValue from a JSON value.
+/// Accepts integer or float literals only.
+fn parseNumericValue(json_val: std.json.Value) !NumericValue {
+    switch (json_val) {
+        .integer => |i| return NumericValue{ .value = .{ .int_value = i } },
+        .float => |f| return NumericValue{ .value = .{ .double_value = f } },
+        else => return error.InvalidNumericValue,
+    }
+}
+
+/// Decode a lowercase-hex string to bytes. Caller owns the returned slice.
+fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]const u8 {
+    if (hex.len % 2 != 0) return error.InvalidHexValue;
+    const out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    for (0..out.len) |i| {
+        const hi = try hexDigit(hex[i * 2]);
+        const lo = try hexDigit(hex[i * 2 + 1]);
+        out[i] = (hi << 4) | lo;
+    }
+    return out;
+}
+
+fn hexDigit(c: u8) !u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => error.InvalidHexValue,
     };
 }
 
@@ -669,6 +779,16 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
             break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
         } else if (jm.contains) |pattern| {
             break :blk .{ .contains = try allocator.dupe(u8, pattern) };
+        } else if (jm.equals) |v| {
+            break :blk .{ .equals = try parseValue(allocator, v) };
+        } else if (jm.gt) |v| {
+            break :blk .{ .gt = try parseNumericValue(v) };
+        } else if (jm.gte) |v| {
+            break :blk .{ .gte = try parseNumericValue(v) };
+        } else if (jm.lt) |v| {
+            break :blk .{ .lt = try parseNumericValue(v) };
+        } else if (jm.lte) |v| {
+            break :blk .{ .lte = try parseNumericValue(v) };
         } else if (jm.metric_type != null or jm.aggregation_temporality != null) {
             break :blk .{ .exists = true };
         } else {
@@ -776,6 +896,16 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
             break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
         } else if (jm.contains) |pattern| {
             break :blk .{ .contains = try allocator.dupe(u8, pattern) };
+        } else if (jm.equals) |v| {
+            break :blk .{ .equals = try parseValue(allocator, v) };
+        } else if (jm.gt) |v| {
+            break :blk .{ .gt = try parseNumericValue(v) };
+        } else if (jm.gte) |v| {
+            break :blk .{ .gte = try parseNumericValue(v) };
+        } else if (jm.lt) |v| {
+            break :blk .{ .lt = try parseNumericValue(v) };
+        } else if (jm.lte) |v| {
+            break :blk .{ .lte = try parseNumericValue(v) };
         } else {
             return error.MissingMatch;
         }
@@ -2445,4 +2575,238 @@ test "parsePoliciesBytes: trace policy with shortname resource_schema_url" {
     const matcher = policies[0].target.?.trace.match.items[0];
     try std.testing.expect(matcher.field.? == .trace_field);
     try std.testing.expectEqual(TraceField.TRACE_FIELD_RESOURCE_SCHEMA_URL, matcher.field.?.trace_field);
+}
+
+// =============================================================================
+// v1.5.0: Typed matcher parsing tests
+// =============================================================================
+
+test "parseValue: bool shorthand" {
+    const allocator = std.testing.allocator;
+    const v = try parseValue(allocator, .{ .bool = true });
+    try std.testing.expect(v.value != null);
+    try std.testing.expect(v.value.? == .bool_value);
+    try std.testing.expect(v.value.?.bool_value == true);
+}
+
+test "parseValue: int shorthand" {
+    const allocator = std.testing.allocator;
+    const v = try parseValue(allocator, .{ .integer = 200 });
+    try std.testing.expect(v.value.? == .int_value);
+    try std.testing.expectEqual(@as(i64, 200), v.value.?.int_value);
+}
+
+test "parseValue: float shorthand" {
+    const allocator = std.testing.allocator;
+    const v = try parseValue(allocator, .{ .float = 0.5 });
+    try std.testing.expect(v.value.? == .double_value);
+    try std.testing.expectEqual(@as(f64, 0.5), v.value.?.double_value);
+}
+
+test "parseValue: hex_value canonical" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.init(allocator);
+    defer obj.deinit();
+    try obj.put("hex_value", .{ .string = "deadbeef" });
+    const v = try parseValue(allocator, .{ .object = obj });
+    defer allocator.free(v.value.?.bytes_value);
+    try std.testing.expect(v.value.? == .bytes_value);
+    try std.testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, v.value.?.bytes_value);
+}
+
+test "parseValue: string rejected" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .string = "foo" }));
+}
+
+test "parseNumericValue: int" {
+    const v = try parseNumericValue(.{ .integer = 500 });
+    try std.testing.expect(v.value.? == .int_value);
+    try std.testing.expectEqual(@as(i64, 500), v.value.?.int_value);
+}
+
+test "parseNumericValue: float" {
+    const v = try parseNumericValue(.{ .float = 0.1 });
+    try std.testing.expect(v.value.? == .double_value);
+    try std.testing.expectEqual(@as(f64, 0.1), v.value.?.double_value);
+}
+
+test "parseNumericValue: bool rejected" {
+    try std.testing.expectError(error.InvalidNumericValue, parseNumericValue(.{ .bool = true }));
+}
+
+test "hexDecode: valid" {
+    const allocator = std.testing.allocator;
+    const bytes = try hexDecode(allocator, "4bf92f35");
+    defer allocator.free(bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4b, 0xf9, 0x2f, 0x35 }, bytes);
+}
+
+test "hexDecode: odd length rejected" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidHexValue, hexDecode(allocator, "abc"));
+}
+
+test "hexDecode: invalid char rejected" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidHexValue, hexDecode(allocator, "zz"));
+}
+
+test "parsePoliciesBytes: log policy with equals bool" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-cache-hits",
+        \\    "name": "Drop cache hit logs",
+        \\    "log": {
+        \\      "match": [
+        \\        { "log_attribute": "cache.hit", "equals": true }
+        \\      ],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.log.match.items[0];
+    try std.testing.expect(matcher.match.? == .equals);
+    try std.testing.expect(matcher.match.?.equals.value.? == .bool_value);
+    try std.testing.expect(matcher.match.?.equals.value.?.bool_value == true);
+}
+
+test "parsePoliciesBytes: log policy with gte int" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-success",
+        \\    "name": "Drop successful HTTP logs",
+        \\    "log": {
+        \\      "match": [
+        \\        { "log_attribute": ["http.response.status_code"], "gte": 200 },
+        \\        { "log_attribute": ["http.response.status_code"], "lt": 400 }
+        \\      ],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matchers = policies[0].target.?.log.match.items;
+    try std.testing.expectEqual(@as(usize, 2), matchers.len);
+
+    try std.testing.expect(matchers[0].match.? == .gte);
+    try std.testing.expect(matchers[0].match.?.gte.value.? == .int_value);
+    try std.testing.expectEqual(@as(i64, 200), matchers[0].match.?.gte.value.?.int_value);
+
+    try std.testing.expect(matchers[1].match.? == .lt);
+    try std.testing.expect(matchers[1].match.?.lt.value.? == .int_value);
+    try std.testing.expectEqual(@as(i64, 400), matchers[1].match.?.lt.value.?.int_value);
+}
+
+test "parsePoliciesBytes: log policy with equals float" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-low-ratio",
+        \\    "name": "Drop low sampling ratio",
+        \\    "log": {
+        \\      "match": [
+        \\        { "log_attribute": "sampling.ratio", "lt": 0.5 }
+        \\      ],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.log.match.items[0];
+    try std.testing.expect(matcher.match.? == .lt);
+    try std.testing.expect(matcher.match.?.lt.value.? == .double_value);
+    try std.testing.expectEqual(@as(f64, 0.5), matcher.match.?.lt.value.?.double_value);
+}
+
+test "parsePoliciesBytes: trace policy with equals hex (bytes identifier)" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "keep-trace",
+        \\    "name": "Keep all spans for a trace",
+        \\    "trace": {
+        \\      "match": [
+        \\        { "trace_field": "TRACE_FIELD_TRACE_ID", "equals": { "hex_value": "4bf92f3577b34da6a3ce929d0e0e4736" } }
+        \\      ]
+        \\    }
+        \\  }]
+        \\}
+        \\
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.trace.match.items[0];
+    try std.testing.expect(matcher.field.? == .trace_field);
+    try std.testing.expectEqual(TraceField.TRACE_FIELD_TRACE_ID, matcher.field.?.trace_field);
+    try std.testing.expect(matcher.match.? == .equals);
+    try std.testing.expect(matcher.match.?.equals.value.? == .bytes_value);
+    try std.testing.expectEqual(@as(usize, 16), matcher.match.?.equals.value.?.bytes_value.len);
+}
+
+test "parsePoliciesBytes: metric policy with gt" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-small-metrics",
+        \\    "name": "Drop small datapoint values",
+        \\    "metric": {
+        \\      "match": [
+        \\        { "datapoint_attribute": "value", "gt": 1000 }
+        \\      ],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.metric.match.items[0];
+    try std.testing.expect(matcher.match.? == .gt);
+    try std.testing.expect(matcher.match.?.gt.value.? == .int_value);
+    try std.testing.expectEqual(@as(i64, 1000), matcher.match.?.gt.value.?.int_value);
 }

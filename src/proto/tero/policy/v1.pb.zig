@@ -116,6 +116,220 @@ pub const AttributePath = struct {
     }
 };
 
+/// Value carries a typed, non-string scalar for the `equals` matcher. String
+/// equality is expressed with the `exact` match type, so this message
+/// intentionally has no string variant.
+///
+/// `equals` matches when the field value has the same type and value as the set
+/// variant. Integer and floating-point values are compared in a single numeric
+/// domain (an int_value may match a double field with an equal numeric value and
+/// vice versa). All other type pairings do not match.
+///
+/// YAML/JSON Unmarshaling:
+///
+/// Implementations MUST accept both the canonical proto form and scalar
+/// shorthand. For shorthand, the literal's type selects the variant:
+///
+/// equals: true   ->  bool_value
+/// equals: 200    ->  int_value
+/// equals: 0.5    ->  double_value
+///
+/// Bytes are authored either as proto-native base64 (`bytes_value`) or, more
+/// readably, as a lowercase-hex string (`hex_value`). The two are equivalent —
+/// hex_value is decoded to bytes at policy-compile time and yields the same bytes
+/// as the corresponding bytes_value — but hex_value keeps identifiers
+/// (trace/span ids) readable in the canonical proto/JSON form instead of base64.
+/// A bare string literal (e.g. `equals: "foo"`) MUST be rejected — use `exact`
+/// for strings.
+pub const Value = struct {
+    value: ?value_union = null,
+
+    pub const _value_case = enum {
+        bool_value,
+        int_value,
+        double_value,
+        bytes_value,
+        hex_value,
+    };
+    pub const value_union = union(_value_case) {
+        bool_value: bool,
+        int_value: i64,
+        double_value: f64,
+        bytes_value: []const u8,
+        hex_value: []const u8,
+        pub const _desc_table = .{
+            .bool_value = fd(1, .{ .scalar = .bool }),
+            .int_value = fd(2, .{ .scalar = .int64 }),
+            .double_value = fd(3, .{ .scalar = .double }),
+            .bytes_value = fd(4, .{ .scalar = .bytes }),
+            .hex_value = fd(5, .{ .scalar = .string }),
+        };
+    };
+
+    pub const _desc_table = .{
+        .value = fd(null, .{ .oneof = value_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
+/// NumericValue carries a typed number for the comparison matchers (`gt`, `gte`,
+/// `lt`, `lte`). It deliberately admits only int and double so that non-numeric
+/// comparisons (against a bool or bytes) are unrepresentable in the schema rather
+/// than rejected at compile time. int and double are compared in a single
+/// numeric domain, and int_value preserves full 64-bit precision for large
+/// integer fields (e.g. nanosecond timestamps) that a double cannot represent
+/// exactly.
+///
+/// YAML/JSON shorthand selects the variant from the literal's type:
+///
+/// gte: 500   ->  int_value
+/// lt: 0.5    ->  double_value
+pub const NumericValue = struct {
+    value: ?value_union = null,
+
+    pub const _value_case = enum {
+        int_value,
+        double_value,
+    };
+    pub const value_union = union(_value_case) {
+        int_value: i64,
+        double_value: f64,
+        pub const _desc_table = .{
+            .int_value = fd(1, .{ .scalar = .int64 }),
+            .double_value = fd(2, .{ .scalar = .double }),
+        };
+    };
+
+    pub const _desc_table = .{
+        .value = fd(null, .{ .oneof = value_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
 /// LogField identifies simple log fields (non-keyed).
 pub const LogField = enum(i32) {
     LOG_FIELD_UNSPECIFIED = 0,
@@ -341,6 +555,11 @@ pub const LogMatcher = struct {
         starts_with,
         ends_with,
         contains,
+        equals,
+        gt,
+        gte,
+        lt,
+        lte,
     };
     pub const match_union = union(_match_case) {
         exact: []const u8,
@@ -349,6 +568,11 @@ pub const LogMatcher = struct {
         starts_with: []const u8,
         ends_with: []const u8,
         contains: []const u8,
+        equals: Value,
+        gt: NumericValue,
+        gte: NumericValue,
+        lt: NumericValue,
+        lte: NumericValue,
         pub const _desc_table = .{
             .exact = fd(10, .{ .scalar = .string }),
             .regex = fd(11, .{ .scalar = .string }),
@@ -356,6 +580,11 @@ pub const LogMatcher = struct {
             .starts_with = fd(13, .{ .scalar = .string }),
             .ends_with = fd(14, .{ .scalar = .string }),
             .contains = fd(15, .{ .scalar = .string }),
+            .equals = fd(22, .submessage),
+            .gt = fd(23, .submessage),
+            .gte = fd(24, .submessage),
+            .lt = fd(25, .submessage),
+            .lte = fd(26, .submessage),
         };
     };
 
@@ -1039,6 +1268,11 @@ pub const MetricMatcher = struct {
         starts_with,
         ends_with,
         contains,
+        equals,
+        gt,
+        gte,
+        lt,
+        lte,
     };
     pub const match_union = union(_match_case) {
         exact: []const u8,
@@ -1047,6 +1281,11 @@ pub const MetricMatcher = struct {
         starts_with: []const u8,
         ends_with: []const u8,
         contains: []const u8,
+        equals: Value,
+        gt: NumericValue,
+        gte: NumericValue,
+        lt: NumericValue,
+        lte: NumericValue,
         pub const _desc_table = .{
             .exact = fd(10, .{ .scalar = .string }),
             .regex = fd(11, .{ .scalar = .string }),
@@ -1054,6 +1293,11 @@ pub const MetricMatcher = struct {
             .starts_with = fd(13, .{ .scalar = .string }),
             .ends_with = fd(14, .{ .scalar = .string }),
             .contains = fd(15, .{ .scalar = .string }),
+            .equals = fd(22, .submessage),
+            .gt = fd(23, .submessage),
+            .gte = fd(24, .submessage),
+            .lt = fd(25, .submessage),
+            .lte = fd(26, .submessage),
         };
     };
 
@@ -1304,6 +1548,11 @@ pub const TraceMatcher = struct {
         starts_with,
         ends_with,
         contains,
+        equals,
+        gt,
+        gte,
+        lt,
+        lte,
     };
     pub const match_union = union(_match_case) {
         exact: []const u8,
@@ -1312,6 +1561,11 @@ pub const TraceMatcher = struct {
         starts_with: []const u8,
         ends_with: []const u8,
         contains: []const u8,
+        equals: Value,
+        gt: NumericValue,
+        gte: NumericValue,
+        lt: NumericValue,
+        lte: NumericValue,
         pub const _desc_table = .{
             .exact = fd(10, .{ .scalar = .string }),
             .regex = fd(11, .{ .scalar = .string }),
@@ -1319,6 +1573,11 @@ pub const TraceMatcher = struct {
             .starts_with = fd(13, .{ .scalar = .string }),
             .ends_with = fd(14, .{ .scalar = .string }),
             .contains = fd(15, .{ .scalar = .string }),
+            .equals = fd(22, .submessage),
+            .gt = fd(23, .submessage),
+            .gte = fd(24, .submessage),
+            .lt = fd(25, .submessage),
+            .lte = fd(26, .submessage),
         };
     };
 

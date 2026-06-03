@@ -67,6 +67,10 @@ const MatcherNullField = struct { matcher_idx: usize };
 const MatcherNullMatch = struct { matcher_idx: usize };
 const MatcherEmptyRegex = struct { matcher_idx: usize };
 const MatcherDetail = struct { matcher_idx: usize, regex: []const u8, negate: bool };
+// v1.5.0: typed matchers (equals/gt/gte/lt/lte) are parsed but not yet
+// evaluated by the engine — they produce no Hyperscan patterns and never
+// match. The engine will gain typed comparison in the next PR.
+const TypedMatcherSkipped = struct { matcher_idx: usize };
 const PolicyStored = struct { id: []const u8, index: PolicyIndex, required_matches: u16, negated_count: u16 };
 
 // =============================================================================
@@ -751,6 +755,18 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => {},
             }
 
+            // Typed matchers (v1.5.0) are not yet evaluated by the engine.
+            // They parse correctly but produce no Hyperscan pattern, so a
+            // policy that uses only typed matchers will never fire. The engine
+            // gains typed comparison in the next PR.
+            switch (m) {
+                .equals, .gt, .gte, .lt, .lte => {
+                    self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                    return;
+                },
+                else => {},
+            }
+
             const pattern, const match_type, const negate = switch (m) {
                 .regex => |r| .{ r, MatchType.regex, matcher.negate },
                 .exact => |e| .{ e, MatchType.exact, matcher.negate },
@@ -758,6 +774,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .starts_with => |s| .{ s, MatchType.starts_with, matcher.negate },
                 .ends_with => |s| .{ s, MatchType.ends_with, matcher.negate },
                 .contains => |s| .{ s, MatchType.contains, matcher.negate },
+                .equals, .gt, .gte, .lt, .lte => unreachable,
             };
 
             if (pattern.len == 0) {
@@ -1473,6 +1490,7 @@ fn compilePatterns(allocator: std.mem.Allocator, collectors: []const PatternColl
             .exact => c.pattern.len + 2,
             .starts_with, .ends_with => c.pattern.len + 1,
             .exists => unreachable,
+            .equals, .gt, .gte, .lt, .lte => unreachable, // typed matchers never reach Hyperscan
         };
     }
 
@@ -1508,6 +1526,7 @@ fn formatPattern(buf: *[]u8, pattern: []const u8, match_type: MatchType) []const
         .ends_with => .{ false, true },
         .contains => return pattern,
         .exists => unreachable, // exists is dispatched outside the Hyperscan path
+        .equals, .gt, .gte, .lt, .lte => unreachable, // typed matchers never reach Hyperscan
     };
 
     const out = std.fmt.bufPrint(buf.*, "{s}{s}{s}", .{
