@@ -97,6 +97,7 @@ pub const TraceFieldRef = types.TraceFieldRef;
 pub const LogAccessor = types.LogAccessor;
 pub const MetricAccessor = types.MetricAccessor;
 pub const TraceAccessor = types.TraceAccessor;
+pub const TypedValue = types.TypedValue;
 pub const TelemetryType = types.TelemetryType;
 
 // =============================================================================
@@ -109,6 +110,9 @@ pub const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
 pub const LogMatcherKey = matcher_index.LogMatcherKey;
 pub const MetricMatcherKey = matcher_index.MetricMatcherKey;
 pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
+pub const CompiledValue = matcher_index.CompiledValue;
+pub const CompiledNumericValue = matcher_index.CompiledNumericValue;
+pub const CompiledTypedMatcher = matcher_index.CompiledTypedMatcher;
 
 // =============================================================================
 // Sampling and Rate Limiting

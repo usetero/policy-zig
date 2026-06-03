@@ -58,6 +58,7 @@ pub const TraceFieldRef = policy_types.TraceFieldRef;
 pub const LogAccessor = policy_types.LogAccessor;
 pub const MetricAccessor = policy_types.MetricAccessor;
 pub const TraceAccessor = policy_types.TraceAccessor;
+pub const TypedValue = policy_types.TypedValue;
 pub const TelemetryType = policy_types.TelemetryType;
 
 // Proto types
@@ -496,15 +497,53 @@ pub const PolicyEngine = struct {
             }
         }
 
+        // Typed checks (v1.5.0): evaluate equals/gt/gte/lt/lte against typed field
+        // values. These bypass Hyperscan entirely and are evaluated here after the
+        // scan loop. Counting follows the same convention as the scan loop:
+        //  - positive: +1 when the typed comparison fires
+        //  - negated:  the negated-init pass pre-seeded +1; decrement when the
+        //    comparison fires (negation failed), leave alone when it doesn't
+        //    (negation succeeded).
+        for (index.getTypedChecks()) |check| {
+            const typed_val: ?policy_types.TypedValue = if (comptime accessor.typed_value != null)
+                accessor.typed_value.?(ctx, check.field_ref)
+            else if (accessor.value(ctx, check.field_ref)) |s|
+                policy_types.TypedValue{ .string = s }
+            else
+                null;
+
+            const fired = check.matcher.evaluate(typed_val);
+
+            if (check.negate) {
+                if (fired) {
+                    state.match_counts[check.policy_index] -= 1;
+                }
+            } else if (fired) {
+                state.match_counts[check.policy_index] += 1;
+            }
+
+            if (!state.is_active[check.policy_index]) {
+                state.is_active[check.policy_index] = true;
+                state.active_policies[state.active_count] = check.policy_index;
+                state.active_count += 1;
+            }
+        }
+
         // Sort active policies by index so iteration order = alphanumeric policy ID order.
         // Policy indices are assigned from an ID-sorted policies_slice in createSnapshot.
         // This sorts only the active set (typically 3-5 elements), not all policies.
         std.mem.sort(PolicyIndex, state.active_policies[0..state.active_count], {}, std.sort.asc(PolicyIndex));
     }
 
-    /// Get sampling input bytes for probabilistic sampling.
-    /// - Traces: raw trace ID bytes from the trace accessor.
-    /// - Logs with sample_key: sample key field value from the log accessor.
+    /// Get raw bytes for probabilistic sampling.
+    ///
+    /// Prefers `accessor.typed_value` to get `TypedValue.bytes` directly —
+    /// the sampler expects raw bytes and no longer accepts hex-encoded strings.
+    /// Falls back to `accessor.value` (treating the result as raw bytes) when
+    /// `typed_value` is not wired or returns a non-bytes variant.
+    ///
+    /// - Traces: `TRACE_FIELD_TRACE_ID` raw bytes (16 bytes per OTel spec).
+    /// - Logs with sample_key: sample key field value as raw bytes.
     /// - Otherwise: null (falls through to non-percentage keep handling).
     inline fn getSamplingInput(
         comptime T: TelemetryType,
@@ -514,10 +553,20 @@ pub const PolicyEngine = struct {
     ) ?[]const u8 {
         if (T == .trace) {
             const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
+            if (comptime accessor.typed_value != null) {
+                if (accessor.typed_value.?(ctx, trace_id_ref)) |tv| {
+                    if (tv == .bytes) return tv.bytes;
+                }
+            }
             return accessor.value(ctx, trace_id_ref);
         } else if (T == .log) {
             if (policy_info.sample_key) |sample_key| {
                 if (FieldRef.fromSampleKeyField(sample_key.field)) |field_ref| {
+                    if (comptime accessor.typed_value != null) {
+                        if (accessor.typed_value.?(ctx, field_ref)) |tv| {
+                            if (tv == .bytes) return tv.bytes;
+                        }
+                    }
                     return accessor.value(ctx, field_ref);
                 }
             }
@@ -1695,6 +1744,378 @@ const MutableTestLogContext = struct {
         .move = accessorMove,
     };
 };
+
+// =============================================================================
+// TypedLogContext - log context that exposes typed attribute values
+// =============================================================================
+
+/// A log record whose attributes are typed scalars (int/double/bool/string).
+/// Used by typed matcher tests to verify equals/gt/gte/lt/lte evaluation.
+const TypedAttrValue = union(enum) {
+    string: []const u8,
+    int: i64,
+    double: f64,
+    bool: bool,
+};
+
+const TypedLogContext = struct {
+    attrs: std.StringHashMap(TypedAttrValue),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) TypedLogContext {
+        return .{
+            .attrs = std.StringHashMap(TypedAttrValue).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *TypedLogContext) void {
+        self.attrs.deinit();
+    }
+
+    fn withInt(self: *TypedLogContext, key: []const u8, v: i64) !*TypedLogContext {
+        try self.attrs.put(key, .{ .int = v });
+        return self;
+    }
+
+    fn withDouble(self: *TypedLogContext, key: []const u8, v: f64) !*TypedLogContext {
+        try self.attrs.put(key, .{ .double = v });
+        return self;
+    }
+
+    fn withBool(self: *TypedLogContext, key: []const u8, v: bool) !*TypedLogContext {
+        try self.attrs.put(key, .{ .bool = v });
+        return self;
+    }
+
+    fn withString(self: *TypedLogContext, key: []const u8, v: []const u8) !*TypedLogContext {
+        try self.attrs.put(key, .{ .string = v });
+        return self;
+    }
+
+    fn attrKey(field: FieldRef) ?[]const u8 {
+        return switch (field) {
+            .log_attribute => |p| if (p.path.items.len > 0) p.path.items[0] else null,
+            else => null,
+        };
+    }
+
+    fn fieldValue(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
+        const self: *const TypedLogContext = @ptrCast(@alignCast(ctx_ptr));
+        const key = attrKey(field) orelse return null;
+        return switch (self.attrs.get(key) orelse return null) {
+            .string => |s| s,
+            else => null, // non-string → null for string-match path
+        };
+    }
+
+    fn fieldTypedValue(ctx_ptr: *const anyopaque, field: FieldRef) ?TypedValue {
+        const self: *const TypedLogContext = @ptrCast(@alignCast(ctx_ptr));
+        const key = attrKey(field) orelse return null;
+        return switch (self.attrs.get(key) orelse return null) {
+            .string => |s| TypedValue{ .string = s },
+            .int => |i| TypedValue{ .int = i },
+            .double => |d| TypedValue{ .double = d },
+            .bool => |b| TypedValue{ .bool = b },
+        };
+    }
+
+    pub const accessor: LogAccessor = .{
+        .value = fieldValue,
+        .typed_value = fieldTypedValue,
+    };
+};
+
+// =============================================================================
+// Typed matcher engine tests (v1.5.0)
+// =============================================================================
+
+fn makeLogTypedPolicy(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    attr_key: []const u8,
+    match: proto.policy.LogMatcher.match_union,
+    keep: []const u8,
+) !Policy {
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, attr_key));
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, id),
+        .name = try allocator.dupe(u8, id),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, keep),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = attr_path },
+        .match = match,
+    });
+    return policy;
+}
+
+test "typed: equals int match and miss" {
+    const allocator = testing.allocator;
+
+    const nv = proto.policy.Value{ .value = .{ .int_value = 200 } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-200", "status", .{ .equals = nv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+
+    _ = try ctx.withInt("status", 200);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx, &policy_id_buf, .{}).decision);
+
+    var ctx2 = TypedLogContext.init(allocator);
+    defer ctx2.deinit();
+    _ = try ctx2.withInt("status", 404);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx2, &policy_id_buf, .{}).decision);
+}
+
+test "typed: equals bool match and miss" {
+    const allocator = testing.allocator;
+
+    const bv = proto.policy.Value{ .value = .{ .bool_value = true } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-cache-hits", "cache.hit", .{ .equals = bv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx_hit = TypedLogContext.init(allocator);
+    defer ctx_hit.deinit();
+    _ = try ctx_hit.withBool("cache.hit", true);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx_hit, &policy_id_buf, .{}).decision);
+
+    var ctx_miss = TypedLogContext.init(allocator);
+    defer ctx_miss.deinit();
+    _ = try ctx_miss.withBool("cache.hit", false);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx_miss, &policy_id_buf, .{}).decision);
+}
+
+test "typed: gte int match and miss" {
+    const allocator = testing.allocator;
+
+    const nv = proto.policy.NumericValue{ .value = .{ .int_value = 500 } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-errors", "status", .{ .gte = nv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx500 = TypedLogContext.init(allocator);
+    defer ctx500.deinit();
+    _ = try ctx500.withInt("status", 500);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx500, &policy_id_buf, .{}).decision);
+
+    var ctx503 = TypedLogContext.init(allocator);
+    defer ctx503.deinit();
+    _ = try ctx503.withInt("status", 503);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx503, &policy_id_buf, .{}).decision);
+
+    var ctx499 = TypedLogContext.init(allocator);
+    defer ctx499.deinit();
+    _ = try ctx499.withInt("status", 499);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx499, &policy_id_buf, .{}).decision);
+}
+
+test "typed: lt double match and miss" {
+    const allocator = testing.allocator;
+
+    const nv = proto.policy.NumericValue{ .value = .{ .double_value = 0.1 } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-fast", "duration_s", .{ .lt = nv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx_fast = TypedLogContext.init(allocator);
+    defer ctx_fast.deinit();
+    _ = try ctx_fast.withDouble("duration_s", 0.05);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx_fast, &policy_id_buf, .{}).decision);
+
+    var ctx_slow = TypedLogContext.init(allocator);
+    defer ctx_slow.deinit();
+    _ = try ctx_slow.withDouble("duration_s", 0.1);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx_slow, &policy_id_buf, .{}).decision);
+}
+
+test "typed: range AND logic (gte 200 AND lt 400)" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-success"),
+        .name = try allocator.dupe(u8, "drop-success"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    {
+        var attr = proto.policy.AttributePath{};
+        try attr.path.append(allocator, try allocator.dupe(u8, "status"));
+        try policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_attribute = attr },
+            .match = .{ .gte = .{ .value = .{ .int_value = 200 } } },
+        });
+    }
+    {
+        var attr = proto.policy.AttributePath{};
+        try attr.path.append(allocator, try allocator.dupe(u8, "status"));
+        try policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_attribute = attr },
+            .match = .{ .lt = .{ .value = .{ .int_value = 400 } } },
+        });
+    }
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx200 = TypedLogContext.init(allocator);
+    defer ctx200.deinit();
+    _ = try ctx200.withInt("status", 200);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx200, &policy_id_buf, .{}).decision);
+
+    var ctx301 = TypedLogContext.init(allocator);
+    defer ctx301.deinit();
+    _ = try ctx301.withInt("status", 301);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx301, &policy_id_buf, .{}).decision);
+
+    var ctx400 = TypedLogContext.init(allocator);
+    defer ctx400.deinit();
+    _ = try ctx400.withInt("status", 400);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx400, &policy_id_buf, .{}).decision);
+
+    var ctx500 = TypedLogContext.init(allocator);
+    defer ctx500.deinit();
+    _ = try ctx500.withInt("status", 500);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx500, &policy_id_buf, .{}).decision);
+}
+
+test "typed: type mismatch is non-match" {
+    const allocator = testing.allocator;
+
+    // int matcher, string field value → non-match
+    const nv = proto.policy.Value{ .value = .{ .int_value = 200 } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-200", "status", .{ .equals = nv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("status", "200");
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx, &policy_id_buf, .{}).decision);
+}
+
+test "typed: numeric cross-domain int equals double" {
+    const allocator = testing.allocator;
+
+    // int_value: 5 should match a double field with value 5.0
+    const nv = proto.policy.Value{ .value = .{ .int_value = 5 } };
+    var policy = try makeLogTypedPolicy(allocator, "match-five", "x", .{ .equals = nv }, "all");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withDouble("x", 5.0);
+    try testing.expectEqual(FilterDecision.keep, engine.evaluate(.log, &TypedLogContext.accessor, &ctx, &policy_id_buf, .{}).decision);
+}
+
+test "typed: negated equals" {
+    const allocator = testing.allocator;
+
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "status"));
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-non-200"),
+        .name = try allocator.dupe(u8, "drop-non-200"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = attr_path },
+        .match = .{ .equals = .{ .value = .{ .int_value = 200 } } },
+        .negate = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // status=200: negated equals fires (200==200) → policy disqualified → no match
+    var ctx200 = TypedLogContext.init(allocator);
+    defer ctx200.deinit();
+    _ = try ctx200.withInt("status", 200);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &TypedLogContext.accessor, &ctx200, &policy_id_buf, .{}).decision);
+
+    // status=500: negated equals does not fire (500≠200) → policy matches → drop
+    var ctx500 = TypedLogContext.init(allocator);
+    defer ctx500.deinit();
+    _ = try ctx500.withInt("status", 500);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &TypedLogContext.accessor, &ctx500, &policy_id_buf, .{}).decision);
+}
 
 test "evaluate: policy with keep=all and no transform" {
     const allocator = testing.allocator;
@@ -4107,6 +4528,8 @@ test "MetricPolicyEngine: scope_version matching" {
 /// Test context for trace policy evaluation tests
 const TestTraceContext = struct {
     name: ?[]const u8 = null,
+    /// Raw bytes (16) or null. The `typed_value` accessor returns this as
+    /// `TypedValue.bytes` so the sampler gets raw bytes directly.
     trace_id: ?[]const u8 = null,
     span_id: ?[]const u8 = null,
     trace_state: ?[]const u8 = null,
@@ -4121,9 +4544,22 @@ const TestTraceContext = struct {
         return switch (field) {
             .trace_field => |tf| switch (tf) {
                 .TRACE_FIELD_NAME => self.name,
-                .TRACE_FIELD_TRACE_ID => self.trace_id,
                 .TRACE_FIELD_SPAN_ID => self.span_id,
                 .TRACE_FIELD_TRACE_STATE => self.trace_state,
+                // trace_id is bytes — return null from the string path so
+                // string matchers don't fire on it; sampling uses typed_value.
+                .TRACE_FIELD_TRACE_ID => null,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    pub fn typedFieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?TypedValue {
+        const self: *const TestTraceContext = @ptrCast(@alignCast(ctx_ptr));
+        return switch (field) {
+            .trace_field => |tf| switch (tf) {
+                .TRACE_FIELD_TRACE_ID => if (self.trace_id) |id| TypedValue{ .bytes = id } else null,
                 else => null,
             },
             else => null,
@@ -4144,6 +4580,7 @@ const TestTraceContext = struct {
 
     pub const accessor: TraceAccessor = .{
         .value = fieldAccessor,
+        .typed_value = typedFieldAccessor,
         .set = accessorSet,
     };
 };
@@ -4491,64 +4928,4 @@ test "PolicyEngine: mixed signal policies scope stats to own signal type" {
     // Policy 2 (drop-health-spans): should have exactly 1 hit from the trace eval
     const trace_stats = snapshot.getStats(2).?;
     try testing.expectEqual(@as(i64, 1), trace_stats.hits.load(.monotonic));
-}
-
-test "PolicyEngine: hex trace_id (protojson) sampling produces same decision as binary" {
-    const allocator = testing.allocator;
-
-    // Create a trace policy with 50% sampling
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "trace-hex-sample"),
-        .name = try allocator.dupe(u8, "hex-sample-50"),
-        .enabled = true,
-        .target = .{ .trace = .{
-            .keep = .{ .percentage = 50.0 },
-        } },
-    };
-    try policy.target.?.trace.match.append(allocator, .{
-        .field = .{ .trace_field = .TRACE_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, ".+") },
-    });
-    defer policy.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, "test", .file);
-
-    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
-    var policy_id_buf: [16][]const u8 = undefined;
-
-    // Binary trace ID with high randomness bytes (last 7 bytes = 0xFF) → keep
-    var bin_keep_ctx = TestTraceContext{
-        .name = "test-span",
-        .trace_id = &[16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
-    };
-    // Hex encoding of the same trace ID (as protojson would provide)
-    var hex_keep_ctx = TestTraceContext{
-        .name = "test-span",
-        .trace_id = "010203040506070809ffffffffffffff",
-    };
-
-    const bin_keep = engine.evaluate(.trace, &TestTraceContext.accessor, &bin_keep_ctx, &policy_id_buf, .{});
-    const hex_keep = engine.evaluate(.trace, &TestTraceContext.accessor, &hex_keep_ctx, &policy_id_buf, .{});
-    try testing.expectEqual(bin_keep.decision, hex_keep.decision);
-    try testing.expectEqual(FilterDecision.keep, hex_keep.decision);
-
-    // Binary trace ID with low randomness bytes (last 7 bytes = 0x00) → drop
-    var bin_drop_ctx = TestTraceContext{
-        .name = "test-span",
-        .trace_id = &[16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    };
-    // Hex encoding of the same trace ID
-    var hex_drop_ctx = TestTraceContext{
-        .name = "test-span",
-        .trace_id = "01020304050607080900000000000000",
-    };
-
-    const bin_drop = engine.evaluate(.trace, &TestTraceContext.accessor, &bin_drop_ctx, &policy_id_buf, .{});
-    const hex_drop = engine.evaluate(.trace, &TestTraceContext.accessor, &hex_drop_ctx, &policy_id_buf, .{});
-    try testing.expectEqual(bin_drop.decision, hex_drop.decision);
-    try testing.expectEqual(FilterDecision.drop, hex_drop.decision);
 }

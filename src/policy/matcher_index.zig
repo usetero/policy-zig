@@ -395,6 +395,163 @@ pub const ExistsEntry = struct {
 };
 
 // =============================================================================
+// Typed Matcher Types (v1.5.0)
+// =============================================================================
+
+/// Compiled non-string scalar for the `equals` matcher.
+/// `bytes` owns its memory — freed when the parent index is deinitialized.
+pub const CompiledValue = union(enum) {
+    bool: bool,
+    int: i64,
+    double: f64,
+    bytes: []const u8,
+};
+
+/// Compiled numeric value for `gt`/`gte`/`lt`/`lte` matchers.
+pub const CompiledNumericValue = union(enum) {
+    int: i64,
+    double: f64,
+};
+
+/// Compiled form of a typed matcher. The enum tag encodes the operator.
+pub const CompiledTypedMatcher = union(enum) {
+    equals: CompiledValue,
+    gt: CompiledNumericValue,
+    gte: CompiledNumericValue,
+    lt: CompiledNumericValue,
+    lte: CompiledNumericValue,
+
+    /// Evaluate this typed matcher against a field value.
+    /// Returns true when the matcher fires (before applying `negate`).
+    /// Type mismatch is always a non-match (fail-open, never an error).
+    pub fn evaluate(self: CompiledTypedMatcher, field_value: ?policy_types.TypedValue) bool {
+        const fv = field_value orelse return false;
+        return switch (self) {
+            .equals => |expected| switch (expected) {
+                .bool => |e| switch (fv) {
+                    .bool => |a| e == a,
+                    else => false,
+                },
+                .int => |e| switch (fv) {
+                    .int => |a| e == a,
+                    .double => |a| @as(f64, @floatFromInt(e)) == a,
+                    else => false,
+                },
+                .double => |e| switch (fv) {
+                    .double => |a| e == a,
+                    .int => |a| e == @as(f64, @floatFromInt(a)),
+                    else => false,
+                },
+                .bytes => |e| switch (fv) {
+                    .bytes => |a| std.mem.eql(u8, e, a),
+                    else => false,
+                },
+            },
+            .gt => |t| compareNumeric(fv, t, std.math.Order.gt),
+            .gte => |t| compareNumericGte(fv, t),
+            .lt => |t| compareNumeric(fv, t, std.math.Order.lt),
+            .lte => |t| compareNumericLte(fv, t),
+        };
+    }
+};
+
+fn compareNumeric(fv: policy_types.TypedValue, threshold: CompiledNumericValue, order: std.math.Order) bool {
+    const field_f64: f64 = switch (fv) {
+        .int => |i| @floatFromInt(i),
+        .double => |d| d,
+        else => return false,
+    };
+    const threshold_f64: f64 = switch (threshold) {
+        .int => |i| @floatFromInt(i),
+        .double => |d| d,
+    };
+    const cmp = std.math.order(field_f64, threshold_f64);
+    return cmp == order;
+}
+
+fn compareNumericGte(fv: policy_types.TypedValue, threshold: CompiledNumericValue) bool {
+    const field_f64: f64 = switch (fv) {
+        .int => |i| @floatFromInt(i),
+        .double => |d| d,
+        else => return false,
+    };
+    const threshold_f64: f64 = switch (threshold) {
+        .int => |i| @floatFromInt(i),
+        .double => |d| d,
+    };
+    return field_f64 >= threshold_f64;
+}
+
+fn compareNumericLte(fv: policy_types.TypedValue, threshold: CompiledNumericValue) bool {
+    const field_f64: f64 = switch (fv) {
+        .int => |i| @floatFromInt(i),
+        .double => |d| d,
+        else => return false,
+    };
+    const threshold_f64: f64 = switch (threshold) {
+        .int => |i| @floatFromInt(i),
+        .double => |d| d,
+    };
+    return field_f64 <= threshold_f64;
+}
+
+/// A compiled typed check stored in the matcher index.
+/// Field type is signal-specific — the index builder instantiates one
+/// `CompiledTypedCheck` type per telemetry type via comptime.
+pub fn TypedCheckType(comptime T: TelemetryType) type {
+    return struct {
+        policy_index: PolicyIndex,
+        field_ref: FieldRefType(T),
+        matcher: CompiledTypedMatcher,
+        negate: bool,
+    };
+}
+
+/// Compile a proto `Value` to a `CompiledValue`.
+/// The parser already decoded hex_value → bytes_value, so we only see
+/// bool/int/double/bytes at compile time. Returns null on unset or invalid.
+fn compileValue(allocator: std.mem.Allocator, v: proto.policy.Value) !?CompiledValue {
+    const inner = v.value orelse return null;
+    return switch (inner) {
+        .bool_value => |b| .{ .bool = b },
+        .int_value => |i| .{ .int = i },
+        .double_value => |d| .{ .double = d },
+        .bytes_value => |b| .{ .bytes = try allocator.dupe(u8, b) },
+        // hex_value should have been decoded by the parser; if it reaches here
+        // (e.g. via raw protobuf), decode it now.
+        .hex_value => |h| blk: {
+            if (h.len % 2 != 0) return null;
+            const bytes = try allocator.alloc(u8, h.len / 2);
+            errdefer allocator.free(bytes);
+            for (0..bytes.len) |i| {
+                const hi = hexNibble(h[i * 2]) orelse return null;
+                const lo = hexNibble(h[i * 2 + 1]) orelse return null;
+                bytes[i] = (hi << 4) | lo;
+            }
+            break :blk .{ .bytes = bytes };
+        },
+    };
+}
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Compile a proto `NumericValue`. Returns null when unset.
+fn compileNumericValue(v: proto.policy.NumericValue) ?CompiledNumericValue {
+    const inner = v.value orelse return null;
+    return switch (inner) {
+        .int_value => |i| .{ .int = i },
+        .double_value => |d| .{ .double = d },
+    };
+}
+
+// =============================================================================
 // ScanResult - Result of scanning a value
 // =============================================================================
 
@@ -622,6 +779,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
     const TargetT = TargetType(T);
     const HashContextT = HashContextType(T);
     const IndexT = MatcherIndexType(T);
+    const TypedCheckT = TypedCheckType(T);
 
     return struct {
         allocator: std.mem.Allocator,
@@ -629,6 +787,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         bus: *EventBus,
         patterns_by_key: std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage),
         policy_info_list: std.ArrayListUnmanaged(PolicyInfo),
+        typed_checks_list: std.ArrayListUnmanaged(TypedCheckT),
         path_storage: std.ArrayListUnmanaged([]const []const u8),
         policy_id_storage: std.ArrayListUnmanaged([]const u8),
         policy_index: PolicyIndex,
@@ -644,6 +803,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .bus = bus,
                 .patterns_by_key = std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage).init(temp_allocator),
                 .policy_info_list = .{},
+                .typed_checks_list = .{},
                 .path_storage = .{},
                 .policy_id_storage = .{},
                 .policy_index = 0,
@@ -755,13 +915,85 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => {},
             }
 
-            // Typed matchers (v1.5.0) are not yet evaluated by the engine.
-            // They parse correctly but produce no Hyperscan pattern, so a
-            // policy that uses only typed matchers will never fire. The engine
-            // gains typed comparison in the next PR.
+            // Typed matchers (v1.5.0): compile the value/threshold and append
+            // to typed_checks_list. They bypass Hyperscan entirely; the engine
+            // evaluates them in a separate loop via the accessor.typed_value
+            // primitive. An invalid/unset value is silently dropped (fail-open).
             switch (m) {
-                .equals, .gt, .gte, .lt, .lte => {
-                    self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                .equals => |v| {
+                    const compiled = (try compileValue(self.allocator, v)) orelse {
+                        self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                        return;
+                    };
+                    // typed checks count toward required_match_count so the
+                    // policy's match threshold is still enforced.
+                    if (matcher.negate) {
+                        self.current_negated_count += 1;
+                    } else {
+                        self.current_positive_count += 1;
+                    }
+                    try self.typed_checks_list.append(self.allocator, .{
+                        .policy_index = self.policy_index,
+                        .field_ref = field_ref,
+                        .matcher = .{ .equals = compiled },
+                        .negate = matcher.negate,
+                    });
+                    return;
+                },
+                .gt => |v| {
+                    const compiled = compileNumericValue(v) orelse {
+                        self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                        return;
+                    };
+                    if (matcher.negate) self.current_negated_count += 1 else self.current_positive_count += 1;
+                    try self.typed_checks_list.append(self.allocator, .{
+                        .policy_index = self.policy_index,
+                        .field_ref = field_ref,
+                        .matcher = .{ .gt = compiled },
+                        .negate = matcher.negate,
+                    });
+                    return;
+                },
+                .gte => |v| {
+                    const compiled = compileNumericValue(v) orelse {
+                        self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                        return;
+                    };
+                    if (matcher.negate) self.current_negated_count += 1 else self.current_positive_count += 1;
+                    try self.typed_checks_list.append(self.allocator, .{
+                        .policy_index = self.policy_index,
+                        .field_ref = field_ref,
+                        .matcher = .{ .gte = compiled },
+                        .negate = matcher.negate,
+                    });
+                    return;
+                },
+                .lt => |v| {
+                    const compiled = compileNumericValue(v) orelse {
+                        self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                        return;
+                    };
+                    if (matcher.negate) self.current_negated_count += 1 else self.current_positive_count += 1;
+                    try self.typed_checks_list.append(self.allocator, .{
+                        .policy_index = self.policy_index,
+                        .field_ref = field_ref,
+                        .matcher = .{ .lt = compiled },
+                        .negate = matcher.negate,
+                    });
+                    return;
+                },
+                .lte => |v| {
+                    const compiled = compileNumericValue(v) orelse {
+                        self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                        return;
+                    };
+                    if (matcher.negate) self.current_negated_count += 1 else self.current_positive_count += 1;
+                    try self.typed_checks_list.append(self.allocator, .{
+                        .policy_index = self.policy_index,
+                        .field_ref = field_ref,
+                        .matcher = .{ .lte = compiled },
+                        .negate = matcher.negate,
+                    });
                     return;
                 },
                 else => {},
@@ -1024,6 +1256,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
 
             const matcher_keys = try self.allocator.dupe(MatcherKeyT, keys_list.items);
+            const typed_checks = try self.allocator.dupe(TypedCheckT, self.typed_checks_list.items);
+            // Free the builder's backing storage; the items are now in `typed_checks`.
+            self.typed_checks_list.deinit(self.allocator);
 
             return IndexT{
                 .allocator = self.allocator,
@@ -1031,6 +1266,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .policies = policies,
                 .policies_with_negation = policies_with_negation,
                 .matcher_keys = matcher_keys,
+                .typed_checks = typed_checks,
                 .path_storage = self.path_storage,
                 .policy_id_storage = self.policy_id_storage,
                 .bus = self.bus,
@@ -1049,6 +1285,7 @@ pub const LogMatcherIndex = struct {
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
     matcher_keys: []LogMatcherKey,
+    typed_checks: []TypedCheckType(.log),
     path_storage: std.ArrayListUnmanaged([]const []const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
@@ -1110,10 +1347,12 @@ pub const LogMatcherIndex = struct {
         return self.policies_with_negation;
     }
 
+    pub fn getTypedChecks(self: *const Self) []const TypedCheckType(.log) {
+        return self.typed_checks;
+    }
+
     pub fn isEmpty(self: *const Self) bool {
-        // Either Hyperscan-backed value matchers or exists-bucket matchers
-        // make the index non-empty; both feed evaluation.
-        return self.matcher_keys.len == 0;
+        return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const Self) usize {
@@ -1143,11 +1382,20 @@ pub const LogMatcherIndex = struct {
         }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
-        // Free exists-entry slices owned by each matcher key.
         for (self.matcher_keys) |key| {
             if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
         }
         self.allocator.free(self.matcher_keys);
+
+        // Free bytes owned by typed checks
+        for (self.typed_checks) |check| {
+            if (check.matcher == .equals) {
+                if (check.matcher.equals == .bytes) {
+                    self.allocator.free(check.matcher.equals.bytes);
+                }
+            }
+        }
+        self.allocator.free(self.typed_checks);
 
         for (self.path_storage.items) |path| {
             for (path) |segment| {
@@ -1174,6 +1422,7 @@ pub const MetricMatcherIndex = struct {
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
     matcher_keys: []MetricMatcherKey,
+    typed_checks: []TypedCheckType(.metric),
     path_storage: std.ArrayListUnmanaged([]const []const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
@@ -1235,10 +1484,12 @@ pub const MetricMatcherIndex = struct {
         return self.policies_with_negation;
     }
 
+    pub fn getTypedChecks(self: *const Self) []const TypedCheckType(.metric) {
+        return self.typed_checks;
+    }
+
     pub fn isEmpty(self: *const Self) bool {
-        // Either Hyperscan-backed value matchers or exists-bucket matchers
-        // make the index non-empty; both feed evaluation.
-        return self.matcher_keys.len == 0;
+        return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const Self) usize {
@@ -1257,7 +1508,6 @@ pub const MetricMatcherIndex = struct {
         }
         self.databases.deinit();
 
-        // Free rate limiters
         for (self.policies) |policy_info| {
             if (policy_info.rate_limiter) |rl| {
                 self.allocator.destroy(rl);
@@ -1265,11 +1515,19 @@ pub const MetricMatcherIndex = struct {
         }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
-        // Free exists-entry slices owned by each matcher key.
         for (self.matcher_keys) |key| {
             if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
         }
         self.allocator.free(self.matcher_keys);
+
+        for (self.typed_checks) |check| {
+            if (check.matcher == .equals) {
+                if (check.matcher.equals == .bytes) {
+                    self.allocator.free(check.matcher.equals.bytes);
+                }
+            }
+        }
+        self.allocator.free(self.typed_checks);
 
         for (self.path_storage.items) |path| {
             for (path) |segment| {
@@ -1296,6 +1554,7 @@ pub const TraceMatcherIndex = struct {
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
     matcher_keys: []TraceMatcherKey,
+    typed_checks: []TypedCheckType(.trace),
     path_storage: std.ArrayListUnmanaged([]const []const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
@@ -1357,10 +1616,12 @@ pub const TraceMatcherIndex = struct {
         return self.policies_with_negation;
     }
 
+    pub fn getTypedChecks(self: *const Self) []const TypedCheckType(.trace) {
+        return self.typed_checks;
+    }
+
     pub fn isEmpty(self: *const Self) bool {
-        // Either Hyperscan-backed value matchers or exists-bucket matchers
-        // make the index non-empty; both feed evaluation.
-        return self.matcher_keys.len == 0;
+        return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const Self) usize {
@@ -1379,7 +1640,6 @@ pub const TraceMatcherIndex = struct {
         }
         self.databases.deinit();
 
-        // Free rate limiters
         for (self.policies) |policy_info| {
             if (policy_info.rate_limiter) |rl| {
                 self.allocator.destroy(rl);
@@ -1387,11 +1647,19 @@ pub const TraceMatcherIndex = struct {
         }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
-        // Free exists-entry slices owned by each matcher key.
         for (self.matcher_keys) |key| {
             if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
         }
         self.allocator.free(self.matcher_keys);
+
+        for (self.typed_checks) |check| {
+            if (check.matcher == .equals) {
+                if (check.matcher.equals == .bytes) {
+                    self.allocator.free(check.matcher.equals.bytes);
+                }
+            }
+        }
+        self.allocator.free(self.typed_checks);
 
         for (self.path_storage.items) |path| {
             for (path) |segment| {
