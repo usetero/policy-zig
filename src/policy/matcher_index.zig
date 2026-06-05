@@ -802,10 +802,10 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .temp_allocator = temp_allocator,
                 .bus = bus,
                 .patterns_by_key = std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage).init(temp_allocator),
-                .policy_info_list = .{},
-                .typed_checks_list = .{},
-                .path_storage = .{},
-                .policy_id_storage = .{},
+                .policy_info_list = .empty,
+                .typed_checks_list = .empty,
+                .path_storage = .empty,
+                .policy_id_storage = .empty,
                 .policy_index = 0,
                 .current_positive_count = 0,
                 .current_negated_count = 0,
@@ -1048,7 +1048,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const gop = try self.patterns_by_key.getOrPut(key);
             if (!gop.found_existing) {
                 try self.dupeKeyIfNeeded(gop.key_ptr, field_ref);
-                gop.value_ptr.* = .{ .positive = .{}, .negated = .{}, .exists = .{} };
+                gop.value_ptr.* = .{ .positive = .empty, .negated = .empty, .exists = .empty };
             }
 
             const collector = PatternCollector{
@@ -1078,7 +1078,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const gop = try self.patterns_by_key.getOrPut(key);
             if (!gop.found_existing) {
                 try self.dupeKeyIfNeeded(gop.key_ptr, field_ref);
-                gop.value_ptr.* = .{ .positive = .{}, .negated = .{}, .exists = .{} };
+                gop.value_ptr.* = .{ .positive = .empty, .negated = .empty, .exists = .empty };
             }
 
             try gop.value_ptr.exists.append(self.temp_allocator, .{
@@ -1108,7 +1108,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         fn dupeFieldRef(comptime FieldRefTT: type, field_ref: FieldRefTT, path_copy: []const []const u8) FieldRefTT {
             // Create an AttributePath with the copied path segments
             // Cast is safe because we own these allocations and they won't be mutated
-            const attr_path = AttributePath{ .path = .{ .items = @constCast(path_copy) } };
+            const attr_path = AttributePath{ .path = .{ .items = @constCast(path_copy), .capacity = path_copy.len } };
 
             switch (T) {
                 .log => return switch (field_ref) {
@@ -1144,12 +1144,12 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const rate_limiter: ?*RateLimiter = switch (keep) {
                 .per_second => |rl_params| blk: {
                     const rl = try self.allocator.create(RateLimiter);
-                    rl.* = RateLimiter.init(rl_params.count, rl_params.duration * 1_000);
+                    rl.* = RateLimiter.init(self.bus.io, rl_params.count, rl_params.duration * 1_000);
                     break :blk rl;
                 },
                 .per_minute => |rl_params| blk: {
                     const rl = try self.allocator.create(RateLimiter);
-                    rl.* = RateLimiter.init(rl_params.count, rl_params.duration * 60_000);
+                    rl.* = RateLimiter.init(self.bus.io, rl_params.count, rl_params.duration * 60_000);
                     break :blk rl;
                 },
                 else => null,
@@ -1210,7 +1210,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         fn finish(self: *Self) !IndexT {
             const policies = try self.allocator.dupe(PolicyInfo, self.policy_info_list.items);
 
-            var negation_indices = std.ArrayListUnmanaged(PolicyIndex){};
+            var negation_indices = std.ArrayListUnmanaged(PolicyIndex).empty;
             for (policies) |p| {
                 if (p.negated_count > 0) {
                     try negation_indices.append(self.temp_allocator, p.index);
@@ -1219,7 +1219,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const policies_with_negation = try self.allocator.dupe(PolicyIndex, negation_indices.items);
 
             var databases = std.HashMap(MatcherKeyT, *MatcherDatabase, HashContextT, std.hash_map.default_max_load_percentage).init(self.allocator);
-            var keys_list = std.ArrayListUnmanaged(MatcherKeyT){};
+            var keys_list = std.ArrayListUnmanaged(MatcherKeyT).empty;
 
             var key_it = self.patterns_by_key.iterator();
             while (key_it.next()) |entry| {
@@ -1817,9 +1817,9 @@ test "LogMatcherKey: hash and equality" {
     const key1 = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
     const key2 = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
     const key3 = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT } };
-    const key4 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } } };
-    const key5 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } } };
-    const key6 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}) } } } };
+    const key4 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}), .capacity = 1 } } } };
+    const key5 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}), .capacity = 1 } } } };
+    const key6 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}), .capacity = 1 } } } };
 
     try testing.expect(key1.eql(key2));
     try testing.expect(key4.eql(key5));
@@ -1829,9 +1829,9 @@ test "LogMatcherKey: hash and equality" {
     try testing.expectEqual(key4.hash(), key5.hash());
 
     // Test nested paths
-    const key7 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) } } } };
-    const key8 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) } } } };
-    const key9 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "status" }) } } } };
+    const key7 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }), .capacity = 2 } } } };
+    const key8 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }), .capacity = 2 } } } };
+    const key9 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "status" }), .capacity = 2 } } } };
 
     try testing.expect(key7.eql(key8));
     try testing.expect(!key7.eql(key9));
@@ -1842,9 +1842,9 @@ test "MetricMatcherKey: hash and equality" {
     const key1 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key2 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key3 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_UNIT } };
-    const key4 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"status"}) } } } };
-    const key5 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"status"}) } } } };
-    const key6 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}) } } } };
+    const key4 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"status"}), .capacity = 1 } } } };
+    const key5 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"status"}), .capacity = 1 } } } };
+    const key6 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}), .capacity = 1 } } } };
 
     try testing.expect(key1.eql(key2));
     try testing.expect(key4.eql(key5));
@@ -1856,8 +1856,8 @@ test "MetricMatcherKey: hash and equality" {
 
 test "FieldRef: isKeyed" {
     const log_field = FieldRef{ .log_field = .LOG_FIELD_BODY };
-    const log_attr = FieldRef{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } };
-    const resource_attr = FieldRef{ .resource_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}) } } };
+    const log_attr = FieldRef{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}), .capacity = 1 } } };
+    const resource_attr = FieldRef{ .resource_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}), .capacity = 1 } } };
 
     try testing.expect(!log_field.isKeyed());
     try testing.expect(log_attr.isKeyed());
@@ -1918,7 +1918,7 @@ test "KeepValue: restrictiveness comparison" {
 test "LogMatcherIndex: build empty" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{});
     defer index.deinit();
@@ -1930,7 +1930,7 @@ test "LogMatcherIndex: build empty" {
 test "MetricMatcherIndex: build empty" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{});
     defer index.deinit();
@@ -1942,7 +1942,7 @@ test "MetricMatcherIndex: build empty" {
 test "LogMatcherIndex: build with single policy" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -1978,7 +1978,7 @@ test "LogMatcherIndex: build with single policy" {
 test "MetricMatcherIndex: build with single policy" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "metric-policy-1"),
@@ -2009,7 +2009,7 @@ test "MetricMatcherIndex: build with single policy" {
 test "LogMatcherIndex: build with keyed matchers" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -2033,7 +2033,7 @@ test "LogMatcherIndex: build with keyed matchers" {
 
     try testing.expect(!index.isEmpty());
 
-    const expected_key = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } } };
+    const expected_key = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}), .capacity = 1 } } } };
     const db = index.getDatabase(expected_key);
     try testing.expect(db != null);
 }
@@ -2041,7 +2041,7 @@ test "LogMatcherIndex: build with keyed matchers" {
 test "LogMatcherIndex: negated matcher creates negated database" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -2073,7 +2073,7 @@ test "LogMatcherIndex: negated matcher creates negated database" {
 test "LogMatcherIndex: scan database" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -2108,7 +2108,7 @@ test "LogMatcherIndex: scan database" {
 test "LogMatcherIndex: exists=true matcher is bucketed into exists_entries" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -2148,7 +2148,7 @@ test "LogMatcherIndex: exists=true matcher is bucketed into exists_entries" {
 test "LogMatcherIndex: exists=false matcher creates negated pattern" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -2188,7 +2188,7 @@ test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
     const allocator = testing.allocator;
 
     var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const policy = Policy{
         .id = "drop-gauges",
@@ -2205,6 +2205,7 @@ test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
                             .case_insensitive = false,
                         },
                     }),
+                    .capacity = 1,
                 },
                 .keep = false,
             },
@@ -2225,7 +2226,7 @@ test "TraceMatcherIndex: span_kind null match with second resource_attribute mat
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const policy = Policy{
         .id = "drop-internal-frontend-spans",
@@ -2242,12 +2243,13 @@ test "TraceMatcherIndex: span_kind null match with second resource_attribute mat
                             .case_insensitive = false,
                         },
                         .{
-                            .field = .{ .resource_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service.name"}) } } },
+                            .field = .{ .resource_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service.name"}), .capacity = 1 } } },
                             .match = .{ .exact = "frontend" },
                             .negate = false,
                             .case_insensitive = false,
                         },
                     }),
+                    .capacity = 2,
                 },
             },
         },
@@ -2273,7 +2275,7 @@ test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
     const allocator = testing.allocator;
 
     var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const policy = Policy{
         .id = "drop-internal-spans",
@@ -2290,6 +2292,7 @@ test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
                             .case_insensitive = false,
                         },
                     }),
+                    .capacity = 1,
                 },
             },
         },
@@ -2312,7 +2315,7 @@ test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
 test "MetricMatcherIndex: exists=true matcher is bucketed into exists_entries" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
@@ -2351,7 +2354,7 @@ test "MetricMatcherIndex: metric_type exists is bucketed into exists_entries" {
     // directly via accessor.callExists and lives in exists_entries.
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const MetricType = proto.policy.MetricType;
 
@@ -2389,7 +2392,7 @@ test "MetricMatcherIndex: metric_type exists is bucketed into exists_entries" {
 test "MetricMatcherIndex: metric_type with regex pattern" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const MetricType = proto.policy.MetricType;
 
@@ -2432,7 +2435,7 @@ test "MetricMatcherIndex: metric_type with regex pattern" {
 test "MetricMatcherIndex: aggregation_temporality field creates Hyperscan database" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const AggregationTemporality = proto.policy.AggregationTemporality;
 
@@ -2478,7 +2481,7 @@ test "MetricMatcherIndex: aggregation_temporality field creates Hyperscan databa
 test "Mixed log and metric policies: each index only gets its type" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var log_policy = Policy{
         .id = try allocator.dupe(u8, "log-policy-1"),
@@ -2581,7 +2584,7 @@ test "formatPattern: contains returns pattern unchanged" {
 test "Log matcher with starts_with" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "starts-with-policy"),
@@ -2619,7 +2622,7 @@ test "Log matcher with starts_with" {
 test "Log matcher with ends_with" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "ends-with-policy"),
@@ -2657,7 +2660,7 @@ test "Log matcher with ends_with" {
 test "Log matcher with contains" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "contains-policy"),
@@ -2698,7 +2701,7 @@ test "Log matcher with contains" {
 test "Log matcher with exact" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "exact-policy"),
@@ -2736,7 +2739,7 @@ test "Log matcher with exact" {
 test "Log matcher with case_insensitive" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "case-insensitive-policy"),
@@ -2778,7 +2781,7 @@ test "Log matcher with case_insensitive" {
 test "Log matcher with starts_with case_insensitive" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "starts-with-ci-policy"),

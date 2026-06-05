@@ -5,9 +5,9 @@ const Level = @import("level.zig").Level;
 pub const SpanId = [8]u8;
 
 /// Generate a random span ID
-pub fn generateSpanId() SpanId {
+pub fn generateSpanId(io: std.Io) SpanId {
     var id: SpanId = undefined;
-    std.crypto.random.bytes(&id);
+    io.random(&id);
     return id;
 }
 
@@ -31,9 +31,9 @@ pub const Span = struct {
     parent: ?*const Span,
 
     /// Generate a random span ID
-    pub fn generateSpanId() SpanId {
+    pub fn generateSpanId(io: std.Io) SpanId {
         var id: SpanId = undefined;
-        std.crypto.random.bytes(&id);
+        io.random(&id);
         return id;
     }
 
@@ -48,19 +48,19 @@ pub const Span = struct {
     }
 
     /// Get elapsed time in nanoseconds since span started
-    pub fn elapsedNs(self: *const Span) i64 {
-        const now = std.time.microTimestamp();
+    pub fn elapsedNs(self: *const Span, io: std.Io) i64 {
+        const now = std.Io.Timestamp.now(io, .awake).toMicroseconds();
         return (now - self.start_time) * 1000;
     }
 
     /// Get elapsed time in milliseconds since span started
-    pub fn elapsedMs(self: *const Span) i64 {
-        return @divFloor(self.elapsedNs(), std.time.ns_per_ms);
+    pub fn elapsedMs(self: *const Span, io: std.Io) i64 {
+        return @divFloor(self.elapsedNs(io), std.time.ns_per_ms);
     }
 
     /// Format elapsed time as a human-readable string
-    pub fn formatElapsed(self: *const Span, buf: []u8) []const u8 {
-        const elapsed_ns = self.elapsedNs();
+    pub fn formatElapsed(self: *const Span, io: std.Io, buf: []u8) []const u8 {
+        const elapsed_ns = self.elapsedNs(io);
 
         if (elapsed_ns < std.time.ns_per_ms) {
             // Microseconds
@@ -85,11 +85,11 @@ test "Span.elapsedMs" {
         .id = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
         .name = "test",
         .level = .info,
-        .start_time = std.time.microTimestamp() - 100_000, // 100ms ago
+        .start_time = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMicroseconds() - 100_000, // 100ms ago
         .parent = null,
     };
 
-    const elapsed = span.elapsedMs();
+    const elapsed = span.elapsedMs(std.Options.debug_io);
     try std.testing.expect(elapsed >= 99 and elapsed <= 110);
 }
 
@@ -101,10 +101,10 @@ test "Span.formatElapsed" {
         .id = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
         .name = "test",
         .level = .info,
-        .start_time = std.time.microTimestamp() - 500, // 500µs ago
+        .start_time = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMicroseconds() - 500, // 500µs ago
         .parent = null,
     };
-    const us_str = span_us.formatElapsed(&buf);
+    const us_str = span_us.formatElapsed(std.Options.debug_io, &buf);
     try std.testing.expect(std.mem.endsWith(u8, us_str, "µs"));
 
     // Test milliseconds
@@ -112,10 +112,10 @@ test "Span.formatElapsed" {
         .id = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
         .name = "test",
         .level = .info,
-        .start_time = std.time.microTimestamp() - 50_000, // 50ms ago
+        .start_time = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMicroseconds() - 50_000, // 50ms ago
         .parent = null,
     };
-    const ms_str = span_ms.formatElapsed(&buf);
+    const ms_str = span_ms.formatElapsed(std.Options.debug_io, &buf);
     try std.testing.expect(std.mem.endsWith(u8, ms_str, "ms"));
 }
 
@@ -127,8 +127,8 @@ test "Span.formatSpanId" {
 }
 
 test "Span.generateSpanId" {
-    const id1 = Span.generateSpanId();
-    const id2 = Span.generateSpanId();
+    const id1 = Span.generateSpanId(std.Options.debug_io);
+    const id2 = Span.generateSpanId(std.Options.debug_io);
     // IDs should be different (with extremely high probability)
     try std.testing.expect(!std.mem.eql(u8, &id1, &id2));
 }

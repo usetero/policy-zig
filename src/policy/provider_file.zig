@@ -33,12 +33,13 @@ const PolicyReloadFailed = struct { err: []const u8 };
 /// File-based policy provider that watches a config file for changes
 pub const FileProvider = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     /// Unique identifier for this provider
     id: []const u8,
     config_path: []const u8,
     callback: ?PolicyCallback,
     watch_thread: ?std.Thread,
-    shutdown_event: std.Thread.ResetEvent,
+    shutdown_event: std.Io.Event,
     /// SHA256 hash of the last loaded file contents
     content_hash: ?[Sha256.digest_length]u8,
     /// Event bus for observability
@@ -49,7 +50,7 @@ pub const FileProvider = struct {
         path: []const u8,
     };
 
-    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, config: Config) !*FileProvider {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, bus: *EventBus, config: Config) !*FileProvider {
         const self = try allocator.create(FileProvider);
         errdefer allocator.destroy(self);
 
@@ -61,11 +62,12 @@ pub const FileProvider = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .id = id_copy,
             .config_path = path_copy,
             .callback = null,
             .watch_thread = null,
-            .shutdown_event = .{},
+            .shutdown_event = .unset,
             .content_hash = null,
             .bus = bus,
         };
@@ -89,7 +91,7 @@ pub const FileProvider = struct {
     }
 
     pub fn shutdown(self: *FileProvider) void {
-        self.shutdown_event.set();
+        self.shutdown_event.set(self.io);
 
         if (self.watch_thread) |thread| {
             thread.join();
@@ -122,10 +124,7 @@ pub const FileProvider = struct {
         self.bus.info(PoliciesLoading{ .path = self.config_path });
 
         // Read file contents and compute hash
-        const file = try std.fs.cwd().openFile(self.config_path, .{});
-        defer file.close();
-
-        const contents = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024); // 10MB max
+        const contents = try std.Io.Dir.cwd().readFileAlloc(self.io, self.config_path, self.allocator, .limited(10 * 1024 * 1024));
         defer self.allocator.free(contents);
 
         var new_hash: [Sha256.digest_length]u8 = undefined;
@@ -172,20 +171,20 @@ pub const FileProvider = struct {
     }
 
     fn watchLoopPoll(self: *FileProvider) !void {
-        var last_mtime: i128 = 0;
+        var last_mtime: i96 = 0;
 
         while (!self.shutdown_event.isSet()) {
-            self.shutdown_event.timedWait(1 * std.time.ns_per_s) catch {};
+            std.Io.sleep(self.io, .{ .nanoseconds = 1 * std.time.ns_per_s }, .awake) catch {};
             if (self.shutdown_event.isSet()) break;
 
-            const file = std.fs.cwd().openFile(self.config_path, .{}) catch continue;
-            defer file.close();
+            const file = std.Io.Dir.cwd().openFile(self.io, self.config_path, .{}) catch continue;
+            defer file.close(self.io);
 
-            const stat = file.stat() catch continue;
+            const stat = file.stat(self.io) catch continue;
 
             // Only attempt reload if mtime changed (optimization to avoid reading file every second)
-            if (stat.mtime != last_mtime) {
-                last_mtime = stat.mtime;
+            if (stat.mtime.nanoseconds != last_mtime) {
+                last_mtime = stat.mtime.nanoseconds;
                 // loadAndNotify will check content hash and skip if unchanged
                 self.loadAndNotify() catch |err| {
                     self.bus.err(PolicyReloadFailed{ .err = @errorName(err) });
@@ -203,13 +202,28 @@ const testing = std.testing;
 const Registry = @import("./registry.zig").PolicyRegistry;
 const NoopEventBus = o11y.NoopEventBus;
 
+/// Write `contents` to `filename` inside `tmp_dir` and return a path string
+/// (relative to cwd: ".zig-cache/tmp/<sub_path>/<filename>") that FileProvider
+/// can open via Io.Dir.cwd().
+fn writeTmpFile(
+    allocator: std.mem.Allocator,
+    tmp_dir: *testing.TmpDir,
+    filename: []const u8,
+    contents: []const u8,
+) ![]u8 {
+    const io = std.Options.debug_io;
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = filename, .data = contents });
+    return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp_dir.sub_path, filename });
+}
+
 test "FileProvider: init and deinit" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .path = "/nonexistent/path/policies.json" },
     );
@@ -221,10 +235,11 @@ test "FileProvider: init and deinit" {
 test "FileProvider: subscribe fails when file does not exist" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     const provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .path = "/nonexistent/path/policies.json" },
     );
@@ -244,22 +259,18 @@ test "FileProvider: subscribe fails when file does not exist" {
 test "FileProvider: subscribe fails with invalid JSON" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     // Create a temporary file with invalid JSON
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("invalid.json", .{});
-    try file.writeAll("{ this is not valid json }");
-    file.close();
-
-    // Get the full path
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath("invalid.json", &path_buf);
+    const tmp_path = try writeTmpFile(allocator, &tmp_dir, "invalid.json", "{ this is not valid json }");
+    defer allocator.free(tmp_path);
 
     const provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .path = tmp_path },
     );
@@ -279,15 +290,13 @@ test "FileProvider: subscribe fails with invalid JSON" {
 test "FileProvider: subscribe fails with invalid policy structure" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     // Create a temporary file with valid JSON but invalid policy structure
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("bad_policy.json", .{});
-    // Missing required fields like "id"
-    try file.writeAll(
+    const tmp_path = try writeTmpFile(allocator, &tmp_dir, "bad_policy.json",
         \\{
         \\  "policies": [
         \\    {
@@ -299,13 +308,11 @@ test "FileProvider: subscribe fails with invalid policy structure" {
         \\  ]
         \\}
     );
-    file.close();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath("bad_policy.json", &path_buf);
+    defer allocator.free(tmp_path);
 
     const provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .path = tmp_path },
     );
@@ -325,7 +332,7 @@ test "FileProvider: subscribe fails with invalid policy structure" {
 test "FileProvider: registry remains usable after provider fails to load" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     // Create registry
     var registry = Registry.init(allocator, noop_bus.eventBus());
@@ -334,6 +341,7 @@ test "FileProvider: registry remains usable after provider fails to load" {
     // Try to load a provider with a non-existent file
     const provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "failing-provider", .path = "/nonexistent/path/policies.json" },
     );
@@ -356,8 +364,7 @@ test "FileProvider: registry remains usable after provider fails to load" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("valid.json", .{});
-    try file.writeAll(
+    const tmp_path = try writeTmpFile(allocator, &tmp_dir, "valid.json",
         \\{
         \\  "policies": [
         \\    {
@@ -371,13 +378,11 @@ test "FileProvider: registry remains usable after provider fails to load" {
         \\  ]
         \\}
     );
-    file.close();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath("valid.json", &path_buf);
+    defer allocator.free(tmp_path);
 
     const good_provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "good-provider", .path = tmp_path },
     );
@@ -412,7 +417,7 @@ test "FileProvider: registry remains usable after provider fails to load" {
 test "FileProvider: registry retains policies after reload with invalid JSON" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var registry = Registry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
@@ -421,8 +426,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("policies.json", .{});
-    try file.writeAll(
+    const tmp_path = try writeTmpFile(allocator, &tmp_dir, "policies.json",
         \\{
         \\  "policies": [
         \\    {
@@ -436,13 +440,11 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
         \\  ]
         \\}
     );
-    file.close();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath("policies.json", &path_buf);
+    defer allocator.free(tmp_path);
 
     const provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .path = tmp_path },
     );
@@ -476,9 +478,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     }
 
     // Now overwrite the file with invalid JSON
-    const file2 = try tmp_dir.dir.createFile("policies.json", .{});
-    try file2.writeAll("{ this is not valid json }");
-    file2.close();
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "policies.json", .data = "{ this is not valid json }" });
 
     // Manually trigger a reload (simulates what the watch loop does)
     // This should fail but not crash
@@ -495,8 +495,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     }
 
     // Now overwrite with valid JSON but invalid policy structure (missing "id" field)
-    const file2b = try tmp_dir.dir.createFile("policies.json", .{});
-    try file2b.writeAll(
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "policies.json", .data =
         \\{
         \\  "policies": [
         \\    {
@@ -507,8 +506,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
         \\    }
         \\  ]
         \\}
-    );
-    file2b.close();
+    });
 
     // Reload should fail due to missing required field
     const reload_result2 = provider.loadAndNotify();
@@ -524,8 +522,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     }
 
     // Fix the file with valid JSON again
-    const file3 = try tmp_dir.dir.createFile("policies.json", .{});
-    try file3.writeAll(
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "policies.json", .data =
         \\{
         \\  "policies": [
         \\    {
@@ -538,8 +535,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
         \\    }
         \\  ]
         \\}
-    );
-    file3.close();
+    });
 
     // Reload should now succeed
     try provider.loadAndNotify();
@@ -557,7 +553,7 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
 test "FileProvider: multiple providers, one fails, registry has policies from successful one" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var registry = Registry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
@@ -566,8 +562,7 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("valid.json", .{});
-    try file.writeAll(
+    const tmp_path = try writeTmpFile(allocator, &tmp_dir, "valid.json",
         \\{
         \\  "policies": [
         \\    {
@@ -581,14 +576,12 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
         \\  ]
         \\}
     );
-    file.close();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath("valid.json", &path_buf);
+    defer allocator.free(tmp_path);
 
     // First provider - will fail
     const failing_provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "failing-provider", .path = "/nonexistent/policies.json" },
     );
@@ -605,6 +598,7 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     // Second provider - will succeed
     const good_provider = try FileProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "good-provider", .path = tmp_path },
     );

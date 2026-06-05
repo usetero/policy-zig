@@ -12,8 +12,8 @@
 //! ## Usage
 //!
 //! ```zig
-//! var limiter = RateLimiter.initPerSecond(100);
-//! if (limiter.shouldKeep()) {
+//! var limiter = RateLimiter.initPerSecond(io, 100);
+//! if (limiter.shouldKeep(io)) {
 //!     // Under rate limit
 //! }
 //! ```
@@ -55,24 +55,28 @@ pub const RateLimiter = struct {
     window_ms: u32,
 
     /// For testing: injectable time source
-    time_source: *const fn () i64 = &defaultTimeSource,
+    time_source: *const fn (io: std.Io) i64 = &defaultTimeSource,
 
-    fn defaultTimeSource() i64 {
-        return std.time.milliTimestamp();
+    fn defaultTimeSource(io: std.Io) i64 {
+        // `.awake` is a monotonic clock (CLOCK_MONOTONIC / CLOCK_UPTIME_RAW),
+        // the right basis for rate-limit windows — unaffected by wall-clock/NTP
+        // jumps. `toMilliseconds()` is the stdlib helper for ns → ms.
+        return std.Io.Timestamp.now(io, .awake).toMilliseconds();
     }
 
     /// Initialize a rate limiter with custom window duration.
-    pub fn init(limit: u32, window_ms: u32) RateLimiter {
-        return initWithTimeSource(limit, window_ms, &defaultTimeSource);
+    pub fn init(io: std.Io, limit: u32, window_ms: u32) RateLimiter {
+        return initWithTimeSource(io, limit, window_ms, &defaultTimeSource);
     }
 
     /// Initialize with injectable time source (for testing).
     pub fn initWithTimeSource(
+        io: std.Io,
         limit: u32,
         window_ms: u32,
-        time_source: *const fn () i64,
+        time_source: *const fn (io: std.Io) i64,
     ) RateLimiter {
-        const now = time_source();
+        const now = time_source(io);
         var limiter = RateLimiter{
             .limit = limit,
             .window_ms = window_ms,
@@ -83,13 +87,13 @@ pub const RateLimiter = struct {
     }
 
     /// Initialize a rate limiter with per-second window.
-    pub fn initPerSecond(limit: u32) RateLimiter {
-        return init(limit, 1000);
+    pub fn initPerSecond(io: std.Io, limit: u32) RateLimiter {
+        return init(io, limit, 1000);
     }
 
     /// Initialize a rate limiter with per-minute window.
-    pub fn initPerMinute(limit: u32) RateLimiter {
-        return init(limit, 60_000);
+    pub fn initPerMinute(io: std.Io, limit: u32) RateLimiter {
+        return init(io, limit, 60_000);
     }
 
     /// Check if request should be allowed. Increments counter atomically.
@@ -98,8 +102,8 @@ pub const RateLimiter = struct {
     /// Automatically resets window when expired.
     ///
     /// This is the only public method - checking and incrementing are atomic.
-    pub fn shouldKeep(self: *RateLimiter) bool {
-        const now = self.time_source();
+    pub fn shouldKeep(self: *RateLimiter, io: std.Io) bool {
+        const now = self.time_source(io);
 
         // Fast path: check if window might be expired
         const window_start = self.window_start.load(.acquire);
@@ -144,9 +148,9 @@ pub const RateLimiter = struct {
     }
 
     /// Force reset (for testing only).
-    pub fn reset(self: *RateLimiter) void {
+    pub fn reset(self: *RateLimiter, io: std.Io) void {
         self.count.store(0, .release);
-        self.window_start.store(self.time_source(), .release);
+        self.window_start.store(self.time_source(io), .release);
     }
 };
 
@@ -181,7 +185,7 @@ const MockTime = struct {
 // =============================================================================
 
 test "RateLimiter: init sets correct values" {
-    var limiter = RateLimiter.init(100, 1000);
+    var limiter = RateLimiter.init(std.Options.debug_io, 100, 1000);
 
     try testing.expectEqual(@as(u32, 100), limiter.limit);
     try testing.expectEqual(@as(u32, 1000), limiter.window_ms);
@@ -189,75 +193,75 @@ test "RateLimiter: init sets correct values" {
 }
 
 test "RateLimiter: initPerSecond convenience" {
-    const limiter = RateLimiter.initPerSecond(50);
+    const limiter = RateLimiter.initPerSecond(std.Options.debug_io, 50);
 
     try testing.expectEqual(@as(u32, 50), limiter.limit);
     try testing.expectEqual(@as(u32, 1000), limiter.window_ms);
 }
 
 test "RateLimiter: initPerMinute convenience" {
-    const limiter = RateLimiter.initPerMinute(1000);
+    const limiter = RateLimiter.initPerMinute(std.Options.debug_io, 1000);
 
     try testing.expectEqual(@as(u32, 1000), limiter.limit);
     try testing.expectEqual(@as(u32, 60_000), limiter.window_ms);
 }
 
 test "RateLimiter: allows requests under limit" {
-    var limiter = RateLimiter.initPerSecond(5);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 5);
 
     for (0..5) |_| {
-        try testing.expect(limiter.shouldKeep());
+        try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     }
 
     try testing.expectEqual(@as(u32, 5), limiter.currentCount());
 }
 
 test "RateLimiter: blocks at limit" {
-    var limiter = RateLimiter.initPerSecond(3);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 3);
 
-    try testing.expect(limiter.shouldKeep()); // 1
-    try testing.expect(limiter.shouldKeep()); // 2
-    try testing.expect(limiter.shouldKeep()); // 3
-    try testing.expect(!limiter.shouldKeep()); // 4 - blocked
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io)); // 1
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io)); // 2
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io)); // 3
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io)); // 4 - blocked
 
     try testing.expectEqual(@as(u32, 4), limiter.currentCount());
 }
 
 test "RateLimiter: limit of 1" {
-    var limiter = RateLimiter.initPerSecond(1);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 1);
 
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: limit of 0 blocks everything" {
-    var limiter = RateLimiter.initPerSecond(0);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 0);
 
-    try testing.expect(!limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: high limit" {
-    var limiter = RateLimiter.initPerSecond(1_000_000);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 1_000_000);
 
     for (0..10000) |_| {
-        try testing.expect(limiter.shouldKeep());
+        try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     }
 }
 
 test "RateLimiter: reset clears count" {
-    var limiter = RateLimiter.initPerSecond(5);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 5);
 
-    _ = limiter.shouldKeep();
-    _ = limiter.shouldKeep();
+    _ = limiter.shouldKeep(std.Options.debug_io);
+    _ = limiter.shouldKeep(std.Options.debug_io);
     try testing.expectEqual(@as(u32, 2), limiter.currentCount());
 
-    limiter.reset();
+    limiter.reset(std.Options.debug_io);
     try testing.expectEqual(@as(u32, 0), limiter.currentCount());
 
     // Should allow again
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 // =============================================================================
@@ -268,25 +272,25 @@ test "RateLimiter: window expiry resets count" {
     var mock_time: i64 = 1000;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(3, 100, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 3, 100, &mockTime.get);
 
     // Use up limit
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Advance time past window
     mock_time = 1150;
 
     // Should allow again
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     try testing.expectEqual(@as(u32, 1), limiter.currentCount());
 }
 
@@ -294,132 +298,132 @@ test "RateLimiter: window expiry exactly at boundary" {
     var mock_time: i64 = 0;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(2, 100, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 2, 100, &mockTime.get);
 
-    _ = limiter.shouldKeep();
-    _ = limiter.shouldKeep();
-    try testing.expect(!limiter.shouldKeep());
+    _ = limiter.shouldKeep(std.Options.debug_io);
+    _ = limiter.shouldKeep(std.Options.debug_io);
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Exactly at window boundary
     mock_time = 100;
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: multiple window rollovers" {
     var mock_time: i64 = 0;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(2, 100, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 2, 100, &mockTime.get);
 
     // Window 1
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Window 2
     mock_time = 100;
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Window 3
     mock_time = 200;
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Skip to window 10
     mock_time = 900;
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: time going backwards handled gracefully" {
     var mock_time: i64 = 1000;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(3, 100, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 3, 100, &mockTime.get);
 
-    _ = limiter.shouldKeep();
-    _ = limiter.shouldKeep();
+    _ = limiter.shouldKeep(std.Options.debug_io);
+    _ = limiter.shouldKeep(std.Options.debug_io);
 
     // Time goes backwards (NTP adjustment, etc.)
     mock_time = 500;
 
     // Should still work - elapsed will be negative, won't trigger reset
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // When time catches up, normal operation resumes
     mock_time = 1100;
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: very short window with mock time" {
     var mock_time: i64 = 0;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(5, 1, &mockTime.get); // 1ms window
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 5, 1, &mockTime.get); // 1ms window
 
     // Should allow 5, then block
     for (0..5) |_| {
-        try testing.expect(limiter.shouldKeep());
+        try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     }
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Advance time past window
     mock_time = 2;
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: very long window" {
     var mock_time: i64 = 0;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
     // 1 hour window
-    var limiter = RateLimiter.initWithTimeSource(100, 3_600_000, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 100, 3_600_000, &mockTime.get);
 
     for (0..100) |_| {
-        try testing.expect(limiter.shouldKeep());
+        try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     }
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Advance 30 minutes - still blocked
     mock_time = 1_800_000;
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Advance to 1 hour - reset
     mock_time = 3_600_000;
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 // =============================================================================
@@ -430,7 +434,7 @@ test "RateLimiter: concurrent increments respect limit" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Use a high limit that won't expire during test
-    var limiter = RateLimiter.initPerSecond(1000);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 1000);
     var kept = std.atomic.Value(u32).init(0);
 
     const thread_count = 8;
@@ -441,7 +445,7 @@ test "RateLimiter: concurrent increments respect limit" {
         t.* = try std.Thread.spawn(.{}, struct {
             fn run(lim: *RateLimiter, k: *std.atomic.Value(u32)) void {
                 for (0..iterations_per_thread) |_| {
-                    if (lim.shouldKeep()) {
+                    if (lim.shouldKeep(std.Options.debug_io)) {
                         _ = k.fetchAdd(1, .monotonic);
                     }
                 }
@@ -465,13 +469,13 @@ test "RateLimiter: concurrent access with window reset" {
     var mock_time = MockTime.init(0);
     const getMockTime = struct {
         var time: *MockTime = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time.get();
         }
     };
     getMockTime.time = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(10, 100, &getMockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 10, 100, &getMockTime.get);
     var total_kept = std.atomic.Value(u32).init(0);
     var windows_processed = std.atomic.Value(u32).init(0);
 
@@ -490,7 +494,7 @@ test "RateLimiter: concurrent access with window reset" {
                 for (0..5) |_| {
                     // Try to get through limit
                     for (0..20) |_| {
-                        if (lim.shouldKeep()) {
+                        if (lim.shouldKeep(std.Options.debug_io)) {
                             _ = k.fetchAdd(1, .monotonic);
                         }
                     }
@@ -518,7 +522,7 @@ test "RateLimiter: concurrent access with window reset" {
 test "RateLimiter: no data races under contention" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var limiter = RateLimiter.initPerSecond(1000);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 1000);
     var iterations = std.atomic.Value(u32).init(0);
 
     const thread_count = 8;
@@ -528,7 +532,7 @@ test "RateLimiter: no data races under contention" {
         t.* = try std.Thread.spawn(.{}, struct {
             fn run(lim: *RateLimiter, iters: *std.atomic.Value(u32)) void {
                 for (0..1000) |_| {
-                    _ = lim.shouldKeep();
+                    _ = lim.shouldKeep(std.Options.debug_io);
                     _ = iters.fetchAdd(1, .monotonic);
                 }
             }
@@ -553,18 +557,18 @@ test "RateLimiter: CAS race at window boundary" {
     var mock_time = MockTime.init(0);
     const getMockTime = struct {
         var time: *MockTime = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time.get();
         }
     };
     getMockTime.time = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(5, 100, &getMockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 5, 100, &getMockTime.get);
     var reset_count = std.atomic.Value(u32).init(0);
 
     // Exhaust limit
     for (0..5) |_| {
-        _ = limiter.shouldKeep();
+        _ = limiter.shouldKeep(std.Options.debug_io);
     }
 
     // Advance time to trigger reset
@@ -578,7 +582,7 @@ test "RateLimiter: CAS race at window boundary" {
         t.* = try std.Thread.spawn(.{}, struct {
             fn run(lim: *RateLimiter, rc: *std.atomic.Value(u32)) void {
                 const before = lim.currentWindowStart();
-                _ = lim.shouldKeep();
+                _ = lim.shouldKeep(std.Options.debug_io);
                 const after = lim.currentWindowStart();
                 // If window changed, we observed a reset
                 if (after != before) {
@@ -604,24 +608,24 @@ test "RateLimiter: CAS race at window boundary" {
 // =============================================================================
 
 test "RateLimiter: max u32 limit" {
-    var limiter = RateLimiter.initPerSecond(std.math.maxInt(u32));
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, std.math.maxInt(u32));
 
     for (0..10000) |_| {
-        try testing.expect(limiter.shouldKeep());
+        try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     }
 }
 
 test "RateLimiter: count overflow protection" {
-    var limiter = RateLimiter.initPerSecond(5);
+    var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 5);
 
     // Exhaust limit
     for (0..5) |_| {
-        _ = limiter.shouldKeep();
+        _ = limiter.shouldKeep(std.Options.debug_io);
     }
 
     // Hammer it many times past limit
     for (0..10000) |_| {
-        try testing.expect(!limiter.shouldKeep());
+        try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
     }
 
     // Count will be high but shouldKeep still works correctly
@@ -632,38 +636,38 @@ test "RateLimiter: window_ms of 0 always resets" {
     var mock_time: i64 = 0;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
     // Edge case: 0ms window means always expired
-    var limiter = RateLimiter.initWithTimeSource(2, 0, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 2, 0, &mockTime.get);
 
     // First two should be allowed (reset happens, then increment)
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
     // Third triggers reset again since elapsed >= 0 is always true
-    try testing.expect(limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
 }
 
 test "RateLimiter: i64 time overflow edge case" {
     var mock_time: i64 = std.math.maxInt(i64) - 50;
     const mockTime = struct {
         var time_ptr: *i64 = undefined;
-        fn get() i64 {
+        fn get(_: std.Io) i64 {
             return time_ptr.*;
         }
     };
     mockTime.time_ptr = &mock_time;
 
-    var limiter = RateLimiter.initWithTimeSource(3, 100, &mockTime.get);
+    var limiter = RateLimiter.initWithTimeSource(std.Options.debug_io, 3, 100, &mockTime.get);
 
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(limiter.shouldKeep());
-    try testing.expect(!limiter.shouldKeep());
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(limiter.shouldKeep(std.Options.debug_io));
+    try testing.expect(!limiter.shouldKeep(std.Options.debug_io));
 
     // Would overflow if we add 100, but subtraction handles this
     // This is technically undefined behavior territory, but practically

@@ -237,7 +237,7 @@ pub const Compiled = struct {
     template: Template,
     /// Serializes access to the regex engine's per-iteration state.
     /// See the struct docstring for the threading model.
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -265,12 +265,13 @@ pub const Compiled = struct {
     /// See `Compiled`'s docstring for thread-safety and output-lifetime notes.
     pub fn replaceAll(
         self: *Compiled,
+        io: std.Io,
         haystack: []const u8,
         out: *std.ArrayListUnmanaged(u8),
         gpa: std.mem.Allocator,
     ) !usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var cursor: usize = 0;
         var count: usize = 0;
@@ -318,7 +319,7 @@ fn templateExpectSingle(template_str: []const u8, regex_str: []const u8, haystac
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(testing.allocator);
 
-    _ = try compiled.replaceAll(haystack, &out, testing.allocator);
+    _ = try compiled.replaceAll(std.Options.debug_io, haystack, &out, testing.allocator);
     try testing.expectEqualStrings(expected, out.items);
 }
 
@@ -406,7 +407,7 @@ test "Compiled.replaceAll: no match leaves output empty" {
     defer compiled.deinit();
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(testing.allocator);
-    const count = try compiled.replaceAll("abc 123", &out, testing.allocator);
+    const count = try compiled.replaceAll(std.Options.debug_io, "abc 123", &out, testing.allocator);
     try testing.expectEqual(@as(usize, 0), count);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
@@ -457,7 +458,7 @@ test "Compiled.replaceAll: zero-width match terminates and advances byte-by-byte
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(testing.allocator);
 
-    const count = try compiled.replaceAll("abc", &out, testing.allocator);
+    const count = try compiled.replaceAll(std.Options.debug_io, "abc", &out, testing.allocator);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqualStrings("[START]abc", out.items);
 }
@@ -471,7 +472,7 @@ test "Compiled.replaceAll: zero-width match on empty haystack" {
 
     // Should terminate cleanly. Whether we emit "X" or 0 matches is a
     // policy decision — we tolerate either outcome here.
-    _ = try compiled.replaceAll("", &out, testing.allocator);
+    _ = try compiled.replaceAll(std.Options.debug_io, "", &out, testing.allocator);
 }
 
 test "Compiled.replaceAll: concurrent callers serialize on the Mutex" {
@@ -495,6 +496,7 @@ test "Compiled.replaceAll: concurrent callers serialize on the Mutex" {
                 defer arena.deinit();
                 var out: std.ArrayListUnmanaged(u8) = .empty;
                 const count = self.compiled_ref.replaceAll(
+                    std.Options.debug_io,
                     "user=42 token=99 session=7",
                     &out,
                     arena.allocator(),

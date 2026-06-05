@@ -11,7 +11,7 @@
 //! defer loader.deinit();
 //!
 //! // Start loading providers asynchronously (non-blocking)
-//! try loader.startAsync();
+//! try loader.startAsync(io);
 //!
 //! // Server can now start handling requests...
 //!
@@ -117,16 +117,16 @@ pub const PolicyLoader = struct {
 
     /// Start loading providers asynchronously in a background thread.
     /// Returns immediately, allowing the server to start handling requests.
-    pub fn startAsync(self: *PolicyLoader) !void {
+    pub fn startAsync(self: *PolicyLoader, io: std.Io) !void {
         self.bus.info(PolicyLoaderStarting{ .provider_count = self.provider_states.len });
-        self.load_thread = try std.Thread.spawn(.{}, loadProvidersThread, .{self});
+        self.load_thread = try std.Thread.spawn(.{}, loadProvidersThread, .{ self, io });
     }
 
     /// Load all providers synchronously (blocks until complete).
     /// Use this if you need policies loaded before accepting requests.
-    pub fn loadSync(self: *PolicyLoader) void {
+    pub fn loadSync(self: *PolicyLoader, io: std.Io) void {
         self.bus.info(PolicyLoaderStarting{ .provider_count = self.provider_states.len });
-        self.loadAllProviders();
+        self.loadAllProviders(io);
     }
 
     /// Wait for the initial load to complete.
@@ -191,18 +191,18 @@ pub const PolicyLoader = struct {
     // Private Implementation
     // =========================================================================
 
-    fn loadProvidersThread(self: *PolicyLoader) void {
-        self.loadAllProviders();
+    fn loadProvidersThread(self: *PolicyLoader, io: std.Io) void {
+        self.loadAllProviders(io);
     }
 
-    fn loadAllProviders(self: *PolicyLoader) void {
+    fn loadAllProviders(self: *PolicyLoader, io: std.Io) void {
         var loaded_count: usize = 0;
         var failed_count: usize = 0;
 
         for (self.provider_states) |*state| {
             if (self.shutdown_flag.load(.acquire)) break;
 
-            self.loadProvider(state) catch |err| {
+            self.loadProvider(state, io) catch |err| {
                 const err_str = self.allocator.dupe(u8, @errorName(err)) catch "allocation_failed";
                 state.load_error = err_str;
                 self.bus.err(ProviderLoadFailed{
@@ -223,7 +223,7 @@ pub const PolicyLoader = struct {
         });
     }
 
-    fn loadProvider(self: *PolicyLoader, state: *ProviderState) !void {
+    fn loadProvider(self: *PolicyLoader, state: *ProviderState, io: std.Io) !void {
         const config = state.config;
         const provider_type_str = switch (config.type) {
             .file => "file",
@@ -242,6 +242,7 @@ pub const PolicyLoader = struct {
 
                 const file_provider = try FileProvider.init(
                     self.allocator,
+                    io,
                     self.bus,
                     .{ .id = config.id, .path = path },
                 );
@@ -264,6 +265,7 @@ pub const PolicyLoader = struct {
 
                 const http_provider = try HttpProvider.init(
                     self.allocator,
+                    io,
                     self.bus,
                     .{
                         .id = config.id,
@@ -297,7 +299,7 @@ test "PolicyLoader: init and deinit" {
     const allocator = std.testing.allocator;
 
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(std.Options.debug_io);
     const bus = stdio_bus.eventBus();
 
     var registry = Registry.init(allocator, bus);

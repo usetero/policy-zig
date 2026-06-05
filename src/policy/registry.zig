@@ -236,7 +236,7 @@ pub const PolicyRegistry = struct {
     policy_sources: std.StringHashMap(PolicyMetadata),
 
     // Synchronization
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     allocator: std.mem.Allocator,
     version: std.atomic.Value(u64),
 
@@ -282,12 +282,12 @@ pub const PolicyRegistry = struct {
         return .{
             .policies = .empty,
             .policy_sources = std.StringHashMap(PolicyMetadata).init(allocator),
-            .mutex = .{},
+            .mutex = .init,
             .allocator = allocator,
             .version = std.atomic.Value(u64).init(0),
             .current_snapshot = std.atomic.Value(?*const PolicySnapshot).init(null),
-            .pending_snapshots = .{},
-            .providers = .{},
+            .pending_snapshots = .empty,
+            .providers = .empty,
             .subscriptions = .empty,
             .bus = bus,
         };
@@ -339,8 +339,8 @@ pub const PolicyRegistry = struct {
     /// Report an error encountered when applying a policy.
     /// Routes the error to the appropriate provider based on the policy's source.
     pub fn recordPolicyError(self: *PolicyRegistry, policy_id: []const u8, error_message: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.bus.io);
+        defer self.mutex.unlock(self.bus.io);
 
         if (self.policy_sources.get(policy_id)) |metadata| {
             if (self.providers.get(metadata.provider_id)) |provider| {
@@ -356,8 +356,8 @@ pub const PolicyRegistry = struct {
     /// Report statistics about policy hits, misses, and transform results.
     /// Routes the stats to the appropriate provider based on the policy's source.
     pub fn recordPolicyStats(self: *PolicyRegistry, policy_id: []const u8, hits: i64, misses: i64, transform_result: policy_provider.TransformResult) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.bus.io);
+        defer self.mutex.unlock(self.bus.io);
 
         if (self.policy_sources.get(policy_id)) |metadata| {
             if (self.providers.get(metadata.provider_id)) |provider| {
@@ -420,8 +420,8 @@ pub const PolicyRegistry = struct {
         provider_id: []const u8,
         source_type: SourceType,
     ) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.bus.io);
+        defer self.mutex.unlock(self.bus.io);
 
         // Track if any changes were made
         var changed = false;
@@ -498,7 +498,7 @@ pub const PolicyRegistry = struct {
         const id_key = try self.allocator.dupe(u8, policy.id);
         errdefer self.allocator.free(id_key);
 
-        try self.policy_sources.put(id_key, PolicyMetadata.init(provider_id, source_type));
+        try self.policy_sources.put(id_key, PolicyMetadata.init(self.bus.io, provider_id, source_type));
     }
 
     /// Remove a policy by id and free its memory
@@ -519,7 +519,7 @@ pub const PolicyRegistry = struct {
         provider_id: []const u8,
         new_ids: *const std.StringHashMap(void),
     ) !usize {
-        var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
+        var ids_to_remove = std.ArrayListUnmanaged([]const u8).empty;
         defer ids_to_remove.deinit(self.allocator);
 
         // Find policies from this provider not in new set
@@ -661,7 +661,10 @@ pub const PolicyRegistry = struct {
         // Defer cleanup of old snapshot to allow in-flight readers to complete.
         // This implements a simple grace period mechanism to prevent use-after-free.
         if (old_snapshot) |old| {
-            const now = std.time.nanoTimestamp();
+            // Monotonic clock: retire_time/elapsed is a grace-period duration,
+            // so use `.awake` (immune to wall-clock/NTP jumps), consistent with
+            // the read in cleanupExpiredSnapshots.
+            const now: i128 = std.Io.Timestamp.now(self.bus.io, .awake).nanoseconds;
             try self.pending_snapshots.append(self.allocator, .{
                 .snapshot = old,
                 .retire_time = now,
@@ -675,7 +678,8 @@ pub const PolicyRegistry = struct {
     /// Clean up snapshots whose grace period has expired.
     /// Also forces cleanup if we have too many pending snapshots.
     fn cleanupExpiredSnapshots(self: *PolicyRegistry) void {
-        const now = std.time.nanoTimestamp();
+        // Monotonic clock to match the retire_time set during snapshot swap.
+        const now: i128 = std.Io.Timestamp.now(self.bus.io, .awake).nanoseconds;
         var i: usize = 0;
 
         while (i < self.pending_snapshots.items.len) {
@@ -704,10 +708,10 @@ pub const PolicyRegistry = struct {
     /// Clear all policies from a specific source
     /// Clear all policies from a specific provider
     pub fn clearProvider(self: *PolicyRegistry, provider_id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.bus.io);
+        defer self.mutex.unlock(self.bus.io);
 
-        var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
+        var ids_to_remove = std.ArrayListUnmanaged([]const u8).empty;
         defer ids_to_remove.deinit(self.allocator);
 
         // Find all policies from this provider
@@ -771,7 +775,7 @@ fn freeTestPolicy(allocator: std.mem.Allocator, policy: *Policy) void {
 test "PolicyRegistry: init and deinit with no policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -782,7 +786,7 @@ test "PolicyRegistry: init and deinit with no policies" {
 test "PolicyRegistry: add single policy" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -802,7 +806,7 @@ test "PolicyRegistry: add single policy" {
 test "PolicyRegistry: add multiple policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -827,7 +831,7 @@ test "PolicyRegistry: add multiple policies" {
 test "PolicyRegistry: update existing policy from same source" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -860,7 +864,7 @@ test "PolicyRegistry: update existing policy from same source" {
 test "PolicyRegistry: HTTP source takes priority over file source" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -888,7 +892,7 @@ test "PolicyRegistry: HTTP source takes priority over file source" {
 test "PolicyRegistry: HTTP source can update file source policy" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -916,7 +920,7 @@ test "PolicyRegistry: HTTP source can update file source policy" {
 test "PolicyRegistry: multiple sources with different policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -943,7 +947,7 @@ test "PolicyRegistry: multiple sources with different policies" {
 test "PolicyRegistry: stale policies are removed when source updates" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -969,7 +973,7 @@ test "PolicyRegistry: stale policies are removed when source updates" {
 test "PolicyRegistry: stale removal only affects same source" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -998,7 +1002,7 @@ test "PolicyRegistry: stale removal only affects same source" {
 test "PolicyRegistry: clearProvider removes all policies from provider" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1029,7 +1033,7 @@ test "PolicyRegistry: clearProvider removes all policies from provider" {
 test "PolicyRegistry: snapshot version increments on update" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1058,7 +1062,7 @@ test "PolicyRegistry: snapshot version increments on update" {
 test "PolicyRegistry: clearProvider increments version" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1100,7 +1104,7 @@ test "TestProvider: integrates with PolicyRegistry" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1143,7 +1147,7 @@ test "TestProvider: multiple providers with different sources" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1198,7 +1202,7 @@ test "TestProvider: notifySubscribers updates registry" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1258,7 +1262,7 @@ test "TestProvider: HTTP provider overrides file provider" {
     const allocator = testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1386,7 +1390,7 @@ test "PolicyConfigType: fromPolicy returns none when log is null" {
 test "PolicySnapshot: log_target_indices contains only log policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1418,7 +1422,7 @@ test "PolicySnapshot: log_target_indices contains only log policies" {
 test "PolicySnapshot: multiple log policies are indexed" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1444,7 +1448,7 @@ test "PolicySnapshot: multiple log policies are indexed" {
 test "PolicySnapshot: empty when no log policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1467,7 +1471,7 @@ test "PolicySnapshot: empty when no log policies" {
 test "PolicySnapshot: iterateLogTargetPolicies returns all log policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1510,7 +1514,7 @@ test "PolicySnapshot: iterateLogTargetPolicies returns all log policies" {
 test "PolicySnapshot: iterator returns null when no log policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1529,7 +1533,7 @@ test "PolicySnapshot: iterator returns null when no log policies" {
 test "PolicySnapshot: indices update when policies change" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1568,7 +1572,7 @@ test "PolicySnapshot: indices update when policies change" {
 test "PolicyRegistry: registerProvider and recordPolicyError routes to correct provider" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1612,7 +1616,7 @@ test "PolicyRegistry: registerProvider and recordPolicyError routes to correct p
 test "PolicyRegistry: recordPolicyError for unknown policy does not route to provider" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1637,7 +1641,7 @@ test "PolicyRegistry: recordPolicyError for unknown policy does not route to pro
 test "PolicyRegistry: multiple errors for same policy accumulate" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1665,7 +1669,7 @@ test "PolicyRegistry: multiple errors for same policy accumulate" {
 test "PolicyRegistry: policies keyed by id not name" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1697,7 +1701,7 @@ test "PolicyRegistry: policies keyed by id not name" {
 test "PolicyRegistry: policy update by id replaces correctly" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1762,7 +1766,7 @@ test "PolicyConfigType: fromPolicy returns metric_target when metric is set" {
 test "PolicySnapshot: metric_target_indices contains only metric policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1821,7 +1825,7 @@ test "PolicySnapshot: metric_target_indices contains only metric policies" {
 test "PolicySnapshot: iterateMetricTargetPolicies iterates only metric policies" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

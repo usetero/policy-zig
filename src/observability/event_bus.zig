@@ -76,10 +76,10 @@ pub const NoopEventBus = struct {
 
     /// Initialize an uninitialized NoopEventBus in place.
     /// Call this on a variable that is already at its final address.
-    pub fn init(self: *NoopEventBus) void {
+    pub fn init(self: *NoopEventBus, io: std.Io) void {
         self.buf = undefined;
         self.discarding = std.Io.Writer.Discarding.init(&self.buf);
-        self.bus = EventBus.init(&self.discarding.writer);
+        self.bus = EventBus.init(io, &self.discarding.writer);
     }
 
     pub fn eventBus(self: *NoopEventBus) *EventBus {
@@ -93,8 +93,8 @@ pub const NoopEventBus = struct {
 /// IMPORTANT: This struct must NOT be moved after init() is called.
 /// The EventBus holds pointers to the writers inside this struct.
 pub const StdioEventBus = struct {
-    stdout_writer: std.fs.File.Writer,
-    stderr_writer: std.fs.File.Writer,
+    stdout_writer: std.Io.File.Writer,
+    stderr_writer: std.Io.File.Writer,
     bus: EventBus,
 
     /// Buffers for writers - static to avoid lifetime issues
@@ -103,10 +103,10 @@ pub const StdioEventBus = struct {
 
     /// Initialize an uninitialized StdioEventBus in place.
     /// Call this on a variable that is already at its final address.
-    pub fn init(self: *StdioEventBus) void {
-        self.stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-        self.stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-        self.bus = EventBus.initDual(&self.stdout_writer.interface, &self.stderr_writer.interface);
+    pub fn init(self: *StdioEventBus, io: std.Io) void {
+        self.stdout_writer = std.Io.File.Writer.init(.stdout(), io, &stdout_buf);
+        self.stderr_writer = std.Io.File.Writer.init(.stderr(), io, &stderr_buf);
+        self.bus = EventBus.initDual(io, &self.stdout_writer.interface, &self.stderr_writer.interface);
     }
 
     /// Get a pointer to the EventBus for use
@@ -123,27 +123,31 @@ pub const EventBus = struct {
     min_level: Level,
     current_span: ?*const Span,
     /// Mutex for thread-safe writes (writers are not thread-safe)
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
+    /// Io instance used for mutex operations and timestamps
+    io: std.Io,
 
     /// Initialize with a single std.Io.Writer for all levels
-    pub fn init(writer: *std.Io.Writer) EventBus {
+    pub fn init(io: std.Io, writer: *std.Io.Writer) EventBus {
         return .{
             .writer = writer,
             .err_writer = writer,
             .min_level = .info,
             .current_span = null,
-            .mutex = .{},
+            .mutex = .init,
+            .io = io,
         };
     }
 
     /// Initialize with separate writers: stdout for non-errors, stderr for errors
-    pub fn initDual(stdout_writer: *std.Io.Writer, stderr_writer: *std.Io.Writer) EventBus {
+    pub fn initDual(io: std.Io, stdout_writer: *std.Io.Writer, stderr_writer: *std.Io.Writer) EventBus {
         return .{
             .writer = stdout_writer,
             .err_writer = stderr_writer,
             .min_level = .info,
             .current_span = null,
-            .mutex = .{},
+            .mutex = .init,
+            .io = io,
         };
     }
 
@@ -159,6 +163,8 @@ pub const EventBus = struct {
             .err_writer = self.err_writer,
             .min_level = self.min_level,
             .current_span = span,
+            .mutex = .init,
+            .io = self.io,
         };
     }
 
@@ -188,10 +194,10 @@ pub const EventBus = struct {
         var guard = SpanGuard(@TypeOf(event)){
             .bus = self,
             .span = .{
-                .id = Span.generateSpanId(),
+                .id = Span.generateSpanId(self.io),
                 .name = span_name,
                 .level = level,
-                .start_time = std.time.microTimestamp(),
+                .start_time = std.Io.Timestamp.now(self.io, .awake).toMicroseconds(),
                 .parent = self.current_span,
             },
         };
@@ -246,16 +252,16 @@ pub const EventBus = struct {
         }
 
         // Acquire mutex for thread-safe writes
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Select writer based on level (errors go to err_writer)
         const writer = self.writerForLevel(level);
 
         // Timestamp (ISO 8601 with milliseconds: 2025-12-03T14:30:45.123Z)
-        const millis = std.time.milliTimestamp();
-        const secs: u64 = @intCast(@divFloor(millis, 1000));
-        const ms: u64 = @intCast(@mod(millis, 1000));
+        const now_ts = std.Io.Timestamp.now(self.io, .real);
+        const secs: u64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
+        const ms: u64 = @intCast(@divFloor(@mod(now_ts.nanoseconds, std.time.ns_per_s), std.time.ns_per_ms));
         const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
         const epoch_day = epoch_seconds.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
@@ -289,7 +295,7 @@ pub const EventBus = struct {
             writer.print(" span_id={s}", .{span_id}) catch return;
 
             var elapsed_buf: [32]u8 = undefined;
-            const elapsed = s.formatElapsed(&elapsed_buf);
+            const elapsed = s.formatElapsed(self.io, &elapsed_buf);
             writer.print(" elapsed={s}", .{elapsed}) catch return;
         }
 
@@ -402,7 +408,7 @@ const TestWriter = struct {
 
     fn init(allocator: std.mem.Allocator) TestWriter {
         return .{
-            .output = .{},
+            .output = .empty,
             .allocator = allocator,
             .io_writer = std.Io.Writer.Allocating.init(allocator),
         };
@@ -430,7 +436,7 @@ test "EventBus: simple info event" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.debug);
 
     const UserLoggedIn = struct {
@@ -451,7 +457,7 @@ test "EventBus: level filtering" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.warn); // Only warn and above
 
     const DebugEvent = struct { detail: []const u8 };
@@ -469,7 +475,7 @@ test "EventBus: span with timing" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.debug);
 
     const BatchProcessingStarted = struct { batch_id: u32 };
@@ -478,7 +484,7 @@ test "EventBus: span with timing" {
     var span = bus.started(.info, BatchProcessingStarted{ .batch_id = 123 });
 
     // Simulate some work
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    try std.Options.debug_io.sleep(.fromMilliseconds(10), .awake);
 
     span.completed(BatchProcessingCompleted{ .items_processed = 5 });
 
@@ -494,7 +500,7 @@ test "EventBus: numeric and boolean fields" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.debug);
 
     const MetricsEvent = struct {
@@ -515,7 +521,7 @@ test "EventBus: enum fields" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.debug);
 
     const Status = enum { pending, running, completed };
@@ -531,7 +537,7 @@ test "EventBus: optional fields" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.debug);
 
     const OptionalEvent = struct {

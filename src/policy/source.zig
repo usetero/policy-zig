@@ -22,11 +22,11 @@ pub const PolicyMetadata = struct {
     source_type: SourceType,
     last_updated: i128, // Unix timestamp in nanoseconds
 
-    pub fn init(provider_id: []const u8, source_type: SourceType) PolicyMetadata {
+    pub fn init(io: std.Io, provider_id: []const u8, source_type: SourceType) PolicyMetadata {
         return .{
             .provider_id = provider_id,
             .source_type = source_type,
-            .last_updated = std.time.nanoTimestamp(),
+            .last_updated = std.Io.Timestamp.now(io, .real).nanoseconds,
         };
     }
 
@@ -37,8 +37,8 @@ pub const PolicyMetadata = struct {
 };
 
 test "PolicyMetadata.shouldReplace prioritizes HTTP over file" {
-    const file_meta = PolicyMetadata.init("file-provider", .file);
-    const http_meta = PolicyMetadata.init("http-provider", .http);
+    const file_meta = PolicyMetadata.init(std.Options.debug_io, "file-provider", .file);
+    const http_meta = PolicyMetadata.init(std.Options.debug_io, "http-provider", .http);
 
     // HTTP should replace file
     try std.testing.expect(file_meta.shouldReplace(.http));

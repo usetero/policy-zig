@@ -89,6 +89,10 @@ pub const TransformOptions = struct {
     /// call must keep `scratch` alive at least that long, and should
     /// reset/deinit the arena at a natural boundary (e.g. per log record).
     scratch: ?std.mem.Allocator = null,
+    /// Io used to serialize the regex engine's per-call scratch state via the
+    /// compiled rule's mutex. Only consulted on the regex-redact path; like
+    /// `scratch`, a null `io` degrades regex rules to no-op.
+    io: ?std.Io = null,
 };
 
 /// Optional configuration for a single redact rule.
@@ -104,6 +108,10 @@ pub const RedactOptions = struct {
     /// mutator by reference without freeing it. Use an arena that the caller
     /// resets at an appropriate boundary.
     scratch: ?std.mem.Allocator = null,
+    /// Io used to serialize the regex engine via the compiled rule's mutex.
+    /// Ignored when `compiled` is null; required (non-null) for the regex path
+    /// to run — a null `io` degrades the regex path to no-op (like `scratch`).
+    io: ?std.Io = null,
 };
 
 /// Apply all transforms from a LogTransform in order: remove → redact → rename → add.
@@ -145,6 +153,7 @@ pub fn applyTransforms(
             if (applyRedact(cr.rule, ctx, accessor, .{
                 .compiled = if (cr.compiled) |*c| c else null,
                 .scratch = options.scratch,
+                .io = options.io,
             })) {
                 result.redacts_applied += 1;
             }
@@ -210,6 +219,7 @@ pub fn applyRedact(
 
     if (options.compiled) |c| {
         const allocator = options.scratch orelse return false;
+        const io = options.io orelse return false;
         const value = accessor.value(ctx, field_ref) orelse return false;
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -225,7 +235,7 @@ pub fn applyRedact(
         // the engine's internal scratch state is mutable, and the Mutex
         // makes that safe across threads.
         const mut: *redact_mod.Compiled = @constCast(c);
-        const count = mut.replaceAll(value, &out, allocator) catch return false;
+        const count = mut.replaceAll(io, value, &out, allocator) catch return false;
         if (count == 0) return false;
 
         accessor.set.?(ctx, field_ref, out.items);
@@ -506,6 +516,7 @@ test "applyRedact: regex targeted replacement" {
     const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
+        .io = std.Options.debug_io,
     });
     try testing.expect(result);
     try testing.expectEqualStrings("?user=alice&password=[REDACTED]&session=xyz", ctx.fields.get("body").?);
@@ -532,6 +543,7 @@ test "applyRedact: regex no-match is a no-op" {
     const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
+        .io = std.Options.debug_io,
     });
     try testing.expect(!result);
     try testing.expectEqualStrings("no secrets here", ctx.fields.get("body").?);
@@ -587,6 +599,7 @@ test "applyRedact: regex output outlives applyRedact return" {
     const result = applyRedact(&rule, @ptrCast(&ctx), &ByRefCtx.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
+        .io = std.Options.debug_io,
     });
     try testing.expect(result);
 
@@ -614,6 +627,7 @@ test "applyRedact: regex on missing field is a no-op" {
     const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.accessor, .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
+        .io = std.Options.debug_io,
     });
     try testing.expect(!result);
 }

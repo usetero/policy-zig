@@ -417,7 +417,7 @@ fn parsePolicy(allocator: std.mem.Allocator, json_policy: PolicyJson) !Policy {
 // =============================================================================
 
 fn parseLogTarget(allocator: std.mem.Allocator, json: LogTargetJson) !LogTarget {
-    var matchers = std.ArrayListUnmanaged(LogMatcher){};
+    var matchers = std.ArrayListUnmanaged(LogMatcher).empty;
 
     if (json.match) |json_matchers| {
         try matchers.ensureTotalCapacity(allocator, json_matchers.len);
@@ -728,7 +728,7 @@ fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
 // =============================================================================
 
 fn parseMetricTarget(allocator: std.mem.Allocator, json: MetricTargetJson) !MetricTarget {
-    var matchers = std.ArrayListUnmanaged(MetricMatcher){};
+    var matchers = std.ArrayListUnmanaged(MetricMatcher).empty;
 
     if (json.match) |json_matchers| {
         try matchers.ensureTotalCapacity(allocator, json_matchers.len);
@@ -835,7 +835,7 @@ fn parseAggregationTemporality(name: []const u8) !AggregationTemporality {
 // =============================================================================
 
 fn parseTraceTarget(allocator: std.mem.Allocator, json: TraceTargetJson) !TraceTarget {
-    var matchers = std.ArrayListUnmanaged(TraceMatcher){};
+    var matchers = std.ArrayListUnmanaged(TraceMatcher).empty;
 
     if (json.match) |json_matchers| {
         try matchers.ensureTotalCapacity(allocator, json_matchers.len);
@@ -2605,9 +2605,9 @@ test "parseValue: float shorthand" {
 
 test "parseValue: hex_value canonical" {
     const allocator = std.testing.allocator;
-    var obj = std.json.ObjectMap.init(allocator);
-    defer obj.deinit();
-    try obj.put("hex_value", .{ .string = "deadbeef" });
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "hex_value", .{ .string = "deadbeef" });
     const v = try parseValue(allocator, .{ .object = obj });
     defer allocator.free(v.value.?.bytes_value);
     try std.testing.expect(v.value.? == .bytes_value);

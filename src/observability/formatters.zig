@@ -1,9 +1,9 @@
 const std = @import("std");
 const Level = @import("level.zig").Level;
 
-/// Format a timestamp as HH:MM:SS
-pub fn formatTimestamp(buf: []u8) []const u8 {
-    const timestamp = std.time.timestamp();
+/// Format the current time as HH:MM:SS
+pub fn formatTimestamp(io: std.Io, buf: []u8) []const u8 {
+    const timestamp = std.Io.Timestamp.now(io, .real).toSeconds();
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
 
@@ -14,9 +14,9 @@ pub fn formatTimestamp(buf: []u8) []const u8 {
     }) catch "??:??:??";
 }
 
-/// Format a timestamp as ISO8601
-pub fn formatTimestampISO(buf: []u8) []const u8 {
-    const timestamp = std.time.timestamp();
+/// Format the current time as ISO8601
+pub fn formatTimestampISO(io: std.Io, buf: []u8) []const u8 {
+    const timestamp = std.Io.Timestamp.now(io, .real).toSeconds();
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
@@ -35,7 +35,7 @@ pub fn formatTimestampISO(buf: []u8) []const u8 {
 
 test "formatTimestamp" {
     var buf: [16]u8 = undefined;
-    const ts = formatTimestamp(&buf);
+    const ts = formatTimestamp(std.Options.debug_io, &buf);
     try std.testing.expectEqual(@as(usize, 8), ts.len); // HH:MM:SS
     try std.testing.expectEqual(@as(u8, ':'), ts[2]);
     try std.testing.expectEqual(@as(u8, ':'), ts[5]);
@@ -43,7 +43,7 @@ test "formatTimestamp" {
 
 test "formatTimestampISO" {
     var buf: [32]u8 = undefined;
-    const ts = formatTimestampISO(&buf);
+    const ts = formatTimestampISO(std.Options.debug_io, &buf);
     try std.testing.expectEqual(@as(usize, 20), ts.len);
     try std.testing.expectEqual(@as(u8, 'T'), ts[10]);
     try std.testing.expectEqual(@as(u8, 'Z'), ts[19]);

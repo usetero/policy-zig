@@ -37,7 +37,7 @@ pub const SymbolVisibility = enum(i32) {
 /// The protocol compiler can output a FileDescriptorSet containing the .proto
 /// files it parses.
 pub const FileDescriptorSet = struct {
-    file: std.ArrayListUnmanaged(FileDescriptorProto) = .empty,
+    file: std.ArrayList(FileDescriptorProto) = .empty,
 
     pub const _desc_table = .{
         .file = fd(1, .{ .repeated = .submessage }),
@@ -85,9 +85,10 @@ pub const FileDescriptorSet = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -99,26 +100,20 @@ pub const FileDescriptorSet = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// Describes a complete .proto file.
 pub const FileDescriptorProto = struct {
     name: ?[]const u8 = null,
     package: ?[]const u8 = null,
-    dependency: std.ArrayListUnmanaged([]const u8) = .empty,
-    public_dependency: std.ArrayListUnmanaged(i32) = .empty,
-    weak_dependency: std.ArrayListUnmanaged(i32) = .empty,
-    option_dependency: std.ArrayListUnmanaged([]const u8) = .empty,
-    message_type: std.ArrayListUnmanaged(DescriptorProto) = .empty,
-    enum_type: std.ArrayListUnmanaged(EnumDescriptorProto) = .empty,
-    service: std.ArrayListUnmanaged(ServiceDescriptorProto) = .empty,
-    extension: std.ArrayListUnmanaged(FieldDescriptorProto) = .empty,
+    dependency: std.ArrayList([]const u8) = .empty,
+    public_dependency: std.ArrayList(i32) = .empty,
+    weak_dependency: std.ArrayList(i32) = .empty,
+    option_dependency: std.ArrayList([]const u8) = .empty,
+    message_type: std.ArrayList(DescriptorProto) = .empty,
+    enum_type: std.ArrayList(EnumDescriptorProto) = .empty,
+    service: std.ArrayList(ServiceDescriptorProto) = .empty,
+    extension: std.ArrayList(FieldDescriptorProto) = .empty,
     options: ?FileOptions = null,
     source_code_info: ?SourceCodeInfo = null,
     syntax: ?[]const u8 = null,
@@ -183,9 +178,10 @@ pub const FileDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -197,26 +193,20 @@ pub const FileDescriptorProto = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// Describes a message type.
 pub const DescriptorProto = struct {
     name: ?[]const u8 = null,
-    field: std.ArrayListUnmanaged(FieldDescriptorProto) = .empty,
-    extension: std.ArrayListUnmanaged(FieldDescriptorProto) = .empty,
-    nested_type: std.ArrayListUnmanaged(DescriptorProto) = .empty,
-    enum_type: std.ArrayListUnmanaged(EnumDescriptorProto) = .empty,
-    extension_range: std.ArrayListUnmanaged(DescriptorProto.ExtensionRange) = .empty,
-    oneof_decl: std.ArrayListUnmanaged(OneofDescriptorProto) = .empty,
+    field: std.ArrayList(FieldDescriptorProto) = .empty,
+    extension: std.ArrayList(FieldDescriptorProto) = .empty,
+    nested_type: std.ArrayList(DescriptorProto) = .empty,
+    enum_type: std.ArrayList(EnumDescriptorProto) = .empty,
+    extension_range: std.ArrayList(DescriptorProto.ExtensionRange) = .empty,
+    oneof_decl: std.ArrayList(OneofDescriptorProto) = .empty,
     options: ?MessageOptions = null,
-    reserved_range: std.ArrayListUnmanaged(DescriptorProto.ReservedRange) = .empty,
-    reserved_name: std.ArrayListUnmanaged([]const u8) = .empty,
+    reserved_range: std.ArrayList(DescriptorProto.ReservedRange) = .empty,
+    reserved_name: std.ArrayList([]const u8) = .empty,
     visibility: ?SymbolVisibility = null,
 
     pub const _desc_table = .{
@@ -286,9 +276,10 @@ pub const DescriptorProto = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -299,12 +290,6 @@ pub const DescriptorProto = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -362,9 +347,10 @@ pub const DescriptorProto = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -375,12 +361,6 @@ pub const DescriptorProto = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -426,9 +406,10 @@ pub const DescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -440,17 +421,11 @@ pub const DescriptorProto = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const ExtensionRangeOptions = struct {
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
-    declaration: std.ArrayListUnmanaged(ExtensionRangeOptions.Declaration) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
+    declaration: std.ArrayList(ExtensionRangeOptions.Declaration) = .empty,
     features: ?FeatureSet = null,
     verification: ?ExtensionRangeOptions.VerificationState = .UNVERIFIED,
 
@@ -525,9 +500,10 @@ pub const ExtensionRangeOptions = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -538,12 +514,6 @@ pub const ExtensionRangeOptions = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -589,9 +559,10 @@ pub const ExtensionRangeOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -602,12 +573,6 @@ pub const ExtensionRangeOptions = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -710,9 +675,10 @@ pub const FieldDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -723,12 +689,6 @@ pub const FieldDescriptorProto = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -784,9 +744,10 @@ pub const OneofDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -798,21 +759,15 @@ pub const OneofDescriptorProto = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// Describes an enum type.
 pub const EnumDescriptorProto = struct {
     name: ?[]const u8 = null,
-    value: std.ArrayListUnmanaged(EnumValueDescriptorProto) = .empty,
+    value: std.ArrayList(EnumValueDescriptorProto) = .empty,
     options: ?EnumOptions = null,
-    reserved_range: std.ArrayListUnmanaged(EnumDescriptorProto.EnumReservedRange) = .empty,
-    reserved_name: std.ArrayListUnmanaged([]const u8) = .empty,
+    reserved_range: std.ArrayList(EnumDescriptorProto.EnumReservedRange) = .empty,
+    reserved_name: std.ArrayList([]const u8) = .empty,
     visibility: ?SymbolVisibility = null,
 
     pub const _desc_table = .{
@@ -881,9 +836,10 @@ pub const EnumDescriptorProto = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -894,12 +850,6 @@ pub const EnumDescriptorProto = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -945,9 +895,10 @@ pub const EnumDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -958,12 +909,6 @@ pub const EnumDescriptorProto = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -1021,9 +966,10 @@ pub const EnumValueDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1035,18 +981,12 @@ pub const EnumValueDescriptorProto = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// Describes a service.
 pub const ServiceDescriptorProto = struct {
     name: ?[]const u8 = null,
-    method: std.ArrayListUnmanaged(MethodDescriptorProto) = .empty,
+    method: std.ArrayList(MethodDescriptorProto) = .empty,
     options: ?ServiceOptions = null,
 
     pub const _desc_table = .{
@@ -1097,9 +1037,10 @@ pub const ServiceDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1110,12 +1051,6 @@ pub const ServiceDescriptorProto = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -1179,9 +1114,10 @@ pub const MethodDescriptorProto = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1192,12 +1128,6 @@ pub const MethodDescriptorProto = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -1222,7 +1152,7 @@ pub const FileOptions = struct {
     php_metadata_namespace: ?[]const u8 = null,
     ruby_package: ?[]const u8 = null,
     features: ?FeatureSet = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .java_package = fd(1, .{ .scalar = .string }),
@@ -1298,9 +1228,10 @@ pub const FileOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1312,12 +1243,6 @@ pub const FileOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const MessageOptions = struct {
@@ -1327,7 +1252,7 @@ pub const MessageOptions = struct {
     map_entry: ?bool = null,
     deprecated_legacy_json_field_conflicts: ?bool = null,
     features: ?FeatureSet = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .message_set_wire_format = fd(1, .{ .scalar = .bool }),
@@ -1381,9 +1306,10 @@ pub const MessageOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1394,12 +1320,6 @@ pub const MessageOptions = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -1413,11 +1333,11 @@ pub const FieldOptions = struct {
     weak: ?bool = false,
     debug_redact: ?bool = false,
     retention: ?FieldOptions.OptionRetention = null,
-    targets: std.ArrayListUnmanaged(FieldOptions.OptionTargetType) = .empty,
-    edition_defaults: std.ArrayListUnmanaged(FieldOptions.EditionDefault) = .empty,
+    targets: std.ArrayList(FieldOptions.OptionTargetType) = .empty,
+    edition_defaults: std.ArrayList(FieldOptions.EditionDefault) = .empty,
     features: ?FeatureSet = null,
     feature_support: ?FieldOptions.FeatureSupport = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .ctype = fd(1, .@"enum"),
@@ -1526,9 +1446,10 @@ pub const FieldOptions = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -1539,12 +1460,6 @@ pub const FieldOptions = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -1604,9 +1519,10 @@ pub const FieldOptions = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -1617,12 +1533,6 @@ pub const FieldOptions = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -1668,9 +1578,10 @@ pub const FieldOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1682,17 +1593,11 @@ pub const FieldOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const OneofOptions = struct {
     features: ?FeatureSet = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .features = fd(1, .submessage),
@@ -1741,9 +1646,10 @@ pub const OneofOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1755,12 +1661,6 @@ pub const OneofOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const EnumOptions = struct {
@@ -1768,7 +1668,7 @@ pub const EnumOptions = struct {
     deprecated: ?bool = false,
     deprecated_legacy_json_field_conflicts: ?bool = null,
     features: ?FeatureSet = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .allow_alias = fd(2, .{ .scalar = .bool }),
@@ -1820,9 +1720,10 @@ pub const EnumOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1834,12 +1735,6 @@ pub const EnumOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const EnumValueOptions = struct {
@@ -1847,7 +1742,7 @@ pub const EnumValueOptions = struct {
     features: ?FeatureSet = null,
     debug_redact: ?bool = false,
     feature_support: ?FieldOptions.FeatureSupport = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .deprecated = fd(1, .{ .scalar = .bool }),
@@ -1899,9 +1794,10 @@ pub const EnumValueOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1913,18 +1809,12 @@ pub const EnumValueOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const ServiceOptions = struct {
     features: ?FeatureSet = null,
     deprecated: ?bool = false,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .features = fd(34, .submessage),
@@ -1974,9 +1864,10 @@ pub const ServiceOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -1988,19 +1879,13 @@ pub const ServiceOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 pub const MethodOptions = struct {
     deprecated: ?bool = false,
     idempotency_level: ?MethodOptions.IdempotencyLevel = .IDEMPOTENCY_UNKNOWN,
     features: ?FeatureSet = null,
-    uninterpreted_option: std.ArrayListUnmanaged(UninterpretedOption) = .empty,
+    uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
 
     pub const _desc_table = .{
         .deprecated = fd(33, .{ .scalar = .bool }),
@@ -2061,9 +1946,10 @@ pub const MethodOptions = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -2075,12 +1961,6 @@ pub const MethodOptions = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// A message representing a option the parser does not recognize. This only
@@ -2090,7 +1970,7 @@ pub const MethodOptions = struct {
 /// or produced by Descriptor::CopyTo()) will never have UninterpretedOptions
 /// in them.
 pub const UninterpretedOption = struct {
-    name: std.ArrayListUnmanaged(UninterpretedOption.NamePart) = .empty,
+    name: std.ArrayList(UninterpretedOption.NamePart) = .empty,
     identifier_value: ?[]const u8 = null,
     positive_int_value: ?u64 = null,
     negative_int_value: ?i64 = null,
@@ -2164,9 +2044,10 @@ pub const UninterpretedOption = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -2177,12 +2058,6 @@ pub const UninterpretedOption = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -2228,9 +2103,10 @@ pub const UninterpretedOption = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -2241,12 +2117,6 @@ pub const UninterpretedOption = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };
 
@@ -2381,9 +2251,10 @@ pub const FeatureSet = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -2394,12 +2265,6 @@ pub const FeatureSet = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -2445,9 +2310,10 @@ pub const FeatureSet = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -2459,12 +2325,6 @@ pub const FeatureSet = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// A compiled specification for the defaults of a set of features.  These
@@ -2472,7 +2332,7 @@ pub const FeatureSet = struct {
 /// feature resolution. The resolution with this object becomes a simple search
 /// for the closest matching edition, followed by proto merges.
 pub const FeatureSetDefaults = struct {
-    defaults: std.ArrayListUnmanaged(FeatureSetDefaults.FeatureSetEditionDefault) = .empty,
+    defaults: std.ArrayList(FeatureSetDefaults.FeatureSetEditionDefault) = .empty,
     minimum_edition: ?Edition = null,
     maximum_edition: ?Edition = null,
 
@@ -2539,9 +2399,10 @@ pub const FeatureSetDefaults = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -2552,12 +2413,6 @@ pub const FeatureSetDefaults = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -2603,9 +2458,10 @@ pub const FeatureSetDefaults = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -2617,29 +2473,23 @@ pub const FeatureSetDefaults = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// Encapsulates information about the original source file from which a
 /// FileDescriptorProto was generated.
 pub const SourceCodeInfo = struct {
-    location: std.ArrayListUnmanaged(SourceCodeInfo.Location) = .empty,
+    location: std.ArrayList(SourceCodeInfo.Location) = .empty,
 
     pub const _desc_table = .{
         .location = fd(1, .{ .repeated = .submessage }),
     };
 
     pub const Location = struct {
-        path: std.ArrayListUnmanaged(i32) = .empty,
-        span: std.ArrayListUnmanaged(i32) = .empty,
+        path: std.ArrayList(i32) = .empty,
+        span: std.ArrayList(i32) = .empty,
         leading_comments: ?[]const u8 = null,
         trailing_comments: ?[]const u8 = null,
-        leading_detached_comments: std.ArrayListUnmanaged([]const u8) = .empty,
+        leading_detached_comments: std.ArrayList([]const u8) = .empty,
 
         pub const _desc_table = .{
             .path = fd(1, .{ .packed_repeated = .{ .scalar = .int32 } }),
@@ -2691,9 +2541,10 @@ pub const SourceCodeInfo = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -2704,12 +2555,6 @@ pub const SourceCodeInfo = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -2755,9 +2600,10 @@ pub const SourceCodeInfo = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -2769,26 +2615,20 @@ pub const SourceCodeInfo = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
-    }
 };
 
 /// Describes the relationship between generated code and its original source
 /// file. A GeneratedCodeInfo message is associated with only one generated
 /// source file, but may contain references to different source .proto files.
 pub const GeneratedCodeInfo = struct {
-    annotation: std.ArrayListUnmanaged(GeneratedCodeInfo.Annotation) = .empty,
+    annotation: std.ArrayList(GeneratedCodeInfo.Annotation) = .empty,
 
     pub const _desc_table = .{
         .annotation = fd(1, .{ .repeated = .submessage }),
     };
 
     pub const Annotation = struct {
-        path: std.ArrayListUnmanaged(i32) = .empty,
+        path: std.ArrayList(i32) = .empty,
         source_file: ?[]const u8 = null,
         begin: ?i32 = null,
         end: ?i32 = null,
@@ -2853,9 +2693,10 @@ pub const GeneratedCodeInfo = struct {
         pub fn jsonEncode(
             self: @This(),
             options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
             allocator: std.mem.Allocator,
         ) ![]const u8 {
-            return protobuf.json.encode(self, options, allocator);
+            return protobuf.json.encode(self, options, pb_options, allocator);
         }
 
         /// This method is used by std.json
@@ -2866,12 +2707,6 @@ pub const GeneratedCodeInfo = struct {
             options: std.json.ParseOptions,
         ) !@This() {
             return protobuf.json.parse(@This(), allocator, source, options);
-        }
-
-        /// This method is used by std.json
-        /// internally for serialization. DO NOT RENAME!
-        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-            return protobuf.json.stringify(@This(), self, jws);
         }
     };
 
@@ -2917,9 +2752,10 @@ pub const GeneratedCodeInfo = struct {
     pub fn jsonEncode(
         self: @This(),
         options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
         allocator: std.mem.Allocator,
     ) ![]const u8 {
-        return protobuf.json.encode(self, options, allocator);
+        return protobuf.json.encode(self, options, pb_options, allocator);
     }
 
     /// This method is used by std.json
@@ -2930,11 +2766,5 @@ pub const GeneratedCodeInfo = struct {
         options: std.json.ParseOptions,
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
-    }
-
-    /// This method is used by std.json
-    /// internally for serialization. DO NOT RENAME!
-    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
-        return protobuf.json.stringify(@This(), self, jws);
     }
 };

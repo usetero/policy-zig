@@ -14,7 +14,7 @@
 //! defer registry.deinit();
 //!
 //! // Construct an accessor for your record type and pass it to evaluate():
-//! //   engine.evaluate(.log, &my_log_accessor, &log, &policy_id_buf, .{});
+//! //   engine.evaluate(.log, &my_log_accessor, &log, &policy_id_buf, .{ .io = io });
 //! // A single Registry can serve multiple consumers — each call passes the
 //! // accessor appropriate to its record shape. The accessor is comptime,
 //! // so transforms requiring a primitive (set/delete/move) that the
