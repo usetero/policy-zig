@@ -69,6 +69,7 @@ const PolicyStatusRecord = struct {
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     /// Unique identifier for this provider
     id: []const u8,
     http_client: std.http.Client,
@@ -141,6 +142,7 @@ pub const HttpProvider = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .id = id_copy,
             .http_client = std.http.Client{ .allocator = allocator, .io = io },
             .config_url = url_copy,
@@ -320,14 +322,14 @@ pub const HttpProvider = struct {
         self.allocator.destroy(self);
     }
 
-    fn pollLoop(self: *HttpProvider) void {
+    fn pollLoop(self: *HttpProvider) !void {
         while (!self.shutdown_flag.load(.acquire)) {
             // Sleep in small increments so we can respond quickly to shutdown
             const sleep_increment_ns = 100 * std.time.ns_per_ms; // 100ms
             var slept_ns: u64 = 0;
 
             while (slept_ns < self.poll_interval_ns and !self.shutdown_flag.load(.acquire)) {
-                std.Thread.sleep(sleep_increment_ns);
+                try self.io.sleep(.fromNanoseconds(sleep_increment_ns), .awake);
                 slept_ns += sleep_increment_ns;
             }
 

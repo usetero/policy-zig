@@ -68,6 +68,7 @@ const ProviderState = struct {
 
 pub const PolicyLoader = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     bus: *EventBus,
     registry: *Registry,
     service: ServiceMetadata,
@@ -88,6 +89,7 @@ pub const PolicyLoader = struct {
     /// Does not start loading - call `startAsync()` or `loadSync()` to begin.
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         bus: *EventBus,
         registry: *Registry,
         provider_configs: []const ProviderConfig,
@@ -106,6 +108,7 @@ pub const PolicyLoader = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .bus = bus,
             .registry = registry,
             .service = service,
@@ -131,9 +134,9 @@ pub const PolicyLoader = struct {
 
     /// Wait for the initial load to complete.
     /// Call this after `startAsync()` if you need to block until ready.
-    pub fn waitForInitialLoad(self: *PolicyLoader) void {
+    pub fn waitForInitialLoad(self: *PolicyLoader) !void {
         while (!self.initial_load_complete.load(.acquire)) {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            try self.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake);
         }
     }
 
@@ -309,6 +312,7 @@ test "PolicyLoader: init and deinit" {
 
     var loader = try PolicyLoader.init(
         allocator,
+        std.Options.debug_io,
         bus,
         &registry,
         &configs,
