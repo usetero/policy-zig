@@ -421,7 +421,7 @@ pub const HttpProvider = struct {
         const supported_policy_stages = self.service.supported_stages;
 
         // Build policy_statuses from our tracked state
-        var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
+        var policy_statuses_list: std.ArrayListUnmanaged(PolicySyncStatus) = .empty;
         // No defer needed - arena handles cleanup
 
         // Get last successful hash (if any) - read under lock
