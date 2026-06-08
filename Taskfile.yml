@@ -87,6 +87,19 @@ tasks:
     aliases: [l]
     cmds:
       - task: format:check
+      - task: lint:zig
+
+  lint:zig:
+    desc: "Run ziglint on handwritten Zig files before merge"
+    aliases: [zl]
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - |
+        if ! command -v ziglint >/dev/null 2>&1; then
+          echo "ziglint is required before merge. Install it or add it to PATH."
+          exit 1
+        fi
+        ziglint
 
   clean:
     desc: "Clean build artifacts"

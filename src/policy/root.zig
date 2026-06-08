@@ -109,7 +109,7 @@ pub const LogMatcherIndex = matcher_index.LogMatcherIndex;
 pub const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
 pub const LogMatcherKey = matcher_index.LogMatcherKey;
 pub const MetricMatcherKey = matcher_index.MetricMatcherKey;
-pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
+pub const max_policies = matcher_index.max_policies;
 pub const CompiledValue = matcher_index.CompiledValue;
 pub const CompiledNumericValue = matcher_index.CompiledNumericValue;
 pub const CompiledTypedMatcher = matcher_index.CompiledTypedMatcher;
@@ -132,7 +132,7 @@ pub const policy_engine = @import("./policy_engine.zig");
 pub const PolicyEngine = policy_engine.PolicyEngine;
 pub const PolicyResult = policy_engine.PolicyResult;
 pub const FilterDecision = policy_engine.FilterDecision;
-pub const MAX_MATCHES_PER_SCAN = policy_engine.MAX_MATCHES_PER_SCAN;
+pub const max_matches_per_scan = policy_engine.max_matches_per_scan;
 
 // =============================================================================
 // Parsing

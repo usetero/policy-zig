@@ -100,31 +100,58 @@ pub const FileProvider = struct {
     }
 
     pub fn deinit(self: *FileProvider) void {
+        const allocator = self.allocator;
+        // LIFO defer order: self.* = undefined runs first (while memory is
+        // still valid), then destroy frees it.
+        defer allocator.destroy(self);
+        defer self.* = undefined;
+
         // Ensure shutdown is called first
         self.shutdown();
 
-        self.allocator.free(self.id);
-        self.allocator.free(self.config_path);
-        self.allocator.destroy(self);
+        allocator.free(self.id);
+        allocator.free(self.config_path);
     }
 
     /// Report an error encountered when applying a policy.
     /// For file provider, this logs to stderr since there's no remote server to report to.
     pub fn recordPolicyError(self: *FileProvider, policy_id: []const u8, error_message: []const u8) void {
-        self.bus.err(PolicyError{ .policy_id = policy_id, .message = error_message });
+        const event: PolicyError = .{
+            .policy_id = policy_id,
+            .message = error_message,
+        };
+        self.bus.err(event);
     }
 
     /// Report statistics about policy hits, misses, and transform results.
     /// For file provider, this logs to stdout since there's no remote server to report to.
-    pub fn recordPolicyStats(self: *FileProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
-        self.bus.debug(PolicyStats{ .policy_id = policy_id, .hits = hits, .misses = misses, .transform_result = transform_result });
+    pub fn recordPolicyStats(
+        self: *FileProvider,
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    ) void {
+        const event: PolicyStats = .{
+            .policy_id = policy_id,
+            .hits = hits,
+            .misses = misses,
+            .transform_result = transform_result,
+        };
+        self.bus.debug(event);
     }
 
     fn loadAndNotify(self: *FileProvider) !void {
-        self.bus.info(PoliciesLoading{ .path = self.config_path });
+        const loading_event: PoliciesLoading = .{ .path = self.config_path };
+        self.bus.info(loading_event);
 
         // Read file contents and compute hash
-        const contents = try std.Io.Dir.cwd().readFileAlloc(self.io, self.config_path, self.allocator, .limited(10 * 1024 * 1024));
+        const contents = try std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            self.config_path,
+            self.allocator,
+            .limited(10 * 1024 * 1024),
+        );
         defer self.allocator.free(contents);
 
         var new_hash: [Sha256.digest_length]u8 = undefined;
@@ -133,7 +160,8 @@ pub const FileProvider = struct {
         // Check if content has changed
         if (self.content_hash) |old_hash| {
             if (std.mem.eql(u8, &old_hash, &new_hash)) {
-                self.bus.debug(PoliciesUnchanged{ .hash = &new_hash });
+                const unchanged_event: PoliciesUnchanged = .{ .hash = &new_hash };
+                self.bus.debug(unchanged_event);
                 return;
             }
         }
@@ -157,16 +185,22 @@ pub const FileProvider = struct {
             });
         }
 
-        self.bus.info(PoliciesLoaded{ .count = policies.len, .path = self.config_path });
+        const loaded_event: PoliciesLoaded = .{
+            .count = policies.len,
+            .path = self.config_path,
+        };
+        self.bus.info(loaded_event);
     }
 
     fn watchLoop(self: *FileProvider) void {
         if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
             self.watchLoopPoll() catch |err| {
-                self.bus.err(FileWatcherError{ .err = @errorName(err) });
+                const event: FileWatcherError = .{ .err = @errorName(err) };
+                self.bus.err(event);
             };
         } else {
-            self.bus.warn(FileWatcherUnsupported{});
+            const event: FileWatcherUnsupported = .{};
+            self.bus.warn(event);
         }
     }
 
@@ -174,7 +208,11 @@ pub const FileProvider = struct {
         var last_mtime: i96 = 0;
 
         while (!self.shutdown_event.isSet()) {
-            std.Io.sleep(self.io, .{ .nanoseconds = 1 * std.time.ns_per_s }, .awake) catch {};
+            std.Io.sleep(self.io, .{ .nanoseconds = 1 * std.time.ns_per_s }, .awake) catch |err| {
+                const event: FileWatcherError = .{ .err = @errorName(err) };
+                self.bus.warn(event);
+                continue;
+            };
             if (self.shutdown_event.isSet()) break;
 
             const file = std.Io.Dir.cwd().openFile(self.io, self.config_path, .{}) catch continue;
@@ -187,7 +225,8 @@ pub const FileProvider = struct {
                 last_mtime = stat.mtime.nanoseconds;
                 // loadAndNotify will check content hash and skip if unchanged
                 self.loadAndNotify() catch |err| {
-                    self.bus.err(PolicyReloadFailed{ .err = @errorName(err) });
+                    const event: PolicyReloadFailed = .{ .err = @errorName(err) };
+                    self.bus.err(event);
                 };
             }
         }
@@ -390,15 +429,17 @@ test "FileProvider: registry remains usable after provider fails to load" {
 
     // Create callback that updates registry
     const CallbackContext = struct {
+        const Self = @This();
+
         registry: *Registry,
 
         fn handleUpdate(ctx: *anyopaque, update: policy_provider.PolicyUpdate) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const self: *Self = @ptrCast(@alignCast(ctx));
             try self.registry.updatePolicies(update.policies, update.provider_id, .file);
         }
     };
 
-    var ctx = CallbackContext{ .registry = &registry };
+    var ctx: CallbackContext = .{ .registry = &registry };
 
     try good_provider.subscribe(.{
         .context = @ptrCast(&ctx),
@@ -452,15 +493,17 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
 
     // Create callback that updates registry
     const CallbackContext = struct {
+        const Self = @This();
+
         registry: *Registry,
 
         fn handleUpdate(ctx: *anyopaque, update: policy_provider.PolicyUpdate) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const self: *Self = @ptrCast(@alignCast(ctx));
             try self.registry.updatePolicies(update.policies, update.provider_id, .file);
         }
     };
 
-    var ctx = CallbackContext{ .registry = &registry };
+    var ctx: CallbackContext = .{ .registry = &registry };
 
     // Subscribe - this should load the valid policy
     try provider.subscribe(.{
@@ -478,7 +521,10 @@ test "FileProvider: registry retains policies after reload with invalid JSON" {
     }
 
     // Now overwrite the file with invalid JSON
-    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "policies.json", .data = "{ this is not valid json }" });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "policies.json",
+        .data = "{ this is not valid json }",
+    });
 
     // Manually trigger a reload (simulates what the watch loop does)
     // This should fail but not crash
@@ -605,15 +651,17 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     defer good_provider.deinit();
 
     const CallbackContext = struct {
+        const Self = @This();
+
         registry: *Registry,
 
         fn handleUpdate(ctx: *anyopaque, update: policy_provider.PolicyUpdate) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const self: *Self = @ptrCast(@alignCast(ctx));
             try self.registry.updatePolicies(update.policies, update.provider_id, .file);
         }
     };
 
-    var ctx = CallbackContext{ .registry = &registry };
+    var ctx: CallbackContext = .{ .registry = &registry };
 
     try good_provider.subscribe(.{
         .context = @ptrCast(&ctx),

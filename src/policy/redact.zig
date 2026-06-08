@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const Regex = @import("regex");
+const proto = @import("proto");
+const log_transform = @import("./log_transform.zig");
 
 // =============================================================================
 // Pattern — thin wrapper around the third-party regex engine
@@ -24,12 +26,16 @@ pub const CompileError = error{InvalidRegex} || std.mem.Allocator.Error;
 pub const Pattern = struct {
     re: Regex,
 
-    pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) CompileError!Pattern {
+    pub fn compile(
+        gpa: std.mem.Allocator,
+        pattern: []const u8,
+    ) (error{InvalidRegex} || std.mem.Allocator.Error)!Pattern {
         const re = Regex.compile(gpa, pattern, .{}) catch return error.InvalidRegex;
         return .{ .re = re };
     }
 
     pub fn deinit(self: *Pattern) void {
+        defer self.* = undefined;
         self.re.deinit();
     }
 };
@@ -49,7 +55,7 @@ pub const Template = struct {
     gpa: std.mem.Allocator,
 
     pub fn parse(gpa: std.mem.Allocator, template: []const u8) !Template {
-        var segs: std.ArrayListUnmanaged(Segment) = .empty;
+        var segs: std.ArrayList(Segment) = .empty;
         errdefer freeSegments(gpa, segs.items);
         errdefer segs.deinit(gpa);
 
@@ -57,7 +63,7 @@ pub const Template = struct {
         // until we hit a non-literal boundary (numbered/named group), at
         // which point we flush as a single owned segment. This avoids the
         // O(n²) cost of concat-merging adjacent literals after every byte.
-        var lit_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var lit_buf: std.ArrayList(u8) = .empty;
         errdefer lit_buf.deinit(gpa);
 
         var i: usize = 0;
@@ -143,6 +149,7 @@ pub const Template = struct {
     }
 
     pub fn deinit(self: *Template) void {
+        defer self.* = undefined;
         freeSegments(self.gpa, self.segments);
         self.gpa.free(self.segments);
     }
@@ -150,10 +157,10 @@ pub const Template = struct {
     /// Expand the template into `out` using `captures` from a single match in `haystack`.
     pub fn expand(
         self: Template,
+        gpa: std.mem.Allocator,
         haystack: []const u8,
         captures: Regex.Captures,
-        out: *std.ArrayListUnmanaged(u8),
-        gpa: std.mem.Allocator,
+        out: *std.ArrayList(u8),
     ) !void {
         for (self.segments) |seg| {
             switch (seg) {
@@ -177,8 +184,8 @@ pub const Template = struct {
 /// Resets `buf` to empty afterwards. No-ops when `buf` is empty.
 fn flushLiteral(
     gpa: std.mem.Allocator,
-    segs: *std.ArrayListUnmanaged(Segment),
-    buf: *std.ArrayListUnmanaged(u8),
+    segs: *std.ArrayList(Segment),
+    buf: *std.ArrayList(u8),
 ) !void {
     if (buf.items.len == 0) return;
     const owned = try buf.toOwnedSlice(gpa);
@@ -251,6 +258,7 @@ pub const Compiled = struct {
     }
 
     pub fn deinit(self: *Compiled) void {
+        defer self.* = undefined;
         self.pattern.deinit();
         self.template.deinit();
     }
@@ -265,10 +273,10 @@ pub const Compiled = struct {
     /// See `Compiled`'s docstring for thread-safety and output-lifetime notes.
     pub fn replaceAll(
         self: *Compiled,
+        gpa: std.mem.Allocator,
         io: std.Io,
         haystack: []const u8,
-        out: *std.ArrayListUnmanaged(u8),
-        gpa: std.mem.Allocator,
+        out: *std.ArrayList(u8),
     ) !usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -285,7 +293,7 @@ pub const Compiled = struct {
             if (span.start < cursor) continue;
 
             try out.appendSlice(gpa, haystack[cursor..span.start]);
-            try self.template.expand(haystack, caps, out, gpa);
+            try self.template.expand(gpa, haystack, caps, out);
             count += 1;
 
             if (span.end > cursor) {
@@ -312,14 +320,19 @@ pub const Compiled = struct {
 
 const testing = std.testing;
 
-fn templateExpectSingle(template_str: []const u8, regex_str: []const u8, haystack: []const u8, expected: []const u8) !void {
+fn templateExpectSingle(
+    template_str: []const u8,
+    regex_str: []const u8,
+    haystack: []const u8,
+    expected: []const u8,
+) !void {
     var compiled = try Compiled.init(testing.allocator, regex_str, template_str);
     defer compiled.deinit();
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
 
-    _ = try compiled.replaceAll(std.Options.debug_io, haystack, &out, testing.allocator);
+    _ = try compiled.replaceAll(testing.allocator, std.Options.debug_io, haystack, &out);
     try testing.expectEqualStrings(expected, out.items);
 }
 
@@ -405,16 +418,21 @@ test "Compiled.replaceAll: multiple non-overlapping matches" {
 test "Compiled.replaceAll: no match leaves output empty" {
     var compiled = try Compiled.init(testing.allocator, "zzz", "X");
     defer compiled.deinit();
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    const count = try compiled.replaceAll(std.Options.debug_io, "abc 123", &out, testing.allocator);
+    const count = try compiled.replaceAll(testing.allocator, std.Options.debug_io, "abc 123", &out);
     try testing.expectEqual(@as(usize, 0), count);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "Compiled.replaceAll: capture group reference" {
     // Pattern matches bearer + token; preserve scheme, redact token
-    try templateExpectSingle("$1[REDACTED]", "(?i)(bearer\\s+)\\S+", "Authorization: Bearer abc123", "Authorization: Bearer [REDACTED]");
+    try templateExpectSingle(
+        "$1[REDACTED]",
+        "(?i)(bearer\\s+)\\S+",
+        "Authorization: Bearer abc123",
+        "Authorization: Bearer [REDACTED]",
+    );
 }
 
 test "Compiled.replaceAll: named capture reference" {
@@ -455,10 +473,10 @@ test "Compiled.replaceAll: zero-width match terminates and advances byte-by-byte
     var compiled = try Compiled.init(testing.allocator, "^", "[START]");
     defer compiled.deinit();
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
 
-    const count = try compiled.replaceAll(std.Options.debug_io, "abc", &out, testing.allocator);
+    const count = try compiled.replaceAll(testing.allocator, std.Options.debug_io, "abc", &out);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqualStrings("[START]abc", out.items);
 }
@@ -467,12 +485,12 @@ test "Compiled.replaceAll: zero-width match on empty haystack" {
     var compiled = try Compiled.init(testing.allocator, "^", "X");
     defer compiled.deinit();
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
 
     // Should terminate cleanly. Whether we emit "X" or 0 matches is a
     // policy decision — we tolerate either outcome here.
-    _ = try compiled.replaceAll(std.Options.debug_io, "", &out, testing.allocator);
+    _ = try compiled.replaceAll(testing.allocator, std.Options.debug_io, "", &out);
 }
 
 test "Compiled.replaceAll: concurrent callers serialize on the Mutex" {
@@ -485,21 +503,23 @@ test "Compiled.replaceAll: concurrent callers serialize on the Mutex" {
     defer compiled.deinit();
 
     const Worker = struct {
+        const Self = @This();
+
         compiled_ref: *Compiled,
         gpa: std.mem.Allocator,
         ok: *std.atomic.Value(u32),
 
-        fn run(self: @This()) void {
+        fn run(self: Self) void {
             var i: usize = 0;
             while (i < 50) : (i += 1) {
                 var arena = std.heap.ArenaAllocator.init(self.gpa);
                 defer arena.deinit();
-                var out: std.ArrayListUnmanaged(u8) = .empty;
+                var out: std.ArrayList(u8) = .empty;
                 const count = self.compiled_ref.replaceAll(
+                    arena.allocator(),
                     std.Options.debug_io,
                     "user=42 token=99 session=7",
                     &out,
-                    arena.allocator(),
                 ) catch return;
                 if (count != 3) return;
                 if (!std.mem.eql(u8, out.items, "user=X token=X session=X")) return;
@@ -542,10 +562,9 @@ test "Template: $999 only consumes two digits (greedy cap)" {
 test "compileRedactRules: cleans up on partial failure" {
     // First rule compiles, second rule has an invalid regex — the helper
     // must free the first rule's compiled state on the error path.
-    const proto = @import("proto");
     const allocator = testing.allocator;
 
-    var transform = proto.policy.LogTransform{};
+    var transform: proto.policy.LogTransform = .{};
     defer transform.redact.deinit(allocator);
 
     try transform.redact.append(allocator, .{
@@ -558,7 +577,7 @@ test "compileRedactRules: cleans up on partial failure" {
         .regex = "(",
     });
 
-    const result = @import("./log_transform.zig").compileRedactRules(allocator, &transform);
+    const result = log_transform.compileRedactRules(allocator, &transform);
     try testing.expectError(error.InvalidRegex, result);
     // No leaks: the testing allocator panics on undeinited allocations,
     // so reaching the end of the test proves the cleanup succeeded.

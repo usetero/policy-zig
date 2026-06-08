@@ -436,7 +436,14 @@ pub const TraceFieldRef = union(enum) {
     pub fn isEnumField(self: TraceFieldRef) bool {
         return switch (self) {
             .span_kind, .span_status => true,
-            .trace_field, .span_attribute, .resource_attribute, .scope_attribute, .event_name, .event_attribute, .link_trace_id => false,
+            .trace_field,
+            .span_attribute,
+            .resource_attribute,
+            .scope_attribute,
+            .event_name,
+            .event_attribute,
+            .link_trace_id,
+            => false,
         };
     }
 
@@ -513,7 +520,7 @@ pub const TransformResult = struct {
 // Provider - Tagged union over concrete provider types
 // =============================================================================
 
-const Policy = proto.policy.Policy;
+pub const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
@@ -542,7 +549,13 @@ pub const Provider = union(enum) {
         }
     }
 
-    pub fn recordPolicyStats(self: Provider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+    pub fn recordPolicyStats(
+        self: Provider,
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    ) void {
         switch (self) {
             inline else => |p| p.recordPolicyStats(policy_id, hits, misses, transform_result),
         }
@@ -568,10 +581,10 @@ pub const TestProvider = struct {
     allocator: std.mem.Allocator,
     id: []const u8,
     source_type: SourceType,
-    policies: std.ArrayListUnmanaged(Policy),
-    callbacks: std.ArrayListUnmanaged(PolicyCallback),
-    recorded_errors: std.ArrayListUnmanaged(struct { policy_id: []const u8, message: []const u8 }),
-    recorded_stats: std.ArrayListUnmanaged(StatsCall),
+    policies: std.ArrayList(Policy),
+    callbacks: std.ArrayList(PolicyCallback),
+    recorded_errors: std.ArrayList(struct { policy_id: []const u8, message: []const u8 }),
+    recorded_stats: std.ArrayList(StatsCall),
 
     pub const StatsCall = struct {
         policy_id: []const u8,
@@ -593,6 +606,8 @@ pub const TestProvider = struct {
     }
 
     pub fn deinit(self: *TestProvider) void {
+        defer self.* = undefined;
+
         for (self.policies.items) |*p| {
             p.deinit(self.allocator);
         }
@@ -638,7 +653,7 @@ pub const TestProvider = struct {
     }
 
     pub fn notifySubscribers(self: *TestProvider) !void {
-        const update = PolicyUpdate{
+        const update: PolicyUpdate = .{
             .policies = self.policies.items,
             .provider_id = self.id,
         };
@@ -670,7 +685,13 @@ pub const TestProvider = struct {
         };
     }
 
-    pub fn recordPolicyStats(self: *TestProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+    pub fn recordPolicyStats(
+        self: *TestProvider,
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    ) void {
         const id_copy = self.allocator.dupe(u8, policy_id) catch return;
         self.recorded_stats.append(self.allocator, .{
             .policy_id = id_copy,

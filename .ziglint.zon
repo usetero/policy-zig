@@ -1,0 +1,9 @@
+.{
+    // Handwritten Zig files only. Generated protobuf bindings under src/proto
+    // are intentionally excluded.
+    .paths = .{
+        "src/observability",
+        "src/policy",
+        "build.zig",
+    },
+}
