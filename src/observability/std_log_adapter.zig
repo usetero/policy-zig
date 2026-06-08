@@ -73,7 +73,7 @@ pub const StdLogAdapter = struct {
         const now_ts = std.Io.Timestamp.now(bus.io, .real);
         const secs: u64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
         const ms: u64 = @intCast(@divFloor(@mod(now_ts.nanoseconds, std.time.ns_per_s), std.time.ns_per_ms));
-        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+        const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = secs };
         const epoch_day = epoch_seconds.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -129,6 +129,7 @@ const TestWriter = struct {
 
     fn deinit(self: *TestWriter) void {
         self.io_writer.deinit();
+        self.* = undefined;
     }
 
     fn writer(self: *TestWriter) *std.Io.Writer {

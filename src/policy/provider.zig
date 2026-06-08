@@ -1,4 +1,3 @@
-const std = @import("std");
 const proto = @import("proto");
 const types = @import("types.zig");
 

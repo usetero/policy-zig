@@ -47,39 +47,39 @@ const c = struct {
     };
 
     // Error codes
-    const HS_SUCCESS: c_int = 0;
-    const HS_INVALID: c_int = -1;
-    const HS_NOMEM: c_int = -2;
-    const HS_SCAN_TERMINATED: c_int = -3;
-    const HS_COMPILER_ERROR: c_int = -4;
-    const HS_DB_VERSION_ERROR: c_int = -5;
-    const HS_DB_PLATFORM_ERROR: c_int = -6;
-    const HS_DB_MODE_ERROR: c_int = -7;
-    const HS_BAD_ALIGN: c_int = -8;
-    const HS_BAD_ALLOC: c_int = -9;
-    const HS_SCRATCH_IN_USE: c_int = -10;
-    const HS_ARCH_ERROR: c_int = -11;
-    const HS_INSUFFICIENT_SPACE: c_int = -12;
-    const HS_UNKNOWN_ERROR: c_int = -13;
+    const hs_success: c_int = 0;
+    const hs_invalid: c_int = -1;
+    const hs_nomem: c_int = -2;
+    const hs_scan_terminated: c_int = -3;
+    const hs_compiler_error: c_int = -4;
+    const hs_db_version_error: c_int = -5;
+    const hs_db_platform_error: c_int = -6;
+    const hs_db_mode_error: c_int = -7;
+    const hs_bad_align: c_int = -8;
+    const hs_bad_alloc: c_int = -9;
+    const hs_scratch_in_use: c_int = -10;
+    const hs_arch_error: c_int = -11;
+    const hs_insufficient_space: c_int = -12;
+    const hs_unknown_error: c_int = -13;
 
     // Compile flags
-    const HS_FLAG_CASELESS: c_uint = 1;
-    const HS_FLAG_DOTALL: c_uint = 2;
-    const HS_FLAG_MULTILINE: c_uint = 4;
-    const HS_FLAG_SINGLEMATCH: c_uint = 8;
-    const HS_FLAG_ALLOWEMPTY: c_uint = 16;
-    const HS_FLAG_UTF8: c_uint = 32;
-    const HS_FLAG_UCP: c_uint = 64;
-    const HS_FLAG_PREFILTER: c_uint = 128;
-    const HS_FLAG_SOM_LEFTMOST: c_uint = 256;
+    const hs_flag_caseless: c_uint = 1;
+    const hs_flag_dotall: c_uint = 2;
+    const hs_flag_multiline: c_uint = 4;
+    const hs_flag_singlematch: c_uint = 8;
+    const hs_flag_allowempty: c_uint = 16;
+    const hs_flag_utf8: c_uint = 32;
+    const hs_flag_ucp: c_uint = 64;
+    const hs_flag_prefilter: c_uint = 128;
+    const hs_flag_som_leftmost: c_uint = 256;
 
     // Mode flags
-    const HS_MODE_BLOCK: c_uint = 1;
-    const HS_MODE_STREAM: c_uint = 2;
-    const HS_MODE_VECTORED: c_uint = 4;
-    const HS_MODE_SOM_HORIZON_LARGE: c_uint = 1 << 24;
-    const HS_MODE_SOM_HORIZON_MEDIUM: c_uint = 1 << 25;
-    const HS_MODE_SOM_HORIZON_SMALL: c_uint = 1 << 26;
+    const hs_mode_block: c_uint = 1;
+    const hs_mode_stream: c_uint = 2;
+    const hs_mode_vectored: c_uint = 4;
+    const hs_mode_som_horizon_large: c_uint = 1 << 24;
+    const hs_mode_som_horizon_medium: c_uint = 1 << 25;
+    const hs_mode_som_horizon_small: c_uint = 1 << 26;
 
     // Callback type
     const match_event_handler = *const fn (
@@ -242,17 +242,17 @@ pub const CompileErrorDetails = struct {
 
 fn mapError(code: c_int) Error {
     return switch (code) {
-        c.HS_INVALID => error.Invalid,
-        c.HS_NOMEM => error.OutOfMemory,
-        c.HS_COMPILER_ERROR => error.CompileError,
-        c.HS_DB_VERSION_ERROR => error.DatabaseVersionError,
-        c.HS_DB_PLATFORM_ERROR => error.DatabasePlatformError,
-        c.HS_DB_MODE_ERROR => error.DatabaseModeError,
-        c.HS_BAD_ALIGN => error.BadAlignment,
-        c.HS_BAD_ALLOC => error.BadAlloc,
-        c.HS_SCRATCH_IN_USE => error.ScratchInUse,
-        c.HS_ARCH_ERROR => error.ArchitectureError,
-        c.HS_INSUFFICIENT_SPACE => error.InsufficientSpace,
+        c.hs_invalid => error.Invalid,
+        c.hs_nomem => error.OutOfMemory,
+        c.hs_compiler_error => error.CompileError,
+        c.hs_db_version_error => error.DatabaseVersionError,
+        c.hs_db_platform_error => error.DatabasePlatformError,
+        c.hs_db_mode_error => error.DatabaseModeError,
+        c.hs_bad_align => error.BadAlignment,
+        c.hs_bad_alloc => error.BadAlloc,
+        c.hs_scratch_in_use => error.ScratchInUse,
+        c.hs_arch_error => error.ArchitectureError,
+        c.hs_insufficient_space => error.InsufficientSpace,
         else => error.UnknownError,
     };
 }
@@ -297,25 +297,25 @@ pub const Flags = packed struct(c_uint) {
 /// Database compilation mode
 pub const Mode = enum(c_uint) {
     /// Block mode - scan complete data in single call
-    block = c.HS_MODE_BLOCK,
+    block = c.hs_mode_block,
     /// Stream mode - scan data incrementally
-    stream = c.HS_MODE_STREAM,
+    stream = c.hs_mode_stream,
     /// Vectored mode - scan non-contiguous data blocks
-    vectored = c.HS_MODE_VECTORED,
+    vectored = c.hs_mode_vectored,
 
     /// Add start-of-match tracking with large horizon
     pub fn withSomLarge(self: Mode) c_uint {
-        return @intFromEnum(self) | c.HS_MODE_SOM_HORIZON_LARGE;
+        return @intFromEnum(self) | c.hs_mode_som_horizon_large;
     }
 
     /// Add start-of-match tracking with medium horizon
     pub fn withSomMedium(self: Mode) c_uint {
-        return @intFromEnum(self) | c.HS_MODE_SOM_HORIZON_MEDIUM;
+        return @intFromEnum(self) | c.hs_mode_som_horizon_medium;
     }
 
     /// Add start-of-match tracking with small horizon
     pub fn withSomSmall(self: Mode) c_uint {
-        return @intFromEnum(self) | c.HS_MODE_SOM_HORIZON_SMALL;
+        return @intFromEnum(self) | c.hs_mode_som_horizon_small;
     }
 };
 
@@ -358,8 +358,6 @@ pub const Pattern = struct {
 pub const Database = struct {
     handle: *c.hs_database_t,
 
-    const Self = @This();
-
     /// Compile options
     pub const CompileOptions = struct {
         flags: Flags = .{},
@@ -367,7 +365,7 @@ pub const Database = struct {
     };
 
     /// Compile a single regex pattern
-    pub fn compile(pattern: []const u8, options: CompileOptions) Error!Self {
+    pub fn compile(pattern: []const u8, options: CompileOptions) Error!Database {
         return compileWithDetails(pattern, options) catch |err| switch (err) {
             error.CompileErrorWithDetails => error.CompileError,
             else => |e| e,
@@ -381,7 +379,7 @@ pub const Database = struct {
     pub fn compileWithDetails(
         pattern: []const u8,
         options: CompileOptions,
-    ) CompileWithDetailsError!Self {
+    ) CompileWithDetailsError!Database {
         // Pattern must be null-terminated for C API
         var pattern_buf: [4096]u8 = undefined;
         if (pattern.len >= pattern_buf.len) return error.Invalid;
@@ -401,11 +399,11 @@ pub const Database = struct {
             &comp_err,
         );
 
-        if (rc != c.HS_SUCCESS) {
+        if (rc != c.hs_success) {
             if (comp_err) |err| {
                 _ = c.hs_free_compile_error(err);
             }
-            if (rc == c.HS_COMPILER_ERROR) {
+            if (rc == c.hs_compiler_error) {
                 return error.CompileErrorWithDetails;
             }
             return mapError(rc);
@@ -422,7 +420,7 @@ pub const Database = struct {
         allocator: std.mem.Allocator,
         patterns: []const Pattern,
         options: CompileOptions,
-    ) (Error || std.mem.Allocator.Error)!Self {
+    ) (Error || std.mem.Allocator.Error)!Database {
         if (patterns.len == 0) return error.Invalid;
         if (patterns.len > std.math.maxInt(c_uint)) return error.Invalid;
 
@@ -459,7 +457,7 @@ pub const Database = struct {
             &comp_err,
         );
 
-        if (rc != c.HS_SUCCESS) {
+        if (rc != c.hs_success) {
             if (comp_err) |err| {
                 _ = c.hs_free_compile_error(err);
             }
@@ -470,7 +468,7 @@ pub const Database = struct {
     }
 
     /// Compile a literal (non-regex) pattern for exact matching
-    pub fn compileLiteral(pattern: []const u8, options: CompileOptions) Error!Self {
+    pub fn compileLiteral(pattern: []const u8, options: CompileOptions) Error!Database {
         var db: ?*c.hs_database_t = null;
         var comp_err: ?*c.hs_compile_error_t = null;
 
@@ -484,7 +482,7 @@ pub const Database = struct {
             &comp_err,
         );
 
-        if (rc != c.HS_SUCCESS) {
+        if (rc != c.hs_success) {
             if (comp_err) |err| {
                 _ = c.hs_free_compile_error(err);
             }
@@ -502,7 +500,7 @@ pub const Database = struct {
         allocator: std.mem.Allocator,
         patterns: []const Pattern,
         options: CompileOptions,
-    ) (Error || std.mem.Allocator.Error)!Self {
+    ) (Error || std.mem.Allocator.Error)!Database {
         if (patterns.len == 0) return error.Invalid;
         if (patterns.len > std.math.maxInt(c_uint)) return error.Invalid;
 
@@ -537,7 +535,7 @@ pub const Database = struct {
             &comp_err,
         );
 
-        if (rc != c.HS_SUCCESS) {
+        if (rc != c.hs_success) {
             if (comp_err) |err| {
                 _ = c.hs_free_compile_error(err);
             }
@@ -548,34 +546,37 @@ pub const Database = struct {
     }
 
     /// Deserialize a database from bytes
-    pub fn deserialize(bytes: []const u8) Error!Self {
+    pub fn deserialize(bytes: []const u8) Error!Database {
         var db: ?*c.hs_database_t = null;
         const rc = c.hs_deserialize_database(bytes.ptr, bytes.len, &db);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
         return .{ .handle = db.? };
     }
 
     /// Free the database
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Database) void {
+        defer self.* = undefined;
         _ = c.hs_free_database(self.handle);
-        self.handle = undefined;
     }
 
     /// Get the size of the database in bytes
-    pub fn size(self: *const Self) Error!usize {
+    pub fn size(self: *const Database) Error!usize {
         var sz: usize = 0;
         const rc = c.hs_database_size(self.handle, &sz);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
         return sz;
     }
 
     /// Serialize the database to bytes
-    pub fn serialize(self: *const Self, allocator: std.mem.Allocator) (Error || std.mem.Allocator.Error)![]u8 {
+    pub fn serialize(
+        self: *const Database,
+        allocator: std.mem.Allocator,
+    ) (Error || std.mem.Allocator.Error)![]u8 {
         var bytes: ?[*]u8 = null;
         var length: usize = 0;
 
         const rc = c.hs_serialize_database(self.handle, &bytes, &length);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
 
         // Copy to Zig-managed memory
         const result = try allocator.alloc(u8, length);
@@ -591,7 +592,7 @@ pub const Database = struct {
     ///
     /// Returns an iterator over matches. The scratch space must remain valid
     /// for the duration of iteration.
-    pub fn scan(self: *const Self, scratch: *Scratch, data: []const u8) BlockScanner {
+    pub fn scan(self: *const Database, scratch: *Scratch, data: []const u8) BlockScanner {
         return BlockScanner.init(self, scratch, data);
     }
 
@@ -600,13 +601,13 @@ pub const Database = struct {
     /// This is more efficient than the iterator when you don't need to
     /// collect matches or when early termination is desired.
     pub fn scanWithCallback(
-        self: *const Self,
+        self: *const Database,
+        comptime Context: type,
+        comptime callback: fn (Context, Match) bool,
         scratch: *Scratch,
         data: []const u8,
-        context: anytype,
-        comptime callback: fn (@TypeOf(context), Match) bool,
+        context: Context,
     ) Error!bool {
-        const Context = @TypeOf(context);
         const Wrapper = struct {
             fn handler(
                 id: c_uint,
@@ -615,7 +616,7 @@ pub const Database = struct {
                 _: c_uint,
                 ctx: ?*anyopaque,
             ) callconv(.c) c_int {
-                const match = Match{
+                const match: Match = .{
                     .id = id,
                     .start = from,
                     .end = to,
@@ -636,13 +637,13 @@ pub const Database = struct {
             @ptrCast(@alignCast(context)),
         );
 
-        if (rc == c.HS_SCAN_TERMINATED) return false;
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc == c.hs_scan_terminated) return false;
+        if (rc != c.hs_success) return mapError(rc);
         return true;
     }
 
     /// Check if any pattern matches (short-circuit on first match)
-    pub fn matches(self: *const Self, scratch: *Scratch, data: []const u8) Error!bool {
+    pub fn matches(self: *const Database, scratch: *Scratch, data: []const u8) Error!bool {
         var found = false;
 
         const rc = c.hs_scan(
@@ -661,19 +662,19 @@ pub const Database = struct {
             &found,
         );
 
-        if (rc == c.HS_SCAN_TERMINATED) return true;
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc == c.hs_scan_terminated) return true;
+        if (rc != c.hs_success) return mapError(rc);
         return found;
     }
 
     /// Find the first matching pattern and return its ID
     /// Returns null if no pattern matches
-    pub fn findFirstMatch(self: *const Self, scratch: *Scratch, data: []const u8) Error!?u32 {
+    pub fn findFirstMatch(self: *const Database, scratch: *Scratch, data: []const u8) Error!?u32 {
         const Context = struct {
             found: bool = false,
             pattern_id: u32 = 0,
         };
-        var ctx = Context{};
+        var ctx: Context = .{};
 
         const rc = c.hs_scan(
             self.handle,
@@ -682,7 +683,13 @@ pub const Database = struct {
             0,
             scratch.handle,
             struct {
-                fn handler(id: c_uint, _: c_ulonglong, _: c_ulonglong, _: c_uint, context: ?*anyopaque) callconv(.c) c_int {
+                fn handler(
+                    id: c_uint,
+                    _: c_ulonglong,
+                    _: c_ulonglong,
+                    _: c_uint,
+                    context: ?*anyopaque,
+                ) callconv(.c) c_int {
                     const ptr: *Context = @ptrCast(@alignCast(context));
                     ptr.found = true;
                     ptr.pattern_id = id;
@@ -692,17 +699,17 @@ pub const Database = struct {
             &ctx,
         );
 
-        if (rc == c.HS_SCAN_TERMINATED) return ctx.pattern_id;
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc == c.hs_scan_terminated) return ctx.pattern_id;
+        if (rc != c.hs_success) return mapError(rc);
         if (ctx.found) return ctx.pattern_id;
         return null;
     }
 
     /// Open a stream for incremental scanning (streaming mode only)
-    pub fn openStream(self: *const Self) Error!Stream {
+    pub fn openStream(self: *const Database) Error!Stream {
         var stream: ?*c.hs_stream_t = null;
         const rc = c.hs_open_stream(self.handle, 0, &stream);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
         return .{ .handle = stream.?, .database = self };
     }
 };
@@ -718,24 +725,22 @@ pub const Database = struct {
 pub const Scratch = struct {
     handle: *c.hs_scratch_t,
 
-    const Self = @This();
-
     /// Allocate scratch space for the given database
-    pub fn init(db: *const Database) Error!Self {
+    pub fn init(db: *const Database) Error!Scratch {
         var scratch: ?*c.hs_scratch_t = null;
         const rc = c.hs_alloc_scratch(db.handle, &scratch);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
         return .{ .handle = scratch.? };
     }
 
     /// Allocate scratch space for multiple databases
     ///
     /// The resulting scratch can be used with any of the provided databases.
-    pub fn initMulti(databases: []const *const Database) Error!Self {
+    pub fn initMulti(databases: []const *const Database) Error!Scratch {
         var scratch: ?*c.hs_scratch_t = null;
         for (databases) |db| {
             const rc = c.hs_alloc_scratch(db.handle, &scratch);
-            if (rc != c.HS_SUCCESS) {
+            if (rc != c.hs_success) {
                 if (scratch) |s| _ = c.hs_free_scratch(s);
                 return mapError(rc);
             }
@@ -744,24 +749,24 @@ pub const Scratch = struct {
     }
 
     /// Free the scratch space
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Scratch) void {
+        defer self.* = undefined;
         _ = c.hs_free_scratch(self.handle);
-        self.handle = undefined;
     }
 
     /// Clone this scratch space
-    pub fn clone(self: *const Self) Error!Self {
+    pub fn clone(self: *const Scratch) Error!Scratch {
         var new_scratch: ?*c.hs_scratch_t = null;
         const rc = c.hs_clone_scratch(self.handle, &new_scratch);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
         return .{ .handle = new_scratch.? };
     }
 
     /// Get the size of the scratch space in bytes
-    pub fn size(self: *const Self) Error!usize {
+    pub fn size(self: *const Scratch) Error!usize {
         var sz: usize = 0;
         const rc = c.hs_scratch_size(self.handle, &sz);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
         return sz;
     }
 };
@@ -781,9 +786,7 @@ pub const BlockScanner = struct {
     scan_complete: bool = false,
     scan_error: ?Error = null,
 
-    const Self = @This();
-
-    fn init(database: *const Database, scratch: *Scratch, data: []const u8) Self {
+    fn init(database: *const Database, scratch: *Scratch, data: []const u8) BlockScanner {
         return .{
             .database = database,
             .scratch = scratch,
@@ -792,7 +795,7 @@ pub const BlockScanner = struct {
     }
 
     /// Get the next match, or null if no more matches
-    pub fn next(self: *Self) ?Match {
+    pub fn next(self: *BlockScanner) ?Match {
         // Return buffered matches first
         if (self.match_index < self.matches_len) {
             const match = self.matches_buf[self.match_index];
@@ -819,7 +822,7 @@ pub const BlockScanner = struct {
 
         self.scan_complete = true;
 
-        if (rc != c.HS_SUCCESS and rc != c.HS_SCAN_TERMINATED) {
+        if (rc != c.hs_success and rc != c.hs_scan_terminated) {
             self.scan_error = mapError(rc);
             return null;
         }
@@ -840,7 +843,7 @@ pub const BlockScanner = struct {
         _: c_uint,
         ctx: ?*anyopaque,
     ) callconv(.c) c_int {
-        const self: *Self = @ptrCast(@alignCast(ctx));
+        const self: *BlockScanner = @ptrCast(@alignCast(ctx));
         if (self.matches_len >= self.matches_buf.len) {
             // Buffer full, stop scanning
             return 1;
@@ -855,7 +858,7 @@ pub const BlockScanner = struct {
     }
 
     /// Check if an error occurred during scanning
-    pub fn err(self: *const Self) ?Error {
+    pub fn err(self: *const BlockScanner) ?Error {
         return self.scan_error;
     }
 };
@@ -872,17 +875,15 @@ pub const Stream = struct {
     handle: *c.hs_stream_t,
     database: *const Database,
 
-    const Self = @This();
-
     /// Write data to the stream and scan for matches
     pub fn scan(
-        self: *Self,
+        self: *Stream,
+        comptime Context: type,
+        comptime callback: fn (Context, Match) bool,
         scratch: *Scratch,
         data: []const u8,
-        context: anytype,
-        comptime callback: fn (@TypeOf(context), Match) bool,
+        context: Context,
     ) Error!bool {
-        const Context = @TypeOf(context);
         const Wrapper = struct {
             fn handler(
                 id: c_uint,
@@ -891,7 +892,7 @@ pub const Stream = struct {
                 _: c_uint,
                 ctx: ?*anyopaque,
             ) callconv(.c) c_int {
-                const match = Match{
+                const match: Match = .{
                     .id = id,
                     .start = from,
                     .end = to,
@@ -911,13 +912,13 @@ pub const Stream = struct {
             @ptrCast(@alignCast(@constCast(context))),
         );
 
-        if (rc == c.HS_SCAN_TERMINATED) return false;
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc == c.hs_scan_terminated) return false;
+        if (rc != c.hs_success) return mapError(rc);
         return true;
     }
 
     /// Write data without callbacks (useful for building up context)
-    pub fn write(self: *Self, scratch: *Scratch, data: []const u8) Error!void {
+    pub fn write(self: *Stream, scratch: *Scratch, data: []const u8) Error!void {
         const rc = c.hs_scan_stream(
             self.handle,
             data.ptr,
@@ -927,26 +928,26 @@ pub const Stream = struct {
             null,
             null,
         );
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
     }
 
     /// Reset stream to initial state
-    pub fn reset(self: *Self, scratch: *Scratch) Error!void {
+    pub fn reset(self: *Stream, scratch: *Scratch) Error!void {
         const rc = c.hs_reset_stream(self.handle, 0, scratch.handle, null, null);
-        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (rc != c.hs_success) return mapError(rc);
     }
 
     /// Close the stream and free resources
     ///
     /// This may trigger end-of-data matches (e.g., $ anchors).
     pub fn close(
-        self: *Self,
+        self: *Stream,
+        comptime Context: type,
+        comptime callback: ?fn (Context, Match) bool,
         scratch: *Scratch,
-        context: anytype,
-        comptime callback: ?fn (@TypeOf(context), Match) bool,
+        context: Context,
     ) Error!void {
         if (callback) |cb| {
-            const Context = @TypeOf(context);
             const Wrapper = struct {
                 fn handler(
                     id: c_uint,
@@ -955,7 +956,7 @@ pub const Stream = struct {
                     _: c_uint,
                     ctx: ?*anyopaque,
                 ) callconv(.c) c_int {
-                    const match = Match{
+                    const match: Match = .{
                         .id = id,
                         .start = from,
                         .end = to,
@@ -971,18 +972,18 @@ pub const Stream = struct {
                 Wrapper.handler,
                 @ptrCast(@alignCast(context)),
             );
-            if (rc != c.HS_SUCCESS) return mapError(rc);
+            if (rc != c.hs_success) return mapError(rc);
         } else {
             const rc = c.hs_close_stream(self.handle, scratch.handle, null, null);
-            if (rc != c.HS_SUCCESS) return mapError(rc);
+            if (rc != c.hs_success) return mapError(rc);
         }
         self.handle = undefined;
     }
 
     /// Close the stream without checking for EOD matches
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Stream) void {
+        defer self.* = undefined;
         _ = c.hs_close_stream(self.handle, null, null, null);
-        self.handle = undefined;
     }
 };
 
@@ -998,7 +999,7 @@ pub fn version() []const u8 {
 
 /// Check if the current platform supports Hyperscan
 pub fn isPlatformValid() bool {
-    return c.hs_valid_platform() == c.HS_SUCCESS;
+    return c.hs_valid_platform() == c.hs_success;
 }
 
 // =============================================================================
@@ -1164,18 +1165,18 @@ test "streaming mode" {
     };
 
     // Write data in chunks
-    _ = try stream.scan(&scratch, "hello ", &Ctx{ .count = &match_count }, struct {
+    _ = try stream.scan(*const Ctx, struct {
         fn cb(_: *const Ctx, _: Match) bool {
             return true;
         }
-    }.cb);
+    }.cb, &scratch, "hello ", &Ctx{ .count = &match_count });
 
-    _ = try stream.scan(&scratch, "world", &Ctx{ .count = &match_count }, struct {
+    _ = try stream.scan(*const Ctx, struct {
         fn cb(ctx: *const Ctx, _: Match) bool {
             ctx.count.* += 1;
             return true;
         }
-    }.cb);
+    }.cb, &scratch, "world", &Ctx{ .count = &match_count });
 
     try std.testing.expectEqual(@as(usize, 1), match_count);
 }

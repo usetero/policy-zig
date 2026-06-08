@@ -81,7 +81,7 @@ pub const Span = struct {
 };
 
 test "Span.elapsedMs" {
-    const span = Span{
+    const span: Span = .{
         .id = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
         .name = "test",
         .level = .info,
@@ -97,7 +97,7 @@ test "Span.formatElapsed" {
     var buf: [32]u8 = undefined;
 
     // Test microseconds
-    const span_us = Span{
+    const span_us: Span = .{
         .id = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
         .name = "test",
         .level = .info,
@@ -108,7 +108,7 @@ test "Span.formatElapsed" {
     try std.testing.expect(std.mem.endsWith(u8, us_str, "µs"));
 
     // Test milliseconds
-    const span_ms = Span{
+    const span_ms: Span = .{
         .id = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
         .name = "test",
         .level = .info,

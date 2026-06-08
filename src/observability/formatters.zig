@@ -4,7 +4,7 @@ const Level = @import("level.zig").Level;
 /// Format the current time as HH:MM:SS
 pub fn formatTimestamp(io: std.Io, buf: []u8) []const u8 {
     const timestamp = std.Io.Timestamp.now(io, .real).toSeconds();
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
 
     return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{
@@ -15,9 +15,9 @@ pub fn formatTimestamp(io: std.Io, buf: []u8) []const u8 {
 }
 
 /// Format the current time as ISO8601
-pub fn formatTimestampISO(io: std.Io, buf: []u8) []const u8 {
+pub fn formatTimestampIso(io: std.Io, buf: []u8) []const u8 {
     const timestamp = std.Io.Timestamp.now(io, .real).toSeconds();
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -41,9 +41,9 @@ test "formatTimestamp" {
     try std.testing.expectEqual(@as(u8, ':'), ts[5]);
 }
 
-test "formatTimestampISO" {
+test "formatTimestampIso" {
     var buf: [32]u8 = undefined;
-    const ts = formatTimestampISO(std.Options.debug_io, &buf);
+    const ts = formatTimestampIso(std.Options.debug_io, &buf);
     try std.testing.expectEqual(@as(usize, 20), ts.len);
     try std.testing.expectEqual(@as(u8, 'T'), ts[10]);
     try std.testing.expectEqual(@as(u8, 'Z'), ts[19]);

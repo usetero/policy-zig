@@ -191,7 +191,7 @@ pub const EventBus = struct {
             break :blk full_name;
         };
 
-        var guard = SpanGuard(@TypeOf(event)){
+        var guard: SpanGuard(@TypeOf(event)) = .{
             .bus = self,
             .span = .{
                 .id = Span.generateSpanId(self.io),
@@ -262,7 +262,7 @@ pub const EventBus = struct {
         const now_ts = std.Io.Timestamp.now(self.io, .real);
         const secs: u64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
         const ms: u64 = @intCast(@divFloor(@mod(now_ts.nanoseconds, std.time.ns_per_s), std.time.ns_per_ms));
-        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+        const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = secs };
         const epoch_day = epoch_seconds.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -417,6 +417,7 @@ const TestWriter = struct {
     fn deinit(self: *TestWriter) void {
         self.output.deinit(self.allocator);
         self.io_writer.deinit();
+        self.* = undefined;
     }
 
     fn writer(self: *TestWriter) *std.Io.Writer {
@@ -444,7 +445,8 @@ test "EventBus: simple info event" {
         method: []const u8,
     };
 
-    bus.info(UserLoggedIn{ .username = "alice", .method = "oauth" });
+    const event: UserLoggedIn = .{ .username = "alice", .method = "oauth" };
+    bus.info(event);
 
     const output = tw.getOutput();
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "[INFO]"));
@@ -463,8 +465,10 @@ test "EventBus: level filtering" {
     const DebugEvent = struct { detail: []const u8 };
     const WarnEvent = struct { message: []const u8 };
 
-    bus.debug(DebugEvent{ .detail = "should not appear" });
-    bus.warn(WarnEvent{ .message = "should appear" });
+    const debug_event: DebugEvent = .{ .detail = "should not appear" };
+    const warn_event: WarnEvent = .{ .message = "should appear" };
+    bus.debug(debug_event);
+    bus.warn(warn_event);
 
     const output = tw.getOutput();
     try testing.expect(!std.mem.containsAtLeast(u8, output, 1, "should not appear"));
@@ -481,12 +485,14 @@ test "EventBus: span with timing" {
     const BatchProcessingStarted = struct { batch_id: u32 };
     const BatchProcessingCompleted = struct { items_processed: u32 };
 
-    var span = bus.started(.info, BatchProcessingStarted{ .batch_id = 123 });
+    const started: BatchProcessingStarted = .{ .batch_id = 123 };
+    var span = bus.started(.info, started);
 
     // Simulate some work
     try std.Options.debug_io.sleep(.fromMilliseconds(10), .awake);
 
-    span.completed(BatchProcessingCompleted{ .items_processed = 5 });
+    const completed: BatchProcessingCompleted = .{ .items_processed = 5 };
+    span.completed(completed);
 
     const output = tw.getOutput();
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "batch.processing.started"));
@@ -509,7 +515,8 @@ test "EventBus: numeric and boolean fields" {
         success: bool,
     };
 
-    bus.info(MetricsEvent{ .count = 42, .rate = 3.14, .success = true });
+    const event: MetricsEvent = .{ .count = 42, .rate = 3.14, .success = true };
+    bus.info(event);
 
     const output = tw.getOutput();
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "count=42"));
@@ -527,7 +534,8 @@ test "EventBus: enum fields" {
     const Status = enum { pending, running, completed };
     const StatusEvent = struct { status: Status };
 
-    bus.info(StatusEvent{ .status = .running });
+    const event: StatusEvent = .{ .status = .running };
+    bus.info(event);
 
     const output = tw.getOutput();
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "status=running"));
@@ -545,8 +553,10 @@ test "EventBus: optional fields" {
         error_msg: ?[]const u8,
     };
 
-    bus.info(OptionalEvent{ .name = "test", .error_msg = null });
-    bus.info(OptionalEvent{ .name = "test2", .error_msg = "something failed" });
+    const null_event: OptionalEvent = .{ .name = "test", .error_msg = null };
+    const error_event: OptionalEvent = .{ .name = "test2", .error_msg = "something failed" };
+    bus.info(null_event);
+    bus.info(error_event);
 
     const output = tw.getOutput();
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "error_msg=null"));

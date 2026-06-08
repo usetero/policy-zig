@@ -19,6 +19,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 
 /// Lock-free rate limiter for a single policy.
@@ -77,7 +78,7 @@ pub const RateLimiter = struct {
         time_source: *const fn (io: std.Io) i64,
     ) RateLimiter {
         const now = time_source(io);
-        var limiter = RateLimiter{
+        var limiter: RateLimiter = .{
             .limit = limit,
             .window_ms = window_ms,
             .time_source = time_source,
@@ -431,7 +432,7 @@ test "RateLimiter: very long window" {
 // =============================================================================
 
 test "RateLimiter: concurrent increments respect limit" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     // Use a high limit that won't expire during test
     var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 1000);
@@ -463,7 +464,7 @@ test "RateLimiter: concurrent increments respect limit" {
 }
 
 test "RateLimiter: concurrent access with window reset" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     // Shared mock time that threads will advance
     var mock_time = MockTime.init(0);
@@ -520,7 +521,7 @@ test "RateLimiter: concurrent access with window reset" {
 }
 
 test "RateLimiter: no data races under contention" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var limiter = RateLimiter.initPerSecond(std.Options.debug_io, 1000);
     var iterations = std.atomic.Value(u32).init(0);
@@ -551,7 +552,7 @@ test "RateLimiter: no data races under contention" {
 }
 
 test "RateLimiter: CAS race at window boundary" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     // Test that CAS correctly handles multiple threads trying to reset
     var mock_time = MockTime.init(0);
