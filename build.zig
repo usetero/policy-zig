@@ -53,29 +53,37 @@ pub fn build(b: *std.Build) void {
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // Observability module tests (no libc/hyperscan dependency)
+    const o11y_tests = b.addTest(.{
+        .root_module = o11y_mod,
+    });
+    const run_o11y_tests = b.addRunArtifact(o11y_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_o11y_tests.step);
 
     // Proto generation step (optional, requires protoc)
     const gen_proto_opt = b.option(bool, "gen-proto", "Generate protobuf files") orelse false;
     if (gen_proto_opt) {
         const gen_proto = b.step("gen-proto", "Generate zig files from protocol buffer definitions");
-        const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
+        const generator = protobuf_dep.artifact("protoc-gen-zig");
+        const protoc_step = protobuf.RunProtocStep.createWithGenerator(b, generator, .{
             .destination_directory = b.path("src/proto"),
             .source_files = &.{
-                "proto/tero/policy/v1/policy.proto",
-                "proto/tero/policy/v1/log.proto",
-                "proto/tero/policy/v1/metric.proto",
-                "proto/tero/policy/v1/trace.proto",
-                "proto/tero/policy/v1/shared.proto",
-                "proto/opentelemetry/proto/common/v1/common.proto",
-                "proto/opentelemetry/proto/resource/v1/resource.proto",
-                "proto/opentelemetry/proto/logs/v1/logs.proto",
-                "proto/opentelemetry/proto/metrics/v1/metrics.proto",
-                "proto/opentelemetry/proto/trace/v1/trace.proto",
+                b.path("proto/tero/policy/v1/policy.proto"),
+                b.path("proto/tero/policy/v1/log.proto"),
+                b.path("proto/tero/policy/v1/metric.proto"),
+                b.path("proto/tero/policy/v1/trace.proto"),
+                b.path("proto/tero/policy/v1/shared.proto"),
+                b.path("proto/opentelemetry/proto/common/v1/common.proto"),
+                b.path("proto/opentelemetry/proto/resource/v1/resource.proto"),
+                b.path("proto/opentelemetry/proto/logs/v1/logs.proto"),
+                b.path("proto/opentelemetry/proto/metrics/v1/metrics.proto"),
+                b.path("proto/opentelemetry/proto/trace/v1/trace.proto"),
             },
             .include_directories = &.{
-                "proto",
+                b.path("proto"),
             },
         });
         gen_proto.dependOn(&protoc_step.step);

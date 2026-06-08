@@ -33,7 +33,7 @@ const NumericValue = proto.policy.NumericValue;
 /// - Array shorthand: ["http", "method"] -> ["http", "method"]
 /// - Canonical: {"path": ["http", "method"]} -> ["http", "method"]
 fn parseAttributePath(allocator: std.mem.Allocator, value: std.json.Value) !AttributePath {
-    var attr_path = AttributePath{};
+    var attr_path: AttributePath = .{};
     errdefer {
         for (attr_path.path.items) |segment| {
             allocator.free(segment);
@@ -89,7 +89,7 @@ fn parseAttributePath(allocator: std.mem.Allocator, value: std.json.Value) !Attr
 /// Create an AttributePath from a simple key string.
 /// For backward compatibility, a single key becomes a single-element path.
 fn makeAttributePath(allocator: std.mem.Allocator, key: []const u8) !AttributePath {
-    var attr_path = AttributePath{};
+    var attr_path: AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, key));
     return attr_path;
 }
@@ -403,7 +403,7 @@ fn parsePolicy(allocator: std.mem.Allocator, json_policy: PolicyJson) !Policy {
         target = .{ .trace = try parseTraceTarget(allocator, trace_json) };
     }
 
-    return Policy{
+    return .{
         .id = id,
         .name = name,
         .description = description,
@@ -417,7 +417,7 @@ fn parsePolicy(allocator: std.mem.Allocator, json_policy: PolicyJson) !Policy {
 // =============================================================================
 
 fn parseLogTarget(allocator: std.mem.Allocator, json: LogTargetJson) !LogTarget {
-    var matchers = std.ArrayListUnmanaged(LogMatcher){};
+    var matchers = std.ArrayList(LogMatcher).empty;
 
     if (json.match) |json_matchers| {
         try matchers.ensureTotalCapacity(allocator, json_matchers.len);
@@ -437,7 +437,7 @@ fn parseLogTarget(allocator: std.mem.Allocator, json: LogTargetJson) !LogTarget 
         sample_key = try parseLogSampleKey(allocator, sk);
     }
 
-    return LogTarget{
+    return .{
         .match = matchers,
         .keep = try allocator.dupe(u8, json.keep),
         .transform = transform,
@@ -459,7 +459,7 @@ fn parseLogSampleKey(allocator: std.mem.Allocator, json: LogSampleKeyJson) !LogS
             return error.MissingSampleKeyField;
         }
     };
-    return LogSampleKey{ .field = field };
+    return .{ .field = field };
 }
 
 fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher {
@@ -507,7 +507,7 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
         }
     };
 
-    return LogMatcher{
+    return .{
         .negate = jm.negate,
         .case_insensitive = jm.case_insensitive,
         .field = field,
@@ -588,19 +588,36 @@ fn hexDigit(c: u8) !u8 {
     };
 }
 
+/// Maps a string `name` to an enum value of type `T` using a table of
+/// `.{ alias, value }` entries, returning `err` when nothing matches. List an
+/// enum value more than once to give it several accepted aliases (e.g. both the
+/// short form and the proto constant name).
+fn parseEnumAlias(
+    comptime T: type,
+    comptime table: []const struct { []const u8, T },
+    comptime err: anyerror,
+    name: []const u8,
+) !T {
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return err;
+}
+
 fn parseLogFieldName(name: []const u8) !LogField {
-    if (std.mem.eql(u8, name, "body")) return .LOG_FIELD_BODY;
-    if (std.mem.eql(u8, name, "severity_text")) return .LOG_FIELD_SEVERITY_TEXT;
-    if (std.mem.eql(u8, name, "trace_id")) return .LOG_FIELD_TRACE_ID;
-    if (std.mem.eql(u8, name, "span_id")) return .LOG_FIELD_SPAN_ID;
-    if (std.mem.eql(u8, name, "event_name")) return .LOG_FIELD_EVENT_NAME;
-    if (std.mem.eql(u8, name, "resource_schema_url")) return .LOG_FIELD_RESOURCE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "scope_schema_url")) return .LOG_FIELD_SCOPE_SCHEMA_URL;
-    return error.InvalidLogField;
+    return parseEnumAlias(LogField, &.{
+        .{ "body", .LOG_FIELD_BODY },
+        .{ "severity_text", .LOG_FIELD_SEVERITY_TEXT },
+        .{ "trace_id", .LOG_FIELD_TRACE_ID },
+        .{ "span_id", .LOG_FIELD_SPAN_ID },
+        .{ "event_name", .LOG_FIELD_EVENT_NAME },
+        .{ "resource_schema_url", .LOG_FIELD_RESOURCE_SCHEMA_URL },
+        .{ "scope_schema_url", .LOG_FIELD_SCOPE_SCHEMA_URL },
+    }, error.InvalidLogField, name);
 }
 
 fn parseLogTransform(allocator: std.mem.Allocator, jt: TransformJson) !LogTransform {
-    var transform = LogTransform{};
+    var transform: LogTransform = .{};
 
     if (jt.remove) |removes| {
         try transform.remove.ensureTotalCapacity(allocator, removes.len);
@@ -652,7 +669,7 @@ fn parseLogRemove(allocator: std.mem.Allocator, jr: RemoveJson) !LogRemove {
         }
     };
 
-    return LogRemove{ .field = field };
+    return .{ .field = field };
 }
 
 fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
@@ -672,7 +689,7 @@ fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
 
     const regex_copy: ?[]const u8 = if (jr.regex) |r| try allocator.dupe(u8, r) else null;
 
-    return LogRedact{
+    return .{
         .field = field,
         .replacement = try allocator.dupe(u8, jr.replacement),
         .regex = regex_copy,
@@ -694,7 +711,7 @@ fn parseLogRename(allocator: std.mem.Allocator, jr: RenameJson) !LogRename {
         }
     };
 
-    return LogRename{
+    return .{
         .from = from,
         .to = try allocator.dupe(u8, jr.to),
         .upsert = jr.upsert,
@@ -716,7 +733,7 @@ fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
         }
     };
 
-    return LogAdd{
+    return .{
         .field = field,
         .value = try allocator.dupe(u8, ja.value),
         .upsert = ja.upsert,
@@ -728,7 +745,7 @@ fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
 // =============================================================================
 
 fn parseMetricTarget(allocator: std.mem.Allocator, json: MetricTargetJson) !MetricTarget {
-    var matchers = std.ArrayListUnmanaged(MetricMatcher){};
+    var matchers = std.ArrayList(MetricMatcher).empty;
 
     if (json.match) |json_matchers| {
         try matchers.ensureTotalCapacity(allocator, json_matchers.len);
@@ -738,7 +755,7 @@ fn parseMetricTarget(allocator: std.mem.Allocator, json: MetricTargetJson) !Metr
         }
     }
 
-    return MetricTarget{
+    return .{
         .match = matchers,
         .keep = json.keep,
     };
@@ -758,7 +775,9 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
         } else if (jm.metric_type) |type_name| {
             break :blk .{ .metric_type = try parseMetricType(type_name) };
         } else if (jm.aggregation_temporality) |temporality_name| {
-            break :blk .{ .aggregation_temporality = try parseAggregationTemporality(temporality_name) };
+            break :blk .{
+                .aggregation_temporality = try parseAggregationTemporality(temporality_name),
+            };
         } else {
             return error.MissingField;
         }
@@ -796,7 +815,7 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
         }
     };
 
-    return MetricMatcher{
+    return .{
         .negate = jm.negate,
         .case_insensitive = jm.case_insensitive,
         .field = field,
@@ -805,29 +824,39 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
 }
 
 fn parseMetricFieldName(name: []const u8) !MetricField {
-    if (std.mem.eql(u8, name, "name")) return .METRIC_FIELD_NAME;
-    if (std.mem.eql(u8, name, "description")) return .METRIC_FIELD_DESCRIPTION;
-    if (std.mem.eql(u8, name, "unit")) return .METRIC_FIELD_UNIT;
-    if (std.mem.eql(u8, name, "resource_schema_url")) return .METRIC_FIELD_RESOURCE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "scope_schema_url")) return .METRIC_FIELD_SCOPE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "scope_name")) return .METRIC_FIELD_SCOPE_NAME;
-    if (std.mem.eql(u8, name, "scope_version")) return .METRIC_FIELD_SCOPE_VERSION;
-    return error.InvalidMetricField;
+    return parseEnumAlias(MetricField, &.{
+        .{ "name", .METRIC_FIELD_NAME },
+        .{ "description", .METRIC_FIELD_DESCRIPTION },
+        .{ "unit", .METRIC_FIELD_UNIT },
+        .{ "resource_schema_url", .METRIC_FIELD_RESOURCE_SCHEMA_URL },
+        .{ "scope_schema_url", .METRIC_FIELD_SCOPE_SCHEMA_URL },
+        .{ "scope_name", .METRIC_FIELD_SCOPE_NAME },
+        .{ "scope_version", .METRIC_FIELD_SCOPE_VERSION },
+    }, error.InvalidMetricField, name);
 }
 
 fn parseMetricType(name: []const u8) !MetricType {
-    if (std.mem.eql(u8, name, "gauge") or std.mem.eql(u8, name, "METRIC_TYPE_GAUGE")) return .METRIC_TYPE_GAUGE;
-    if (std.mem.eql(u8, name, "sum") or std.mem.eql(u8, name, "METRIC_TYPE_SUM")) return .METRIC_TYPE_SUM;
-    if (std.mem.eql(u8, name, "histogram") or std.mem.eql(u8, name, "METRIC_TYPE_HISTOGRAM")) return .METRIC_TYPE_HISTOGRAM;
-    if (std.mem.eql(u8, name, "exponential_histogram") or std.mem.eql(u8, name, "METRIC_TYPE_EXPONENTIAL_HISTOGRAM")) return .METRIC_TYPE_EXPONENTIAL_HISTOGRAM;
-    if (std.mem.eql(u8, name, "summary") or std.mem.eql(u8, name, "METRIC_TYPE_SUMMARY")) return .METRIC_TYPE_SUMMARY;
-    return error.InvalidMetricType;
+    return parseEnumAlias(MetricType, &.{
+        .{ "gauge", .METRIC_TYPE_GAUGE },
+        .{ "METRIC_TYPE_GAUGE", .METRIC_TYPE_GAUGE },
+        .{ "sum", .METRIC_TYPE_SUM },
+        .{ "METRIC_TYPE_SUM", .METRIC_TYPE_SUM },
+        .{ "histogram", .METRIC_TYPE_HISTOGRAM },
+        .{ "METRIC_TYPE_HISTOGRAM", .METRIC_TYPE_HISTOGRAM },
+        .{ "exponential_histogram", .METRIC_TYPE_EXPONENTIAL_HISTOGRAM },
+        .{ "METRIC_TYPE_EXPONENTIAL_HISTOGRAM", .METRIC_TYPE_EXPONENTIAL_HISTOGRAM },
+        .{ "summary", .METRIC_TYPE_SUMMARY },
+        .{ "METRIC_TYPE_SUMMARY", .METRIC_TYPE_SUMMARY },
+    }, error.InvalidMetricType, name);
 }
 
 fn parseAggregationTemporality(name: []const u8) !AggregationTemporality {
-    if (std.mem.eql(u8, name, "delta") or std.mem.eql(u8, name, "AGGREGATION_TEMPORALITY_DELTA")) return .AGGREGATION_TEMPORALITY_DELTA;
-    if (std.mem.eql(u8, name, "cumulative") or std.mem.eql(u8, name, "AGGREGATION_TEMPORALITY_CUMULATIVE")) return .AGGREGATION_TEMPORALITY_CUMULATIVE;
-    return error.InvalidAggregationTemporality;
+    return parseEnumAlias(AggregationTemporality, &.{
+        .{ "delta", .AGGREGATION_TEMPORALITY_DELTA },
+        .{ "AGGREGATION_TEMPORALITY_DELTA", .AGGREGATION_TEMPORALITY_DELTA },
+        .{ "cumulative", .AGGREGATION_TEMPORALITY_CUMULATIVE },
+        .{ "AGGREGATION_TEMPORALITY_CUMULATIVE", .AGGREGATION_TEMPORALITY_CUMULATIVE },
+    }, error.InvalidAggregationTemporality, name);
 }
 
 // =============================================================================
@@ -835,7 +864,7 @@ fn parseAggregationTemporality(name: []const u8) !AggregationTemporality {
 // =============================================================================
 
 fn parseTraceTarget(allocator: std.mem.Allocator, json: TraceTargetJson) !TraceTarget {
-    var matchers = std.ArrayListUnmanaged(TraceMatcher){};
+    var matchers = std.ArrayList(TraceMatcher).empty;
 
     if (json.match) |json_matchers| {
         try matchers.ensureTotalCapacity(allocator, json_matchers.len);
@@ -850,7 +879,7 @@ fn parseTraceTarget(allocator: std.mem.Allocator, json: TraceTargetJson) !TraceT
         sampling_config = try parseTraceSamplingConfig(jk);
     }
 
-    return TraceTarget{
+    return .{
         .match = matchers,
         .keep = sampling_config,
     };
@@ -911,7 +940,7 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
         }
     };
 
-    return TraceMatcher{
+    return .{
         .negate = jm.negate,
         .case_insensitive = jm.case_insensitive,
         .field = field,
@@ -920,45 +949,62 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
 }
 
 fn parseTraceFieldName(name: []const u8) !TraceField {
-    if (std.mem.eql(u8, name, "TRACE_FIELD_NAME") or std.mem.eql(u8, name, "name")) return .TRACE_FIELD_NAME;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_ID") or std.mem.eql(u8, name, "trace_id")) return .TRACE_FIELD_TRACE_ID;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SPAN_ID") or std.mem.eql(u8, name, "span_id")) return .TRACE_FIELD_SPAN_ID;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_PARENT_SPAN_ID") or std.mem.eql(u8, name, "parent_span_id")) return .TRACE_FIELD_PARENT_SPAN_ID;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_STATE") or std.mem.eql(u8, name, "trace_state")) return .TRACE_FIELD_TRACE_STATE;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_RESOURCE_SCHEMA_URL") or std.mem.eql(u8, name, "resource_schema_url")) return .TRACE_FIELD_RESOURCE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_SCHEMA_URL") or std.mem.eql(u8, name, "scope_schema_url")) return .TRACE_FIELD_SCOPE_SCHEMA_URL;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_NAME") or std.mem.eql(u8, name, "scope_name")) return .TRACE_FIELD_SCOPE_NAME;
-    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_VERSION") or std.mem.eql(u8, name, "scope_version")) return .TRACE_FIELD_SCOPE_VERSION;
-    return error.InvalidTraceField;
+    return parseEnumAlias(TraceField, &.{
+        .{ "name", .TRACE_FIELD_NAME },
+        .{ "TRACE_FIELD_NAME", .TRACE_FIELD_NAME },
+        .{ "trace_id", .TRACE_FIELD_TRACE_ID },
+        .{ "TRACE_FIELD_TRACE_ID", .TRACE_FIELD_TRACE_ID },
+        .{ "span_id", .TRACE_FIELD_SPAN_ID },
+        .{ "TRACE_FIELD_SPAN_ID", .TRACE_FIELD_SPAN_ID },
+        .{ "parent_span_id", .TRACE_FIELD_PARENT_SPAN_ID },
+        .{ "TRACE_FIELD_PARENT_SPAN_ID", .TRACE_FIELD_PARENT_SPAN_ID },
+        .{ "trace_state", .TRACE_FIELD_TRACE_STATE },
+        .{ "TRACE_FIELD_TRACE_STATE", .TRACE_FIELD_TRACE_STATE },
+        .{ "resource_schema_url", .TRACE_FIELD_RESOURCE_SCHEMA_URL },
+        .{ "TRACE_FIELD_RESOURCE_SCHEMA_URL", .TRACE_FIELD_RESOURCE_SCHEMA_URL },
+        .{ "scope_schema_url", .TRACE_FIELD_SCOPE_SCHEMA_URL },
+        .{ "TRACE_FIELD_SCOPE_SCHEMA_URL", .TRACE_FIELD_SCOPE_SCHEMA_URL },
+        .{ "scope_name", .TRACE_FIELD_SCOPE_NAME },
+        .{ "TRACE_FIELD_SCOPE_NAME", .TRACE_FIELD_SCOPE_NAME },
+        .{ "scope_version", .TRACE_FIELD_SCOPE_VERSION },
+        .{ "TRACE_FIELD_SCOPE_VERSION", .TRACE_FIELD_SCOPE_VERSION },
+    }, error.InvalidTraceField, name);
 }
 
 fn parseSpanKind(name: []const u8) !SpanKind {
-    if (std.mem.eql(u8, name, "SPAN_KIND_UNSPECIFIED")) return .SPAN_KIND_UNSPECIFIED;
-    if (std.mem.eql(u8, name, "SPAN_KIND_INTERNAL")) return .SPAN_KIND_INTERNAL;
-    if (std.mem.eql(u8, name, "SPAN_KIND_SERVER")) return .SPAN_KIND_SERVER;
-    if (std.mem.eql(u8, name, "SPAN_KIND_CLIENT")) return .SPAN_KIND_CLIENT;
-    if (std.mem.eql(u8, name, "SPAN_KIND_PRODUCER")) return .SPAN_KIND_PRODUCER;
-    if (std.mem.eql(u8, name, "SPAN_KIND_CONSUMER")) return .SPAN_KIND_CONSUMER;
-    return error.InvalidSpanKind;
+    return parseEnumAlias(SpanKind, &.{
+        .{ "SPAN_KIND_UNSPECIFIED", .SPAN_KIND_UNSPECIFIED },
+        .{ "SPAN_KIND_INTERNAL", .SPAN_KIND_INTERNAL },
+        .{ "SPAN_KIND_SERVER", .SPAN_KIND_SERVER },
+        .{ "SPAN_KIND_CLIENT", .SPAN_KIND_CLIENT },
+        .{ "SPAN_KIND_PRODUCER", .SPAN_KIND_PRODUCER },
+        .{ "SPAN_KIND_CONSUMER", .SPAN_KIND_CONSUMER },
+    }, error.InvalidSpanKind, name);
 }
 
 fn parseSpanStatusCode(name: []const u8) !SpanStatusCode {
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSPECIFIED") or std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSET") or std.mem.eql(u8, name, "unset")) return .SPAN_STATUS_CODE_UNSPECIFIED;
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_OK") or std.mem.eql(u8, name, "ok")) return .SPAN_STATUS_CODE_OK;
-    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_ERROR") or std.mem.eql(u8, name, "error")) return .SPAN_STATUS_CODE_ERROR;
-    return error.InvalidSpanStatusCode;
+    return parseEnumAlias(SpanStatusCode, &.{
+        .{ "unset", .SPAN_STATUS_CODE_UNSPECIFIED },
+        .{ "SPAN_STATUS_CODE_UNSET", .SPAN_STATUS_CODE_UNSPECIFIED },
+        .{ "SPAN_STATUS_CODE_UNSPECIFIED", .SPAN_STATUS_CODE_UNSPECIFIED },
+        .{ "ok", .SPAN_STATUS_CODE_OK },
+        .{ "SPAN_STATUS_CODE_OK", .SPAN_STATUS_CODE_OK },
+        .{ "error", .SPAN_STATUS_CODE_ERROR },
+        .{ "SPAN_STATUS_CODE_ERROR", .SPAN_STATUS_CODE_ERROR },
+    }, error.InvalidSpanStatusCode, name);
 }
 
 fn parseSamplingMode(name: []const u8) !SamplingMode {
-    if (std.mem.eql(u8, name, "SAMPLING_MODE_UNSPECIFIED")) return .SAMPLING_MODE_UNSPECIFIED;
-    if (std.mem.eql(u8, name, "SAMPLING_MODE_HASH_SEED")) return .SAMPLING_MODE_HASH_SEED;
-    if (std.mem.eql(u8, name, "SAMPLING_MODE_PROPORTIONAL")) return .SAMPLING_MODE_PROPORTIONAL;
-    if (std.mem.eql(u8, name, "SAMPLING_MODE_EQUALIZING")) return .SAMPLING_MODE_EQUALIZING;
-    return error.InvalidSamplingMode;
+    return parseEnumAlias(SamplingMode, &.{
+        .{ "SAMPLING_MODE_UNSPECIFIED", .SAMPLING_MODE_UNSPECIFIED },
+        .{ "SAMPLING_MODE_HASH_SEED", .SAMPLING_MODE_HASH_SEED },
+        .{ "SAMPLING_MODE_PROPORTIONAL", .SAMPLING_MODE_PROPORTIONAL },
+        .{ "SAMPLING_MODE_EQUALIZING", .SAMPLING_MODE_EQUALIZING },
+    }, error.InvalidSamplingMode, name);
 }
 
 fn parseTraceSamplingConfig(jk: TraceSamplingConfigJson) !TraceSamplingConfig {
-    var config = TraceSamplingConfig{
+    var config: TraceSamplingConfig = .{
         .percentage = jk.percentage,
     };
 
@@ -991,7 +1037,7 @@ pub fn parseKeepValue(s: []const u8) !void {
         return;
     }
     // Check for rate limit: "N/s", "N/m", "N/Ds", "N/Dm"
-    if (std.mem.indexOfScalar(u8, s, '/')) |slash_pos| {
+    if (std.mem.findScalar(u8, s, '/')) |slash_pos| {
         if (slash_pos == 0) return error.InvalidKeepValue;
         _ = std.fmt.parseInt(u32, s[0..slash_pos], 10) catch return error.InvalidKeepValue;
         const after_slash = s[slash_pos + 1 ..];
@@ -999,7 +1045,11 @@ pub fn parseKeepValue(s: []const u8) !void {
         const unit = after_slash[after_slash.len - 1];
         if (unit != 's' and unit != 'm') return error.InvalidKeepValue;
         if (after_slash.len > 1) {
-            const dur = std.fmt.parseInt(u32, after_slash[0 .. after_slash.len - 1], 10) catch return error.InvalidKeepValue;
+            const dur = std.fmt.parseInt(
+                u32,
+                after_slash[0 .. after_slash.len - 1],
+                10,
+            ) catch return error.InvalidKeepValue;
             if (dur == 0) return error.InvalidKeepValue;
         }
         return;
@@ -2457,7 +2507,10 @@ test "parsePoliciesBytes: metric policy with aggregation_temporality short form"
     const metric_target = policies[0].target.?.metric;
     const matcher = metric_target.match.items[0];
     try std.testing.expect(matcher.field.? == .aggregation_temporality);
-    try std.testing.expectEqual(AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, matcher.field.?.aggregation_temporality);
+    try std.testing.expectEqual(
+        AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA,
+        matcher.field.?.aggregation_temporality,
+    );
     try std.testing.expect(matcher.match.? == .exists);
     try std.testing.expectEqual(true, matcher.match.?.exists);
 }
@@ -2490,7 +2543,10 @@ test "parsePoliciesBytes: metric policy with aggregation_temporality canonical f
     const metric_target = policies[0].target.?.metric;
     const matcher = metric_target.match.items[0];
     try std.testing.expect(matcher.field.? == .aggregation_temporality);
-    try std.testing.expectEqual(AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE, matcher.field.?.aggregation_temporality);
+    try std.testing.expectEqual(
+        AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE,
+        matcher.field.?.aggregation_temporality,
+    );
 }
 
 test "parsePoliciesBytes: trace policy with SPAN_STATUS_CODE_UNSET" {
@@ -2605,9 +2661,9 @@ test "parseValue: float shorthand" {
 
 test "parseValue: hex_value canonical" {
     const allocator = std.testing.allocator;
-    var obj = std.json.ObjectMap.init(allocator);
-    defer obj.deinit();
-    try obj.put("hex_value", .{ .string = "deadbeef" });
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "hex_value", .{ .string = "deadbeef" });
     const v = try parseValue(allocator, .{ .object = obj });
     defer allocator.free(v.value.?.bytes_value);
     try std.testing.expect(v.value.? == .bytes_value);
@@ -2759,7 +2815,10 @@ test "parsePoliciesBytes: trace policy with equals hex (bytes identifier)" {
         \\    "name": "Keep all spans for a trace",
         \\    "trace": {
         \\      "match": [
-        \\        { "trace_field": "TRACE_FIELD_TRACE_ID", "equals": { "hex_value": "4bf92f3577b34da6a3ce929d0e0e4736" } }
+        \\        {
+        \\          "trace_field": "TRACE_FIELD_TRACE_ID",
+        \\          "equals": { "hex_value": "4bf92f3577b34da6a3ce929d0e0e4736" }
+        \\        }
         \\      ]
         \\    }
         \\  }]

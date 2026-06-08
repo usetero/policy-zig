@@ -253,6 +253,29 @@ pub const MetricFieldRef = union(enum) {
 };
 
 // =============================================================================
+// TypedValue - typed field value for equals/gt/gte/lt/lte matchers
+// =============================================================================
+
+/// A typed field value returned by the `typed_value` accessor primitive.
+///
+/// Used by the `equals`, `gt`, `gte`, `lt`, and `lte` matchers, which need
+/// to compare against non-string values (booleans, integers, floats, bytes).
+///
+/// The default string path (`value` accessor) is still used for string-typed
+/// matchers and for `typed_value`-less accessors that fall back to
+/// `TypedValue.string` wrapping.
+///
+/// `string` and `bytes` slices are borrowed from the consumer record and must
+/// remain valid for the duration of the `engine.evaluate` call.
+pub const TypedValue = union(enum) {
+    string: []const u8,
+    bool: bool,
+    int: i64,
+    double: f64,
+    bytes: []const u8,
+};
+
+// =============================================================================
 // Log Accessor - Capability-tagged interface to consumer log records
 // =============================================================================
 
@@ -306,6 +329,17 @@ pub const LogAccessor = struct {
     /// Wiring this enables: log.rename.
     move: ?*const fn (ctx: *anyopaque, from: FieldRef, to: []const u8) void = null,
 
+    /// Read a field as a typed value for `equals`/`gt`/`gte`/`lt`/`lte` matchers.
+    ///
+    /// When null, the engine falls back to `value()` and treats the result as
+    /// `TypedValue.string` — typed matchers will fire only against string fields.
+    /// Override to expose int/double/bool/bytes attribute values so typed
+    /// matchers can compare against them correctly.
+    ///
+    /// Return null when the field is absent. A present-but-wrong-type value
+    /// causes a non-match (never a runtime error) consistent with fail-open.
+    typed_value: ?*const fn (ctx: *const anyopaque, field: FieldRef) ?TypedValue = null,
+
     /// Returns true if the field is present. Uses the wired `exists` primitive
     /// when available, otherwise falls back to `value != null`.
     pub fn callExists(self: *const LogAccessor, ctx: *const anyopaque, field: FieldRef) bool {
@@ -314,12 +348,14 @@ pub const LogAccessor = struct {
     }
 };
 
-/// Read+write interface to a metric record. Today no transforms touch metrics,
-/// so only `value` and `exists` are part of the interface.
+/// Read+write interface to a metric record.
 pub const MetricAccessor = struct {
     value: *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8,
 
     exists: ?*const fn (ctx: *const anyopaque, field: MetricFieldRef) bool = null,
+
+    /// Typed read for `equals`/`gt`/`gte`/`lt`/`lte` matchers. See `LogAccessor.typed_value`.
+    typed_value: ?*const fn (ctx: *const anyopaque, field: MetricFieldRef) ?TypedValue = null,
 
     pub fn callExists(self: *const MetricAccessor, ctx: *const anyopaque, field: MetricFieldRef) bool {
         if (self.exists) |f| return f(ctx, field);
@@ -338,6 +374,9 @@ pub const TraceAccessor = struct {
 
     /// Wiring this enables: trace sampling threshold writeback.
     set: ?*const fn (ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void = null,
+
+    /// Typed read for `equals`/`gt`/`gte`/`lt`/`lte` matchers. See `LogAccessor.typed_value`.
+    typed_value: ?*const fn (ctx: *const anyopaque, field: TraceFieldRef) ?TypedValue = null,
 
     pub fn callExists(self: *const TraceAccessor, ctx: *const anyopaque, field: TraceFieldRef) bool {
         if (self.exists) |f| return f(ctx, field);
@@ -397,7 +436,14 @@ pub const TraceFieldRef = union(enum) {
     pub fn isEnumField(self: TraceFieldRef) bool {
         return switch (self) {
             .span_kind, .span_status => true,
-            .trace_field, .span_attribute, .resource_attribute, .scope_attribute, .event_name, .event_attribute, .link_trace_id => false,
+            .trace_field,
+            .span_attribute,
+            .resource_attribute,
+            .scope_attribute,
+            .event_name,
+            .event_attribute,
+            .link_trace_id,
+            => false,
         };
     }
 
@@ -474,7 +520,7 @@ pub const TransformResult = struct {
 // Provider - Tagged union over concrete provider types
 // =============================================================================
 
-const Policy = proto.policy.Policy;
+pub const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
@@ -503,7 +549,13 @@ pub const Provider = union(enum) {
         }
     }
 
-    pub fn recordPolicyStats(self: Provider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+    pub fn recordPolicyStats(
+        self: Provider,
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    ) void {
         switch (self) {
             inline else => |p| p.recordPolicyStats(policy_id, hits, misses, transform_result),
         }
@@ -529,10 +581,10 @@ pub const TestProvider = struct {
     allocator: std.mem.Allocator,
     id: []const u8,
     source_type: SourceType,
-    policies: std.ArrayListUnmanaged(Policy),
-    callbacks: std.ArrayListUnmanaged(PolicyCallback),
-    recorded_errors: std.ArrayListUnmanaged(struct { policy_id: []const u8, message: []const u8 }),
-    recorded_stats: std.ArrayListUnmanaged(StatsCall),
+    policies: std.ArrayList(Policy),
+    callbacks: std.ArrayList(PolicyCallback),
+    recorded_errors: std.ArrayList(struct { policy_id: []const u8, message: []const u8 }),
+    recorded_stats: std.ArrayList(StatsCall),
 
     pub const StatsCall = struct {
         policy_id: []const u8,
@@ -554,6 +606,8 @@ pub const TestProvider = struct {
     }
 
     pub fn deinit(self: *TestProvider) void {
+        defer self.* = undefined;
+
         for (self.policies.items) |*p| {
             p.deinit(self.allocator);
         }
@@ -599,7 +653,7 @@ pub const TestProvider = struct {
     }
 
     pub fn notifySubscribers(self: *TestProvider) !void {
-        const update = PolicyUpdate{
+        const update: PolicyUpdate = .{
             .policies = self.policies.items,
             .provider_id = self.id,
         };
@@ -631,7 +685,13 @@ pub const TestProvider = struct {
         };
     }
 
-    pub fn recordPolicyStats(self: *TestProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+    pub fn recordPolicyStats(
+        self: *TestProvider,
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    ) void {
         const id_copy = self.allocator.dupe(u8, policy_id) catch return;
         self.recorded_stats.append(self.allocator, .{
             .policy_id = id_copy,

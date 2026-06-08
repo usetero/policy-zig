@@ -24,7 +24,7 @@ library so it can be consumed independently.
 
 ## Requirements
 
-- [Zig](https://ziglang.org/) >= 0.15.2
+- [Zig](https://ziglang.org/) >= 0.16.0
 - [Vectorscan](https://github.com/VectorCamp/vectorscan) (or Hyperscan) -
   high-performance regex matching
 

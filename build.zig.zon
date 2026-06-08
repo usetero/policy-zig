@@ -25,7 +25,7 @@
     .fingerprint = 0xd8303674de69f7e7, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .protobuf = .{
-            .url = "git+https://github.com/jaronoff97/zig-protobuf?ref=fix-json-oneof-shadowing#0cb7d52fd5b2f7ec4030009c22f140c9eaf5e806",
-            .hash = "protobuf-3.0.0-0e82avMdKQAzgA5gR2xO-GbQM5xgDF-a1g0h9db7IeoT",
+            .url = "git+https://github.com/jaronoff97/zig-protobuf?ref=json-bytes-hex-and-wire-perf#0d57fd6b8ec541b640f4025b13ef4f62f88a90a5",
+            .hash = "protobuf-5.0.0-0e82ahURKgBBo-BuW_Jhy2nZtW-oJyfhUDnC9Rdv9Tpg",
         },
         .regex = .{
             .url = "git+https://github.com/quangd42/regex.zig.git#01a591df26b9d21e842d85ecbb4e16ee5a40eb93",

@@ -15,7 +15,7 @@
 //!
 //! // Initialize the adapter with your EventBus (call once at startup)
 //! var stdio_bus: o11y.StdioEventBus = undefined;
-//! stdio_bus.init();
+//! stdio_bus.init(io);
 //! o11y.StdLogAdapter.init(stdio_bus.eventBus());
 //!
 //! // Now std.log calls go through EventBus
@@ -49,7 +49,7 @@ pub const StdLogAdapter = struct {
     /// Log function compatible with std.Options.logFn
     pub fn logFn(
         comptime level: std.log.Level,
-        comptime scope: @Type(.enum_literal),
+        comptime scope: @EnumLiteral(),
         comptime format: []const u8,
         args: anytype,
     ) void {
@@ -70,10 +70,10 @@ pub const StdLogAdapter = struct {
         const writer = if (event_level == .err) bus.err_writer else bus.writer;
 
         // Timestamp (ISO 8601 with milliseconds)
-        const millis = std.time.milliTimestamp();
-        const secs: u64 = @intCast(@divFloor(millis, 1000));
-        const ms: u64 = @intCast(@mod(millis, 1000));
-        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+        const now_ts = std.Io.Timestamp.now(bus.io, .real);
+        const secs: u64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
+        const ms: u64 = @intCast(@divFloor(@mod(now_ts.nanoseconds, std.time.ns_per_s), std.time.ns_per_ms));
+        const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = secs };
         const epoch_day = epoch_seconds.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -129,6 +129,7 @@ const TestWriter = struct {
 
     fn deinit(self: *TestWriter) void {
         self.io_writer.deinit();
+        self.* = undefined;
     }
 
     fn writer(self: *TestWriter) *std.Io.Writer {
@@ -148,7 +149,7 @@ test "StdLogAdapter: formats log message correctly" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.debug);
 
     StdLogAdapter.init(&bus);
@@ -167,7 +168,7 @@ test "StdLogAdapter: respects level filtering" {
     var tw = TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var bus = EventBus.init(tw.writer());
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
     bus.setLevel(.warn); // Only warn and above
 
     StdLogAdapter.init(&bus);
@@ -199,7 +200,7 @@ test "StdLogAdapter: routes errors to err_writer" {
     var stderr_tw = TestWriter.init(testing.allocator);
     defer stderr_tw.deinit();
 
-    var bus = EventBus.initDual(stdout_tw.writer(), stderr_tw.writer());
+    var bus = EventBus.initDual(std.Options.debug_io, stdout_tw.writer(), stderr_tw.writer());
     bus.setLevel(.debug);
 
     StdLogAdapter.init(&bus);

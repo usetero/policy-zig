@@ -11,7 +11,7 @@
 //! defer loader.deinit();
 //!
 //! // Start loading providers asynchronously (non-blocking)
-//! try loader.startAsync();
+//! try loader.startAsync(io);
 //!
 //! // Server can now start handling requests...
 //!
@@ -68,6 +68,7 @@ const ProviderState = struct {
 
 pub const PolicyLoader = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     bus: *EventBus,
     registry: *Registry,
     service: ServiceMetadata,
@@ -88,6 +89,7 @@ pub const PolicyLoader = struct {
     /// Does not start loading - call `startAsync()` or `loadSync()` to begin.
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         bus: *EventBus,
         registry: *Registry,
         provider_configs: []const ProviderConfig,
@@ -106,6 +108,7 @@ pub const PolicyLoader = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .bus = bus,
             .registry = registry,
             .service = service,
@@ -117,23 +120,25 @@ pub const PolicyLoader = struct {
 
     /// Start loading providers asynchronously in a background thread.
     /// Returns immediately, allowing the server to start handling requests.
-    pub fn startAsync(self: *PolicyLoader) !void {
-        self.bus.info(PolicyLoaderStarting{ .provider_count = self.provider_states.len });
-        self.load_thread = try std.Thread.spawn(.{}, loadProvidersThread, .{self});
+    pub fn startAsync(self: *PolicyLoader, io: std.Io) !void {
+        const event: PolicyLoaderStarting = .{ .provider_count = self.provider_states.len };
+        self.bus.info(event);
+        self.load_thread = try std.Thread.spawn(.{}, loadProvidersThread, .{ self, io });
     }
 
     /// Load all providers synchronously (blocks until complete).
     /// Use this if you need policies loaded before accepting requests.
-    pub fn loadSync(self: *PolicyLoader) void {
-        self.bus.info(PolicyLoaderStarting{ .provider_count = self.provider_states.len });
-        self.loadAllProviders();
+    pub fn loadSync(self: *PolicyLoader, io: std.Io) void {
+        const event: PolicyLoaderStarting = .{ .provider_count = self.provider_states.len };
+        self.bus.info(event);
+        self.loadAllProviders(io);
     }
 
     /// Wait for the initial load to complete.
     /// Call this after `startAsync()` if you need to block until ready.
-    pub fn waitForInitialLoad(self: *PolicyLoader) void {
+    pub fn waitForInitialLoad(self: *PolicyLoader) !void {
         while (!self.initial_load_complete.load(.acquire)) {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            try self.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake);
         }
     }
 
@@ -166,6 +171,12 @@ pub const PolicyLoader = struct {
 
     /// Shutdown all providers and clean up resources.
     pub fn deinit(self: *PolicyLoader) void {
+        const allocator = self.allocator;
+        // LIFO defer order: self.* = undefined runs first (while memory is
+        // still valid), then destroy frees it.
+        defer allocator.destroy(self);
+        defer self.* = undefined;
+
         // Signal shutdown
         self.shutdown_flag.store(true, .release);
 
@@ -179,36 +190,36 @@ pub const PolicyLoader = struct {
         for (self.provider_states) |*state| {
             state.deinitProvider();
             if (state.load_error) |err| {
-                self.allocator.free(err);
+                allocator.free(err);
             }
         }
 
-        self.allocator.free(self.provider_states);
-        self.allocator.destroy(self);
+        allocator.free(self.provider_states);
     }
 
     // =========================================================================
     // Private Implementation
     // =========================================================================
 
-    fn loadProvidersThread(self: *PolicyLoader) void {
-        self.loadAllProviders();
+    fn loadProvidersThread(self: *PolicyLoader, io: std.Io) void {
+        self.loadAllProviders(io);
     }
 
-    fn loadAllProviders(self: *PolicyLoader) void {
+    fn loadAllProviders(self: *PolicyLoader, io: std.Io) void {
         var loaded_count: usize = 0;
         var failed_count: usize = 0;
 
         for (self.provider_states) |*state| {
             if (self.shutdown_flag.load(.acquire)) break;
 
-            self.loadProvider(state) catch |err| {
+            self.loadProvider(io, state) catch |err| {
                 const err_str = self.allocator.dupe(u8, @errorName(err)) catch "allocation_failed";
                 state.load_error = err_str;
-                self.bus.err(ProviderLoadFailed{
+                const event: ProviderLoadFailed = .{
                     .provider_id = state.config.id,
                     .err = err_str,
-                });
+                };
+                self.bus.err(event);
                 failed_count += 1;
                 continue;
             };
@@ -217,31 +228,35 @@ pub const PolicyLoader = struct {
         }
 
         self.initial_load_complete.store(true, .release);
-        self.bus.info(PolicyLoaderReady{
+        const event: PolicyLoaderReady = .{
             .loaded_count = loaded_count,
             .failed_count = failed_count,
-        });
+        };
+        self.bus.info(event);
     }
 
-    fn loadProvider(self: *PolicyLoader, state: *ProviderState) !void {
+    fn loadProvider(self: *PolicyLoader, io: std.Io, state: *ProviderState) !void {
         const config = state.config;
         const provider_type_str = switch (config.type) {
             .file => "file",
             .http => "http",
         };
 
-        self.bus.debug(ProviderLoadStarted{
+        const started_event: ProviderLoadStarted = .{
             .provider_id = config.id,
             .provider_type = provider_type_str,
-        });
+        };
+        self.bus.debug(started_event);
 
         switch (config.type) {
             .file => {
                 const path = config.path orelse return error.FileProviderRequiresPath;
-                self.bus.info(FileProviderConfigured{ .path = path });
+                const configured_event: FileProviderConfigured = .{ .path = path };
+                self.bus.info(configured_event);
 
                 const file_provider = try FileProvider.init(
                     self.allocator,
+                    io,
                     self.bus,
                     .{ .id = config.id, .path = path },
                 );
@@ -252,18 +267,24 @@ pub const PolicyLoader = struct {
                 state.provider = prov;
                 state.loaded.store(true, .release);
 
-                self.bus.debug(ProviderLoadCompleted{
+                const completed_event: ProviderLoadCompleted = .{
                     .provider_id = config.id,
                     .policy_count = self.registry.getPolicyCount(),
-                });
+                };
+                self.bus.debug(completed_event);
             },
             .http => {
                 const url = config.url orelse return error.HttpProviderRequiresUrl;
                 const poll_interval = config.poll_interval orelse 60;
-                self.bus.info(HttpProviderConfigured{ .url = url, .poll_interval = poll_interval });
+                const configured_event: HttpProviderConfigured = .{
+                    .url = url,
+                    .poll_interval = poll_interval,
+                };
+                self.bus.info(configured_event);
 
                 const http_provider = try HttpProvider.init(
                     self.allocator,
+                    io,
                     self.bus,
                     .{
                         .id = config.id,
@@ -280,10 +301,11 @@ pub const PolicyLoader = struct {
                 state.provider = prov;
                 state.loaded.store(true, .release);
 
-                self.bus.debug(ProviderLoadCompleted{
+                const completed_event: ProviderLoadCompleted = .{
                     .provider_id = config.id,
                     .policy_count = self.registry.getPolicyCount(),
-                });
+                };
+                self.bus.debug(completed_event);
             },
         }
     }
@@ -297,16 +319,17 @@ test "PolicyLoader: init and deinit" {
     const allocator = std.testing.allocator;
 
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(std.Options.debug_io);
     const bus = stdio_bus.eventBus();
 
     var registry = Registry.init(allocator, bus);
     defer registry.deinit();
 
-    const configs = [_]ProviderConfig{};
+    const configs: [0]ProviderConfig = .{};
 
     var loader = try PolicyLoader.init(
         allocator,
+        std.Options.debug_io,
         bus,
         &registry,
         &configs,

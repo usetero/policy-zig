@@ -2,7 +2,6 @@ const std = @import("std");
 const policy_provider = @import("./provider.zig");
 const types = @import("./types.zig");
 const proto = @import("proto");
-const protobuf = @import("protobuf");
 const o11y = @import("observability");
 
 const PolicyCallback = policy_provider.PolicyCallback;
@@ -36,18 +35,20 @@ const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
 const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
-const HTTPFetchStarted = struct {};
-const HTTPFetchCompleted = struct {};
+const HttpFetchStarted = struct {};
+const HttpFetchCompleted = struct {};
 
 /// Tracks status for a specific policy (hits, misses, errors, transform results)
 const PolicyStatusRecord = struct {
     hits: i64 = 0,
     misses: i64 = 0,
-    errors: std.ArrayListUnmanaged([]const u8) = .{},
+    errors: std.ArrayList([]const u8) = .empty,
     /// Accumulated transform results (attempted/applied counts)
     transform_result: TransformResult = .{},
 
     fn deinit(self: *PolicyStatusRecord, allocator: std.mem.Allocator) void {
+        defer self.* = undefined;
+
         for (self.errors.items) |msg| {
             allocator.free(msg);
         }
@@ -69,6 +70,7 @@ const PolicyStatusRecord = struct {
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     /// Unique identifier for this provider
     id: []const u8,
     http_client: std.http.Client,
@@ -91,7 +93,7 @@ pub const HttpProvider = struct {
     custom_headers: []Header,
 
     // Mutex for thread-safe access to synced state
-    sync_state_mutex: std.Thread.Mutex,
+    sync_state_mutex: std.Io.Mutex,
 
     // Event bus for observability
     bus: *EventBus,
@@ -106,6 +108,7 @@ pub const HttpProvider = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         bus: *EventBus,
         config: Config,
     ) !*HttpProvider {
@@ -140,8 +143,9 @@ pub const HttpProvider = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .id = id_copy,
-            .http_client = std.http.Client{ .allocator = allocator },
+            .http_client = std.http.Client{ .allocator = allocator, .io = io },
             .config_url = url_copy,
             .poll_interval_ns = config.poll_interval_seconds * std.time.ns_per_s,
             .callback = null,
@@ -150,9 +154,9 @@ pub const HttpProvider = struct {
             .service = config.service,
             .last_sync_timestamp = 0,
             .last_successful_hash = null,
-            .policy_statuses = .{},
+            .policy_statuses = .empty,
             .custom_headers = headers_copy,
-            .sync_state_mutex = .{},
+            .sync_state_mutex = .init,
             .bus = bus,
         };
 
@@ -167,8 +171,8 @@ pub const HttpProvider = struct {
     /// Record the hash from a successful sync.
     /// This hash will be sent in subsequent sync requests.
     pub fn recordSyncedHash(self: *HttpProvider, hash: []const u8) !void {
-        self.sync_state_mutex.lock();
-        defer self.sync_state_mutex.unlock();
+        self.sync_state_mutex.lockUncancelable(self.bus.io);
+        defer self.sync_state_mutex.unlock(self.bus.io);
 
         // Free old hash if exists
         if (self.last_successful_hash) |old_hash| {
@@ -182,11 +186,11 @@ pub const HttpProvider = struct {
     /// These errors will be sent in subsequent sync requests.
     /// Conforms to PolicyProvider interface (void return, logs errors internally).
     pub fn recordPolicyError(self: *HttpProvider, policy_id: []const u8, error_message: []const u8) void {
-        self.sync_state_mutex.lock();
-        defer self.sync_state_mutex.unlock();
+        self.sync_state_mutex.lockUncancelable(self.bus.io);
+        defer self.sync_state_mutex.unlock(self.bus.io);
 
         const msg_copy = self.allocator.dupe(u8, error_message) catch {
-            self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+            self.emitPolicyErrorRecordFailed(policy_id);
             return;
         };
 
@@ -194,30 +198,29 @@ pub const HttpProvider = struct {
             // Append to existing error list
             record.errors.append(self.allocator, msg_copy) catch {
                 self.allocator.free(msg_copy);
-                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.emitPolicyErrorRecordFailed(policy_id);
                 return;
             };
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
                 self.allocator.free(msg_copy);
-                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.emitPolicyErrorRecordFailed(policy_id);
                 return;
             };
 
-            var record = PolicyStatusRecord{};
+            var record: PolicyStatusRecord = .{};
             record.errors.append(self.allocator, msg_copy) catch {
                 self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
-                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.emitPolicyErrorRecordFailed(policy_id);
                 return;
             };
 
             self.policy_statuses.put(self.allocator, id_copy, record) catch {
-                self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
                 record.deinit(self.allocator);
-                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.emitPolicyErrorRecordFailed(policy_id);
                 return;
             };
         }
@@ -226,9 +229,15 @@ pub const HttpProvider = struct {
     /// Record statistics about policy hits, misses, and transform stats.
     /// These stats will be sent in subsequent sync requests.
     /// Conforms to PolicyProvider interface (void return, logs errors internally).
-    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
-        self.sync_state_mutex.lock();
-        defer self.sync_state_mutex.unlock();
+    pub fn recordPolicyStats(
+        self: *HttpProvider,
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+        transform_result: TransformResult,
+    ) void {
+        self.sync_state_mutex.lockUncancelable(self.bus.io);
+        defer self.sync_state_mutex.unlock(self.bus.io);
 
         if (self.policy_statuses.getPtr(policy_id)) |record| {
             // Update existing record
@@ -238,7 +247,7 @@ pub const HttpProvider = struct {
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
-                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.emitPolicyErrorRecordFailed(policy_id);
                 return;
             };
 
@@ -248,17 +257,22 @@ pub const HttpProvider = struct {
                 .transform_result = transform_result,
             }) catch {
                 self.allocator.free(id_copy);
-                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.emitPolicyErrorRecordFailed(policy_id);
                 return;
             };
         }
     }
 
+    fn emitPolicyErrorRecordFailed(self: *HttpProvider, policy_id: []const u8) void {
+        const event: PolicyErrorRecordFailed = .{ .policy_id = policy_id };
+        self.bus.err(event);
+    }
+
     /// Clear all recorded policy statuses.
     /// Call this after statuses have been successfully reported to the server.
     pub fn clearPolicyStatuses(self: *HttpProvider) void {
-        self.sync_state_mutex.lock();
-        defer self.sync_state_mutex.unlock();
+        self.sync_state_mutex.lockUncancelable(self.bus.io);
+        defer self.sync_state_mutex.unlock(self.bus.io);
 
         var it = self.policy_statuses.iterator();
         while (it.next()) |entry| {
@@ -273,7 +287,8 @@ pub const HttpProvider = struct {
 
         // Initial fetch and notify (non-fatal if it fails)
         self.fetchAndNotify() catch |err| {
-            self.bus.warn(HttpInitialFetchFailed{ .err = @errorName(err) });
+            const event: HttpInitialFetchFailed = .{ .err = @errorName(err) };
+            self.bus.warn(event);
         };
 
         // Start polling
@@ -290,50 +305,58 @@ pub const HttpProvider = struct {
     }
 
     pub fn deinit(self: *HttpProvider) void {
+        const allocator = self.allocator;
+        // LIFO defer order: self.* = undefined runs first (while memory is
+        // still valid), then destroy frees it.
+        defer allocator.destroy(self);
+        defer self.* = undefined;
+
         // Ensure shutdown is called first
         self.shutdown();
 
         if (self.last_successful_hash) |hash| {
-            self.allocator.free(hash);
+            allocator.free(hash);
         }
 
         // Free policy statuses
         var ps_it = self.policy_statuses.iterator();
         while (ps_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
         }
-        self.policy_statuses.deinit(self.allocator);
+        self.policy_statuses.deinit(allocator);
 
         // Free custom headers
         for (self.custom_headers) |h| {
-            self.allocator.free(h.name);
-            self.allocator.free(h.value);
+            allocator.free(h.name);
+            allocator.free(h.value);
         }
-        self.allocator.free(self.custom_headers);
+        allocator.free(self.custom_headers);
 
         self.http_client.deinit();
-        self.allocator.free(self.id);
-        self.allocator.free(self.config_url);
-
-        self.allocator.destroy(self);
+        allocator.free(self.id);
+        allocator.free(self.config_url);
     }
 
-    fn pollLoop(self: *HttpProvider) void {
+    fn pollLoop(self: *HttpProvider) !void {
         while (!self.shutdown_flag.load(.acquire)) {
             // Sleep in small increments so we can respond quickly to shutdown
             const sleep_increment_ns = 100 * std.time.ns_per_ms; // 100ms
             var slept_ns: u64 = 0;
 
             while (slept_ns < self.poll_interval_ns and !self.shutdown_flag.load(.acquire)) {
-                std.Thread.sleep(sleep_increment_ns);
+                try self.io.sleep(.fromNanoseconds(sleep_increment_ns), .awake);
                 slept_ns += sleep_increment_ns;
             }
 
             if (self.shutdown_flag.load(.acquire)) break;
 
             self.fetchAndNotify() catch |err| {
-                self.bus.err(HttpFetchFailed{ .url = self.config_url, .err = @errorName(err) });
+                const event: HttpFetchFailed = .{
+                    .url = self.config_url,
+                    .err = @errorName(err),
+                };
+                self.bus.err(event);
             };
         }
     }
@@ -344,8 +367,10 @@ pub const HttpProvider = struct {
     };
 
     pub fn fetchAndNotify(self: *HttpProvider) !void {
-        var span = self.bus.started(.debug, HTTPFetchStarted{});
-        defer span.completed(HTTPFetchCompleted{});
+        const fetch_started: HttpFetchStarted = .{};
+        const fetch_completed: HttpFetchCompleted = .{};
+        var span = self.bus.started(.debug, fetch_started);
+        defer span.completed(fetch_completed);
         var result = try self.fetchPolicies();
         defer result.parsed.deinit();
         defer self.allocator.free(result.response_body);
@@ -365,14 +390,16 @@ pub const HttpProvider = struct {
         };
 
         if (hash_unchanged) {
-            self.bus.debug(HttpPoliciesUnchanged{ .reason = "hash" });
+            const event: HttpPoliciesUnchanged = .{ .reason = "hash" };
+            self.bus.debug(event);
             return;
         }
 
         // Record the hash for future sync requests
         if (response.hash.len > 0) {
             try self.recordSyncedHash(response.hash);
-            self.bus.info(HttpPolicyHashUpdated{ .hash = response.hash });
+            const event: HttpPolicyHashUpdated = .{ .hash = response.hash };
+            self.bus.info(event);
         }
 
         // Notify callback with policies from response
@@ -383,11 +410,12 @@ pub const HttpProvider = struct {
             });
         }
 
-        self.bus.info(HttpPoliciesLoaded{
+        const loaded_event: HttpPoliciesLoaded = .{
             .count = response.policies.items.len,
             .url = self.config_url,
             .sync_timestamp = response.sync_timestamp_unix_nano,
-        });
+        };
+        self.bus.info(loaded_event);
 
         // Clear policy statuses after successful sync
         self.clearPolicyStatuses();
@@ -413,21 +441,21 @@ pub const HttpProvider = struct {
         };
 
         // Labels (empty - workspace.id is no longer required)
-        const labels = [_]KeyValue{};
+        const labels: [0]KeyValue = .{};
 
         // Build supported_policy_stages from service metadata
         // Different binaries support different stages (e.g., OTLP supports traces, Datadog does not)
         const supported_policy_stages = self.service.supported_stages;
 
         // Build policy_statuses from our tracked state
-        var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
+        var policy_statuses_list: std.ArrayList(PolicySyncStatus) = .empty;
         // No defer needed - arena handles cleanup
 
         // Get last successful hash (if any) - read under lock
         var last_hash: []const u8 = &.{};
         {
-            self.sync_state_mutex.lock();
-            defer self.sync_state_mutex.unlock();
+            self.sync_state_mutex.lockUncancelable(self.bus.io);
+            defer self.sync_state_mutex.unlock(self.bus.io);
 
             // Build PolicySyncStatus entries from tracked policy statuses
             var ps_it = self.policy_statuses.iterator();
@@ -440,28 +468,28 @@ pub const HttpProvider = struct {
                     .match_misses = entry.value_ptr.misses,
                     .errors = entry.value_ptr.errors,
                     .remove = if (tr.removes_attempted > 0)
-                        TransformStageStatus{
+                        .{
                             .hits = @intCast(tr.removes_applied),
                             .misses = @intCast(tr.removes_attempted - tr.removes_applied),
                         }
                     else
                         null,
                     .redact = if (tr.redacts_attempted > 0)
-                        TransformStageStatus{
+                        .{
                             .hits = @intCast(tr.redacts_applied),
                             .misses = @intCast(tr.redacts_attempted - tr.redacts_applied),
                         }
                     else
                         null,
                     .rename = if (tr.renames_attempted > 0)
-                        TransformStageStatus{
+                        .{
                             .hits = @intCast(tr.renames_applied),
                             .misses = @intCast(tr.renames_attempted - tr.renames_applied),
                         }
                     else
                         null,
                     .add = if (tr.adds_attempted > 0)
-                        TransformStageStatus{
+                        .{
                             .hits = @intCast(tr.adds_applied),
                             .misses = @intCast(tr.adds_attempted - tr.adds_applied),
                         }
@@ -474,10 +502,16 @@ pub const HttpProvider = struct {
         }
 
         // Create SyncRequest with the new structure
-        const sync_request = SyncRequest{
-            .client_metadata = ClientMetadata{
-                .supported_policy_stages = .{ .items = @constCast(supported_policy_stages), .capacity = supported_policy_stages.len },
-                .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
+        const sync_request: SyncRequest = .{
+            .client_metadata = .{
+                .supported_policy_stages = .{
+                    .items = @constCast(supported_policy_stages),
+                    .capacity = supported_policy_stages.len,
+                },
+                .resource_attributes = .{
+                    .items = @constCast(&resource_attributes),
+                    .capacity = resource_attributes.len,
+                },
                 .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },
             .full_sync = self.last_sync_timestamp == 0,
@@ -487,8 +521,7 @@ pub const HttpProvider = struct {
         };
 
         // Encode SyncRequest to JSON
-        protobuf.json.pb_options.emit_oneof_field_name = false;
-        const request_body = try sync_request.jsonEncode(.{}, temp_allocator);
+        const request_body = try sync_request.jsonEncode(.{}, .{ .emit_oneof_field_name = false }, temp_allocator);
         // No defer needed - arena handles cleanup
 
         // Prepare headers: content-type + custom headers
@@ -530,10 +563,11 @@ pub const HttpProvider = struct {
 
         // Check status code
         if (result.status != .ok) {
-            self.bus.err(HttpSyncRequestFailed{
+            const event: HttpSyncRequestFailed = .{
                 .url = self.config_url,
                 .status = @intFromEnum(result.status),
-            });
+            };
+            self.bus.err(event);
             return error.HttpRequestFailed;
         }
 
@@ -545,10 +579,11 @@ pub const HttpProvider = struct {
         const parsed = SyncResponse.jsonDecode(response_body, .{}, self.allocator) catch |err| {
             // Log the error with a preview of the response body for debugging
             const preview_len = @min(response_body.len, 200);
-            self.bus.err(HttpJsonDecodeFailed{
+            const event: HttpJsonDecodeFailed = .{
                 .err = @errorName(err),
                 .body_preview = response_body[0..preview_len],
-            });
+            };
+            self.bus.err(event);
             return err;
         };
 
@@ -569,10 +604,11 @@ test "HttpProvider: recordPolicyStats accumulates hits and misses" {
     const allocator = testing.allocator;
 
     var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var provider = try HttpProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
     );
@@ -583,8 +619,8 @@ test "HttpProvider: recordPolicyStats accumulates hits and misses" {
 
     // Verify stats were recorded
     {
-        provider.sync_state_mutex.lock();
-        defer provider.sync_state_mutex.unlock();
+        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
+        defer provider.sync_state_mutex.unlock(provider.bus.io);
 
         const record = provider.policy_statuses.get("policy-1");
         try testing.expect(record != null);
@@ -597,8 +633,8 @@ test "HttpProvider: recordPolicyStats accumulates hits and misses" {
 
     // Verify stats were accumulated
     {
-        provider.sync_state_mutex.lock();
-        defer provider.sync_state_mutex.unlock();
+        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
+        defer provider.sync_state_mutex.unlock(provider.bus.io);
 
         const record = provider.policy_statuses.get("policy-1");
         try testing.expect(record != null);
@@ -611,10 +647,11 @@ test "HttpProvider: clearPolicyStatuses resets all counters" {
     const allocator = testing.allocator;
 
     var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var provider = try HttpProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
     );
@@ -627,8 +664,8 @@ test "HttpProvider: clearPolicyStatuses resets all counters" {
 
     // Verify all policies have stats
     {
-        provider.sync_state_mutex.lock();
-        defer provider.sync_state_mutex.unlock();
+        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
+        defer provider.sync_state_mutex.unlock(provider.bus.io);
         try testing.expectEqual(@as(usize, 3), provider.policy_statuses.count());
     }
 
@@ -637,8 +674,8 @@ test "HttpProvider: clearPolicyStatuses resets all counters" {
 
     // Verify all stats are cleared
     {
-        provider.sync_state_mutex.lock();
-        defer provider.sync_state_mutex.unlock();
+        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
+        defer provider.sync_state_mutex.unlock(provider.bus.io);
         try testing.expectEqual(@as(usize, 0), provider.policy_statuses.count());
     }
 }
@@ -680,7 +717,6 @@ test "SyncResponse JSON: metrics_aggregation_temporality" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -700,7 +736,10 @@ test "SyncResponse JSON: metrics_aggregation_temporality" {
     // Verify matcher: field = aggregation_temporality(DELTA), match = exists(true)
     const matcher = metric.match.items[0];
     try testing.expect(matcher.field != null);
-    try testing.expectEqual(proto.policy.AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, matcher.field.?.aggregation_temporality);
+    try testing.expectEqual(
+        proto.policy.AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA,
+        matcher.field.?.aggregation_temporality,
+    );
     try testing.expect(matcher.match != null);
     try testing.expect(matcher.match.?.exists);
 }
@@ -732,7 +771,6 @@ test "SyncResponse JSON: metrics_type_filter" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -782,7 +820,6 @@ test "SyncResponse JSON: traces_span_kind" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -833,7 +870,6 @@ test "SyncResponse JSON: traces_keep_100pct" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -898,7 +934,6 @@ test "SyncResponse JSON: traces_error_vs_health" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -965,7 +1000,6 @@ test "SyncResponse JSON: traces_multiple_matchers" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -1039,7 +1073,6 @@ test "SyncResponse JSON: traces_overlapping" {
         \\}
     ;
 
-    protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try SyncResponse.jsonDecode(json_input, .{}, allocator);
     defer parsed.deinit();
 
@@ -1077,10 +1110,11 @@ test "HttpProvider: recordPolicyStats after clear starts fresh" {
     const allocator = testing.allocator;
 
     var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
 
     var provider = try HttpProvider.init(
         allocator,
+        std.Options.debug_io,
         noop_bus.eventBus(),
         .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
     );
@@ -1097,8 +1131,8 @@ test "HttpProvider: recordPolicyStats after clear starts fresh" {
 
     // Verify stats start fresh (not accumulated with previous values)
     {
-        provider.sync_state_mutex.lock();
-        defer provider.sync_state_mutex.unlock();
+        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
+        defer provider.sync_state_mutex.unlock(provider.bus.io);
 
         const record = provider.policy_statuses.get("policy-1");
         try testing.expect(record != null);

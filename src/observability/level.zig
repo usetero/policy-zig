@@ -37,10 +37,10 @@ pub const Level = enum {
         return null;
     }
 
-    /// Parse log level from an environment variable.
+    /// Parse log level from an environment map.
     /// Returns the default level if the env var is not set or invalid.
-    pub fn parseFromEnv(env_var: []const u8, default: Level) Level {
-        const env_value = std.posix.getenv(env_var) orelse return default;
+    pub fn parseFromEnv(env_map: *const std.process.Environ.Map, env_var: []const u8, default: Level) Level {
+        const env_value = env_map.get(env_var) orelse return default;
         return parse(env_value) orelse default;
     }
 
@@ -90,4 +90,22 @@ test "Level.parse" {
     try testing.expect(Level.parse("invalid") == null);
     try testing.expect(Level.parse("") == null);
     try testing.expect(Level.parse("trace") == null);
+}
+
+test "Level.parseFromEnv" {
+    const testing = std.testing;
+
+    var env_map = std.process.Environ.Map.init(testing.allocator);
+    defer env_map.deinit();
+
+    try testing.expectEqual(Level.info, Level.parseFromEnv(&env_map, "TERO_LOG_LEVEL", .info));
+
+    try env_map.put("TERO_LOG_LEVEL", "DEBUG");
+    try testing.expectEqual(Level.debug, Level.parseFromEnv(&env_map, "TERO_LOG_LEVEL", .info));
+
+    try env_map.put("TERO_LOG_LEVEL", "invalid");
+    try testing.expectEqual(Level.warn, Level.parseFromEnv(&env_map, "TERO_LOG_LEVEL", .warn));
+
+    try env_map.put("TERO_LOG_LEVEL", "");
+    try testing.expectEqual(Level.err, Level.parseFromEnv(&env_map, "TERO_LOG_LEVEL", .err));
 }
