@@ -11,6 +11,10 @@ const EventBus = o11y.EventBus;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+/// Default interval between file-change polls. Also bounds change-detection
+/// latency: a modification is noticed within at most this long.
+const default_poll_interval_ns: i96 = 1 * std.time.ns_per_s;
+
 // =============================================================================
 // Observability Events
 // =============================================================================
@@ -44,10 +48,14 @@ pub const FileProvider = struct {
     content_hash: ?[Sha256.digest_length]u8,
     /// Event bus for observability
     bus: *EventBus,
+    /// Interval between file-change polls, in nanoseconds.
+    poll_interval_ns: i96,
 
     pub const Config = struct {
         id: []const u8,
         path: []const u8,
+        /// Interval between file-change polls. Bounds change-detection latency.
+        poll_interval_ns: i96 = default_poll_interval_ns,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, bus: *EventBus, config: Config) !*FileProvider {
@@ -70,6 +78,7 @@ pub const FileProvider = struct {
             .shutdown_event = .unset,
             .content_hash = null,
             .bus = bus,
+            .poll_interval_ns = config.poll_interval_ns,
         };
 
         return self;
@@ -207,11 +216,22 @@ pub const FileProvider = struct {
     fn watchLoopPoll(self: *FileProvider) !void {
         var last_mtime: i96 = 0;
 
-        while (!self.shutdown_event.isSet()) {
-            std.Io.sleep(self.io, .{ .nanoseconds = 1 * std.time.ns_per_s }, .awake) catch |err| {
-                const event: FileWatcherError = .{ .err = @errorName(err) };
-                self.bus.warn(event);
-                continue;
+        while (true) {
+            // Park up to the poll interval, but wake instantly when shutdown()
+            // sets the event. waitTimeout returns error.Timeout on interval
+            // expiry (the normal poll case) or a spurious wakeup, and returns
+            // void once the event is set; either way we recheck isSet() below.
+            self.shutdown_event.waitTimeout(self.io, .{ .duration = .{
+                .raw = .{ .nanoseconds = self.poll_interval_ns },
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                // Expected: the interval elapsed (normal poll) or a spurious
+                // wakeup occurred. Fall through to the isSet()/stat below.
+                error.Timeout => {},
+                else => {
+                    const event: FileWatcherError = .{ .err = @errorName(err) };
+                    self.bus.warn(event);
+                },
             };
             if (self.shutdown_event.isSet()) break;
 
@@ -453,6 +473,58 @@ test "FileProvider: registry remains usable after provider fails to load" {
     try testing.expect(snapshot != null);
     try testing.expectEqual(@as(usize, 1), snapshot.?.policies.len);
     try testing.expectEqualStrings("test-policy", snapshot.?.policies[0].name);
+}
+
+test "FileProvider: shutdown returns promptly while watch thread is mid-interval" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try writeTmpFile(allocator, &tmp_dir, "policies.json",
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "test-policy",
+        \\      "name": "test-policy",
+        \\      "log": {
+        \\        "match": [{ "log_field": "body", "regex": "test" }],
+        \\        "keep": "all"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    );
+    defer allocator.free(tmp_path);
+
+    // A deliberately long poll interval: the watch thread parks for ~60s on
+    // its first wait. With a non-interruptible sleep, shutdown() would have to
+    // wait out that whole interval before the thread could observe the event.
+    const provider = try FileProvider.init(
+        allocator,
+        std.Options.debug_io,
+        noop_bus.eventBus(),
+        .{ .id = "test-provider", .path = tmp_path, .poll_interval_ns = 60 * std.time.ns_per_s },
+    );
+    defer provider.deinit();
+
+    try provider.subscribe(.{
+        .context = undefined,
+        .onUpdate = struct {
+            fn cb(_: *anyopaque, _: policy_provider.PolicyUpdate) !void {}
+        }.cb,
+    });
+
+    const io = std.Options.debug_io;
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    provider.shutdown();
+    const elapsed_ns = start.untilNow(io).raw.nanoseconds;
+
+    // Must wake well within the 60s interval. Generous bound to avoid flaking
+    // on loaded CI while still catching a regression to full-interval blocking.
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 
 test "FileProvider: registry retains policies after reload with invalid JSON" {
