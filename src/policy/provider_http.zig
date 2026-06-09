@@ -377,6 +377,15 @@ pub const HttpProvider = struct {
 
         const response = result.parsed.value;
 
+        // Clear the policy statuses we just delivered. fetchPolicies serialized
+        // the current statuses into the sync request and the POST succeeded, so
+        // they are now reported. Clearing here (rather than at the end of this
+        // function) is essential: cb.call below compiles the freshly fetched
+        // policies and records any compilation errors back into policy_statuses.
+        // Those errors must survive to the NEXT sync — clearing after cb.call
+        // would discard them before they are ever sent.
+        self.clearPolicyStatuses();
+
         // Update last sync timestamp
         self.last_sync_timestamp = response.sync_timestamp_unix_nano;
 
@@ -416,9 +425,6 @@ pub const HttpProvider = struct {
             .sync_timestamp = response.sync_timestamp_unix_nano,
         };
         self.bus.info(loaded_event);
-
-        // Clear policy statuses after successful sync
-        self.clearPolicyStatuses();
     }
 
     fn fetchPolicies(self: *HttpProvider) !FetchResult {

@@ -162,6 +162,16 @@ pub const FieldRef = union(enum) {
         };
     }
 
+    /// True if this is an attribute selector (AttributePath-backed) with an
+    /// empty path. Such a selector is unsatisfiable and must be rejected at
+    /// compile time. Non-attribute fields are never flagged.
+    pub fn hasEmptyAttributePath(self: FieldRef) bool {
+        return switch (self) {
+            .log_attribute, .resource_attribute, .scope_attribute => |attr| attr.path.items.len == 0,
+            .log_field => false,
+        };
+    }
+
     /// Get the path for attribute-based fields, empty slice for log_field.
     /// For backward compatibility, use getKey() which returns first segment as string.
     pub fn getPath(self: FieldRef) []const []const u8 {
@@ -230,6 +240,15 @@ pub const MetricFieldRef = union(enum) {
     pub fn isKeyed(self: MetricFieldRef) bool {
         return switch (self) {
             .datapoint_attribute, .resource_attribute, .scope_attribute => true,
+            .metric_field, .metric_type, .aggregation_temporality => false,
+        };
+    }
+
+    /// True if this is an attribute selector with an empty path (see
+    /// `FieldRef.hasEmptyAttributePath`).
+    pub fn hasEmptyAttributePath(self: MetricFieldRef) bool {
+        return switch (self) {
+            .datapoint_attribute, .resource_attribute, .scope_attribute => |attr| attr.path.items.len == 0,
             .metric_field, .metric_type, .aggregation_temporality => false,
         };
     }
@@ -453,6 +472,16 @@ pub const TraceFieldRef = union(enum) {
             .span_attribute, .resource_attribute, .scope_attribute, .event_attribute => true,
             .event_name, .link_trace_id => true,
             .trace_field, .span_kind, .span_status => false,
+        };
+    }
+
+    /// True if this is an attribute selector with an empty path (see
+    /// `FieldRef.hasEmptyAttributePath`). `event_name`/`link_trace_id` are
+    /// scalar string fields, not attribute paths, so they are never flagged.
+    pub fn hasEmptyAttributePath(self: TraceFieldRef) bool {
+        return switch (self) {
+            .span_attribute, .resource_attribute, .scope_attribute, .event_attribute => |attr| attr.path.items.len == 0,
+            .event_name, .link_trace_id, .trace_field, .span_kind, .span_status => false,
         };
     }
 

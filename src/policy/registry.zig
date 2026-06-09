@@ -4,6 +4,7 @@ const policy_source = @import("./source.zig");
 const policy_provider = @import("./provider.zig");
 const policy_types = @import("./types.zig");
 const matcher_index = @import("./matcher_index.zig");
+const parser = @import("./parser.zig");
 const o11y = @import("observability");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -343,7 +344,13 @@ pub const PolicyRegistry = struct {
     pub fn recordPolicyError(self: *PolicyRegistry, policy_id: []const u8, error_message: []const u8) void {
         self.mutex.lockUncancelable(self.bus.io);
         defer self.mutex.unlock(self.bus.io);
+        self.recordPolicyErrorLocked(policy_id, error_message);
+    }
 
+    /// Route a policy error to its provider. Assumes the registry mutex is
+    /// already held by the caller (used from `createSnapshot`, which runs under
+    /// the lock — `recordPolicyError` would otherwise deadlock re-locking it).
+    fn recordPolicyErrorLocked(self: *PolicyRegistry, policy_id: []const u8, error_message: []const u8) void {
         if (self.policy_sources.get(policy_id)) |metadata| {
             if (self.providers.get(metadata.provider_id)) |provider| {
                 provider.recordPolicyError(policy_id, error_message);
@@ -637,15 +644,43 @@ pub const PolicyRegistry = struct {
             }
         }
 
-        // Build matcher indices for Hyperscan-based matching
-        var log_idx = try LogMatcherIndex.build(self.allocator, self.bus, policies_slice);
+        // Build matcher indices for Hyperscan-based matching. Validation is
+        // part of compilation: each builder validates the policies it owns,
+        // skips any that fail (keeping them inert — never matching, dropping,
+        // sampling, or transforming) while still compiling the rest of the
+        // batch, and records the failures in `comp_errors`. See
+        // IndexBuilder.validatePolicy and the spec's Error Handling section.
+        var comp_errors = matcher_index.CompilationErrors.init(self.allocator);
+        defer comp_errors.deinit();
+
+        var log_idx = try LogMatcherIndex.build(
+            self.allocator,
+            self.bus,
+            policies_slice,
+            &comp_errors,
+        );
         errdefer log_idx.deinit();
 
-        var metric_idx = try MetricMatcherIndex.build(self.allocator, self.bus, policies_slice);
+        var metric_idx = try MetricMatcherIndex.build(
+            self.allocator,
+            self.bus,
+            policies_slice,
+            &comp_errors,
+        );
         errdefer metric_idx.deinit();
 
-        var trace_idx = try TraceMatcherIndex.build(self.allocator, self.bus, policies_slice);
+        var trace_idx = try TraceMatcherIndex.build(
+            self.allocator,
+            self.bus,
+            policies_slice,
+            &comp_errors,
+        );
         errdefer trace_idx.deinit();
+
+        // Surface compilation errors via the provider's PolicySyncStatus.errors.
+        for (comp_errors.items.items) |entry| {
+            self.recordPolicyErrorLocked(entry.policy_id, entry.message);
+        }
 
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
@@ -1638,6 +1673,56 @@ test "PolicyRegistry: registerProvider and recordPolicyError routes to correct p
     // Verify no cross-contamination
     try testing.expect(!file_mock.hasError("http-policy-1", "Invalid regex in http policy"));
     try testing.expect(!http_mock.hasError("file-policy-1", "Invalid regex in file policy"));
+}
+
+test "PolicyRegistry: invalid policy is inert and reported, valid policy in same batch still compiles" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var mock = TestProvider.init(allocator, "file-provider", .file);
+    defer mock.deinit();
+    try registry.registerProvider(mock.provider());
+
+    // One valid policy and one with an uncompilable regex, in the same batch.
+    const policies = try parser.parsePoliciesBytes(allocator,
+        \\{"policies":[
+        \\  {"id":"aaa-valid","name":"valid","log":{
+        \\    "match":[{"log_field":"body","regex":"error"}],"keep":"none"}},
+        \\  {"id":"zzz-broken","name":"broken","log":{
+        \\    "match":[{"log_field":"body","regex":"([a-z"}],"keep":"all"}}
+        \\]}
+    );
+    defer {
+        for (policies) |*p| @constCast(p).deinit(allocator);
+        allocator.free(policies);
+    }
+
+    // The broken regex must NOT abort the batch: updatePolicies succeeds even
+    // though one policy fails to compile.
+    try registry.updatePolicies(policies, "file-provider", .file);
+
+    const snapshot = registry.getSnapshot() orelse return error.NoSnapshot;
+
+    // Both policies are retained by the registry...
+    try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
+
+    // ...but only the valid one is compiled into the matcher index; the broken
+    // one is inert (absent from the index, so it can never match).
+    try testing.expect(snapshot.log_index.getPolicy("aaa-valid") != null);
+    try testing.expect(snapshot.log_index.getPolicy("zzz-broken") == null);
+
+    // The broken policy's compilation error is reported to its provider, and
+    // the valid policy produces no error.
+    try testing.expect(mock.getErrorCount() >= 1);
+    var found_broken = false;
+    for (mock.recorded_errors.items) |entry| {
+        if (std.mem.eql(u8, entry.policy_id, "zzz-broken")) found_broken = true;
+        try testing.expect(!std.mem.eql(u8, entry.policy_id, "aaa-valid"));
+    }
+    try testing.expect(found_broken);
 }
 
 test "PolicyRegistry: recordPolicyError for unknown policy does not route to provider" {
