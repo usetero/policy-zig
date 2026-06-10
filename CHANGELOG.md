@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/usetero/policy-zig/compare/v0.3.1...v0.4.0) (2026-06-10)
+
+
+### Features
+
+* add new protos and stubs for methods ([#59](https://github.com/usetero/policy-zig/issues/59)) ([79f441d](https://github.com/usetero/policy-zig/commit/79f441d3f0a8df7a39469eb953826d61779effcd))
+* add typed value implementations, use them for sampling ([#61](https://github.com/usetero/policy-zig/issues/61)) ([02cc21e](https://github.com/usetero/policy-zig/commit/02cc21ebd009817f094a81f34da9dd049953b83b))
+* error on compile ([#64](https://github.com/usetero/policy-zig/issues/64)) ([494bcb2](https://github.com/usetero/policy-zig/commit/494bcb27d92cec73622a82ed8fb02eb1bb848b10))
+
+
+### Bug Fixes
+
+* **ci:** add ziglint to ci setup ([#65](https://github.com/usetero/policy-zig/issues/65)) ([b4d8d23](https://github.com/usetero/policy-zig/commit/b4d8d23418caf94894e8fce89b689bdd4d65d4ae))
+
 ## [0.3.1](https://github.com/usetero/policy-zig/compare/v0.3.0...v0.3.1) (2026-05-15)
 
 
