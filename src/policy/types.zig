@@ -26,6 +26,12 @@ pub const TelemetryType = enum {
 // Service and Provider Configuration
 // =============================================================================
 
+/// A key/value string pair used for resource attributes and labels.
+pub const StringPair = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 /// Service metadata for identifying this edge instance
 pub const ServiceMetadata = struct {
     /// Service name (e.g., "tero-edge")
@@ -40,6 +46,10 @@ pub const ServiceMetadata = struct {
     /// Supported policy stages for this service.
     /// Different binaries support different stages (e.g., OTLP supports traces, Datadog does not).
     supported_stages: []const PolicyStage = &.{},
+    /// Extra OTel resource attributes to include in policy sync requests.
+    resource_attributes: []const StringPair = &.{},
+    /// Free-form labels to include in policy sync requests.
+    labels: []const StringPair = &.{},
 };
 
 /// Provider type enumeration
