@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/usetero/policy-zig/compare/v0.4.0...v0.4.1) (2026-06-18)
+
+
+### Bug Fixes
+
+* allow setting resource attrs ([#66](https://github.com/usetero/policy-zig/issues/66)) ([f3c53e7](https://github.com/usetero/policy-zig/commit/f3c53e76bbe02f91e93244e414499a255575edb4))
+
 ## [0.4.0](https://github.com/usetero/policy-zig/compare/v0.3.1...v0.4.0) (2026-06-10)
 
 
