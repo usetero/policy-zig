@@ -40,6 +40,10 @@
             .url = "git+https://github.com/quangd42/regex.zig.git#01a591df26b9d21e842d85ecbb4e16ee5a40eb93",
             .hash = "regex-0.0.0-V8KKSZgdAwByxie7A2ODgrnew7XqS2VJIu2SJh8Jl7LV",
         },
+        .zbench = .{
+            .url = "https://github.com/hendriknielaender/zBench/archive/refs/heads/master.tar.gz",
+            .hash = "zbench-0.13.0-YTdc71ZAAQCUJ0w9jM6ZyLOBxDlGv2j3CqCEj49l-KcP",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

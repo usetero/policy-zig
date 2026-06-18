@@ -42,6 +42,11 @@ tasks:
     cmds:
       - zig build -Doptimize=ReleaseSmall
 
+  bench:
+    desc: "Run benchmarks (log/metric/trace × policy counts)"
+    cmds:
+      - zig build bench
+
   test:
     desc: "Run all tests"
     aliases: [t]
