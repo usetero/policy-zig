@@ -444,13 +444,15 @@ pub const HttpProvider = struct {
             .{ .key = "service.namespace", .value = .{ .value = .{ .string_value = self.service.namespace } } },
         });
         for (self.service.resource_attributes) |pair| {
-            try resource_attributes.append(temp_allocator, .{ .key = pair.key, .value = .{ .value = .{ .string_value = pair.value } } });
+            const v: KeyValue = .{ .key = pair.key, .value = .{ .value = .{ .string_value = pair.value } } };
+            try resource_attributes.append(temp_allocator, v);
         }
 
         var labels: std.ArrayList(KeyValue) = .empty;
         try labels.ensureTotalCapacity(temp_allocator, self.service.labels.len);
         for (self.service.labels) |pair| {
-            try labels.append(temp_allocator, .{ .key = pair.key, .value = .{ .value = .{ .string_value = pair.value } } });
+            const v: KeyValue = .{ .key = pair.key, .value = .{ .value = .{ .string_value = pair.value } } };
+            try labels.append(temp_allocator, v);
         }
 
         // Build supported_policy_stages from service metadata
