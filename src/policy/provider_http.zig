@@ -434,20 +434,26 @@ pub const HttpProvider = struct {
         defer arena.deinit();
         const temp_allocator = arena.allocator();
 
-        // Build resource_attributes with required fields:
-        // - service.name
-        // - service.instance.id
-        // - service.version
-        // - service.namespace
-        const resource_attributes = [_]KeyValue{
+        // Build resource_attributes: fixed service fields + caller-supplied extras.
+        var resource_attributes: std.ArrayList(KeyValue) = .empty;
+        try resource_attributes.ensureTotalCapacity(temp_allocator, 4 + self.service.resource_attributes.len);
+        try resource_attributes.appendSlice(temp_allocator, &.{
             .{ .key = "service.name", .value = .{ .value = .{ .string_value = self.service.name } } },
             .{ .key = "service.instance.id", .value = .{ .value = .{ .string_value = self.service.instance_id } } },
             .{ .key = "service.version", .value = .{ .value = .{ .string_value = self.service.version } } },
             .{ .key = "service.namespace", .value = .{ .value = .{ .string_value = self.service.namespace } } },
-        };
+        });
+        for (self.service.resource_attributes) |pair| {
+            const v: KeyValue = .{ .key = pair.key, .value = .{ .value = .{ .string_value = pair.value } } };
+            try resource_attributes.append(temp_allocator, v);
+        }
 
-        // Labels (empty - workspace.id is no longer required)
-        const labels: [0]KeyValue = .{};
+        var labels: std.ArrayList(KeyValue) = .empty;
+        try labels.ensureTotalCapacity(temp_allocator, self.service.labels.len);
+        for (self.service.labels) |pair| {
+            const v: KeyValue = .{ .key = pair.key, .value = .{ .value = .{ .string_value = pair.value } } };
+            try labels.append(temp_allocator, v);
+        }
 
         // Build supported_policy_stages from service metadata
         // Different binaries support different stages (e.g., OTLP supports traces, Datadog does not)
@@ -515,10 +521,13 @@ pub const HttpProvider = struct {
                     .capacity = supported_policy_stages.len,
                 },
                 .resource_attributes = .{
-                    .items = @constCast(&resource_attributes),
-                    .capacity = resource_attributes.len,
+                    .items = resource_attributes.items,
+                    .capacity = resource_attributes.capacity,
                 },
-                .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
+                .labels = .{
+                    .items = labels.items,
+                    .capacity = labels.capacity,
+                },
             },
             .full_sync = self.last_sync_timestamp == 0,
             .last_sync_timestamp_unix_nano = self.last_sync_timestamp,
