@@ -63,6 +63,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_o11y_tests.step);
 
+    // Benchmarks
+    const zbench_dep = b.dependency("zbench", .{ .target = target, .optimize = .ReleaseFast });
+    const zbench_mod = zbench_dep.module("zbench");
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "policy_zig", .module = mod },
+                .{ .name = "observability", .module = o11y_mod },
+                .{ .name = "zbench", .module = zbench_mod },
+            },
+        }),
+    });
+    bench_exe.root_module.link_libc = true;
+    bench_exe.root_module.linkSystemLibrary("hs", .{});
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&run_bench.step);
+
     // Proto generation step (optional, requires protoc)
     const gen_proto_opt = b.option(bool, "gen-proto", "Generate protobuf files") orelse false;
     if (gen_proto_opt) {
