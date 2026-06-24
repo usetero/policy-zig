@@ -19,14 +19,6 @@ const default_poll_interval_ns: i96 = 1 * std.time.ns_per_s;
 // Observability Events
 // =============================================================================
 
-const PolicyError = struct { policy_id: []const u8, message: []const u8 };
-const TransformResult = policy_provider.TransformResult;
-const PolicyStats = struct {
-    policy_id: []const u8,
-    hits: i64,
-    misses: i64,
-    transform_result: TransformResult,
-};
 const PoliciesLoading = struct { path: []const u8 };
 const PoliciesLoaded = struct { count: usize, path: []const u8 };
 const PoliciesUnchanged = struct { hash: []const u8 };
@@ -120,34 +112,6 @@ pub const FileProvider = struct {
 
         allocator.free(self.id);
         allocator.free(self.config_path);
-    }
-
-    /// Report an error encountered when applying a policy.
-    /// For file provider, this logs to stderr since there's no remote server to report to.
-    pub fn recordPolicyError(self: *FileProvider, policy_id: []const u8, error_message: []const u8) void {
-        const event: PolicyError = .{
-            .policy_id = policy_id,
-            .message = error_message,
-        };
-        self.bus.err(event);
-    }
-
-    /// Report statistics about policy hits, misses, and transform results.
-    /// For file provider, this logs to stdout since there's no remote server to report to.
-    pub fn recordPolicyStats(
-        self: *FileProvider,
-        policy_id: []const u8,
-        hits: i64,
-        misses: i64,
-        transform_result: TransformResult,
-    ) void {
-        const event: PolicyStats = .{
-            .policy_id = policy_id,
-            .hits = hits,
-            .misses = misses,
-            .transform_result = transform_result,
-        };
-        self.bus.debug(event);
     }
 
     fn loadAndNotify(self: *FileProvider) !void {

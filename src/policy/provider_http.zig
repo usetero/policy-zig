@@ -5,7 +5,8 @@ const proto = @import("proto");
 const o11y = @import("observability");
 
 const PolicyCallback = policy_provider.PolicyCallback;
-const TransformResult = policy_provider.TransformResult;
+const StatsCollector = policy_provider.StatsCollector;
+const PolicyStatsSnapshot = policy_provider.PolicyStatsSnapshot;
 const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
@@ -27,7 +28,6 @@ pub const Header = struct {
 // Observability Events
 // =============================================================================
 
-const PolicyErrorRecordFailed = struct { policy_id: []const u8 };
 const HttpInitialFetchFailed = struct { err: []const u8 };
 const HttpFetchFailed = struct { url: []const u8, err: []const u8 };
 const HttpJsonDecodeFailed = struct { err: []const u8, body_preview: []const u8 };
@@ -35,37 +35,12 @@ const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
 const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
+const HttpSyncRequestSucceeded = struct { url: []const u8, policy_statuses_sent: usize };
+// Emitted once per policy status about to be sent, so we can confirm at runtime
+// exactly which policies (and counts) are reported each sync.
+const HttpSyncStatusReported = struct { id: []const u8, match_hits: i64, match_misses: i64, errors: usize };
 const HttpFetchStarted = struct {};
 const HttpFetchCompleted = struct {};
-
-/// Tracks status for a specific policy (hits, misses, errors, transform results)
-const PolicyStatusRecord = struct {
-    hits: i64 = 0,
-    misses: i64 = 0,
-    errors: std.ArrayList([]const u8) = .empty,
-    /// Accumulated transform results (attempted/applied counts)
-    transform_result: TransformResult = .{},
-
-    fn deinit(self: *PolicyStatusRecord, allocator: std.mem.Allocator) void {
-        defer self.* = undefined;
-
-        for (self.errors.items) |msg| {
-            allocator.free(msg);
-        }
-        self.errors.deinit(allocator);
-    }
-
-    fn addTransformResult(self: *PolicyStatusRecord, result: TransformResult) void {
-        self.transform_result.removes_attempted += result.removes_attempted;
-        self.transform_result.removes_applied += result.removes_applied;
-        self.transform_result.redacts_attempted += result.redacts_attempted;
-        self.transform_result.redacts_applied += result.redacts_applied;
-        self.transform_result.renames_attempted += result.renames_attempted;
-        self.transform_result.renames_applied += result.renames_applied;
-        self.transform_result.adds_attempted += result.adds_attempted;
-        self.transform_result.adds_applied += result.adds_applied;
-    }
-};
 
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
@@ -85,10 +60,6 @@ pub const HttpProvider = struct {
     last_sync_timestamp: u64,
     last_successful_hash: ?[]u8,
 
-    // Policy status tracking: maps policy_id -> PolicyStatusRecord
-    // Used to report hits/misses/errors encountered when applying policies
-    policy_statuses: std.StringHashMapUnmanaged(PolicyStatusRecord),
-
     // Custom headers to send with HTTP requests (owned, copied from config)
     custom_headers: []Header,
 
@@ -97,6 +68,10 @@ pub const HttpProvider = struct {
 
     // Event bus for observability
     bus: *EventBus,
+
+    // Pull-based stats source, set by PolicyRegistry.subscribe. Called before
+    // each sync to obtain the per-policy hit/miss/error rows to report.
+    stats_collector: ?StatsCollector,
 
     pub const Config = struct {
         id: []const u8,
@@ -154,10 +129,10 @@ pub const HttpProvider = struct {
             .service = config.service,
             .last_sync_timestamp = 0,
             .last_successful_hash = null,
-            .policy_statuses = .empty,
             .custom_headers = headers_copy,
             .sync_state_mutex = .init,
             .bus = bus,
+            .stats_collector = null,
         };
 
         return self;
@@ -182,104 +157,10 @@ pub const HttpProvider = struct {
         self.last_successful_hash = try self.allocator.dupe(u8, hash);
     }
 
-    /// Record an error for a specific policy.
-    /// These errors will be sent in subsequent sync requests.
-    /// Conforms to PolicyProvider interface (void return, logs errors internally).
-    pub fn recordPolicyError(self: *HttpProvider, policy_id: []const u8, error_message: []const u8) void {
-        self.sync_state_mutex.lockUncancelable(self.bus.io);
-        defer self.sync_state_mutex.unlock(self.bus.io);
-
-        const msg_copy = self.allocator.dupe(u8, error_message) catch {
-            self.emitPolicyErrorRecordFailed(policy_id);
-            return;
-        };
-
-        if (self.policy_statuses.getPtr(policy_id)) |record| {
-            // Append to existing error list
-            record.errors.append(self.allocator, msg_copy) catch {
-                self.allocator.free(msg_copy);
-                self.emitPolicyErrorRecordFailed(policy_id);
-                return;
-            };
-        } else {
-            // Create new entry
-            const id_copy = self.allocator.dupe(u8, policy_id) catch {
-                self.allocator.free(msg_copy);
-                self.emitPolicyErrorRecordFailed(policy_id);
-                return;
-            };
-
-            var record: PolicyStatusRecord = .{};
-            record.errors.append(self.allocator, msg_copy) catch {
-                self.allocator.free(msg_copy);
-                self.allocator.free(id_copy);
-                self.emitPolicyErrorRecordFailed(policy_id);
-                return;
-            };
-
-            self.policy_statuses.put(self.allocator, id_copy, record) catch {
-                self.allocator.free(id_copy);
-                record.deinit(self.allocator);
-                self.emitPolicyErrorRecordFailed(policy_id);
-                return;
-            };
-        }
-    }
-
-    /// Record statistics about policy hits, misses, and transform stats.
-    /// These stats will be sent in subsequent sync requests.
-    /// Conforms to PolicyProvider interface (void return, logs errors internally).
-    pub fn recordPolicyStats(
-        self: *HttpProvider,
-        policy_id: []const u8,
-        hits: i64,
-        misses: i64,
-        transform_result: TransformResult,
-    ) void {
-        self.sync_state_mutex.lockUncancelable(self.bus.io);
-        defer self.sync_state_mutex.unlock(self.bus.io);
-
-        if (self.policy_statuses.getPtr(policy_id)) |record| {
-            // Update existing record
-            record.hits += hits;
-            record.misses += misses;
-            record.addTransformResult(transform_result);
-        } else {
-            // Create new entry
-            const id_copy = self.allocator.dupe(u8, policy_id) catch {
-                self.emitPolicyErrorRecordFailed(policy_id);
-                return;
-            };
-
-            self.policy_statuses.put(self.allocator, id_copy, .{
-                .hits = hits,
-                .misses = misses,
-                .transform_result = transform_result,
-            }) catch {
-                self.allocator.free(id_copy);
-                self.emitPolicyErrorRecordFailed(policy_id);
-                return;
-            };
-        }
-    }
-
-    fn emitPolicyErrorRecordFailed(self: *HttpProvider, policy_id: []const u8) void {
-        const event: PolicyErrorRecordFailed = .{ .policy_id = policy_id };
-        self.bus.err(event);
-    }
-
-    /// Clear all recorded policy statuses.
-    /// Call this after statuses have been successfully reported to the server.
-    pub fn clearPolicyStatuses(self: *HttpProvider) void {
-        self.sync_state_mutex.lockUncancelable(self.bus.io);
-        defer self.sync_state_mutex.unlock(self.bus.io);
-
-        var it = self.policy_statuses.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.policy_statuses.clearRetainingCapacity();
+    /// Register the stats collector to pull per-policy stats from before each
+    /// sync. Set by PolicyRegistry.subscribe.
+    pub fn setStatsCollector(self: *HttpProvider, collector: StatsCollector) void {
+        self.stats_collector = collector;
     }
 
     pub fn subscribe(self: *HttpProvider, callback: PolicyCallback) !void {
@@ -317,14 +198,6 @@ pub const HttpProvider = struct {
         if (self.last_successful_hash) |hash| {
             allocator.free(hash);
         }
-
-        // Free policy statuses
-        var ps_it = self.policy_statuses.iterator();
-        while (ps_it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(allocator);
-        }
-        self.policy_statuses.deinit(allocator);
 
         // Free custom headers
         for (self.custom_headers) |h| {
@@ -376,15 +249,6 @@ pub const HttpProvider = struct {
         defer self.allocator.free(result.response_body);
 
         const response = result.parsed.value;
-
-        // Clear the policy statuses we just delivered. fetchPolicies serialized
-        // the current statuses into the sync request and the POST succeeded, so
-        // they are now reported. Clearing here (rather than at the end of this
-        // function) is essential: cb.call below compiles the freshly fetched
-        // policies and records any compilation errors back into policy_statuses.
-        // Those errors must survive to the NEXT sync — clearing after cb.call
-        // would discard them before they are ever sent.
-        self.clearPolicyStatuses();
 
         // Update last sync timestamp
         self.last_sync_timestamp = response.sync_timestamp_unix_nano;
@@ -459,57 +323,34 @@ pub const HttpProvider = struct {
         // Different binaries support different stages (e.g., OTLP supports traces, Datadog does not)
         const supported_policy_stages = self.service.supported_stages;
 
-        // Build policy_statuses from our tracked state
-        var policy_statuses_list: std.ArrayList(PolicySyncStatus) = .empty;
-        // No defer needed - arena handles cleanup
+        // Pull per-policy stats (hits/misses/errors) from the registry. The
+        // collector returns one row per policy — including zero-hit ones — with
+        // counters reset, all allocated in this arena. Everything is reported so
+        // the control plane knows each policy is live and being evaluated.
+        const stats: []const PolicyStatsSnapshot = if (self.stats_collector) |c|
+            try c.call(temp_allocator)
+        else
+            &.{};
+
+        const policy_statuses_list = try statsToSyncStatuses(temp_allocator, stats);
+
+        // Log exactly what we're about to report, so runtime expectations can be
+        // verified against the live snapshot.
+        for (policy_statuses_list.items) |status| {
+            const reported: HttpSyncStatusReported = .{
+                .id = status.id,
+                .match_hits = status.match_hits,
+                .match_misses = status.match_misses,
+                .errors = status.errors.items.len,
+            };
+            self.bus.debug(reported);
+        }
 
         // Get last successful hash (if any) - read under lock
         var last_hash: []const u8 = &.{};
         {
             self.sync_state_mutex.lockUncancelable(self.bus.io);
             defer self.sync_state_mutex.unlock(self.bus.io);
-
-            // Build PolicySyncStatus entries from tracked policy statuses
-            var ps_it = self.policy_statuses.iterator();
-            while (ps_it.next()) |entry| {
-                const tr = entry.value_ptr.transform_result;
-                // Convert TransformResult to TransformStageStatus: hits = applied, misses = attempted - applied
-                try policy_statuses_list.append(temp_allocator, .{
-                    .id = entry.key_ptr.*,
-                    .match_hits = entry.value_ptr.hits,
-                    .match_misses = entry.value_ptr.misses,
-                    .errors = entry.value_ptr.errors,
-                    .remove = if (tr.removes_attempted > 0)
-                        .{
-                            .hits = @intCast(tr.removes_applied),
-                            .misses = @intCast(tr.removes_attempted - tr.removes_applied),
-                        }
-                    else
-                        null,
-                    .redact = if (tr.redacts_attempted > 0)
-                        .{
-                            .hits = @intCast(tr.redacts_applied),
-                            .misses = @intCast(tr.redacts_attempted - tr.redacts_applied),
-                        }
-                    else
-                        null,
-                    .rename = if (tr.renames_attempted > 0)
-                        .{
-                            .hits = @intCast(tr.renames_applied),
-                            .misses = @intCast(tr.renames_attempted - tr.renames_applied),
-                        }
-                    else
-                        null,
-                    .add = if (tr.adds_attempted > 0)
-                        .{
-                            .hits = @intCast(tr.adds_applied),
-                            .misses = @intCast(tr.adds_attempted - tr.adds_applied),
-                        }
-                    else
-                        null,
-                });
-            }
-
             last_hash = self.last_successful_hash orelse &.{};
         }
 
@@ -586,6 +427,12 @@ pub const HttpProvider = struct {
             return error.HttpRequestFailed;
         }
 
+        const sent_event: HttpSyncRequestSucceeded = .{
+            .url = self.config_url,
+            .policy_statuses_sent = policy_statuses_list.items.len,
+        };
+        self.bus.debug(sent_event);
+
         // Read response body - take ownership to keep memory alive for parsed result
         const response_body = try body.toOwnedSlice();
         errdefer self.allocator.free(response_body);
@@ -609,13 +456,65 @@ pub const HttpProvider = struct {
     }
 };
 
+/// Convert collected per-policy stats into the wire `PolicySyncStatus` list for
+/// a sync request. One status per stats row, preserving order, so every policy
+/// the collector reported (including zero-hit ones) is sent. Transform counters
+/// map to TransformStageStatus as hits = applied, misses = attempted - applied;
+/// a stage with nothing attempted is omitted (null). All output is allocated in
+/// `arena`, which must outlive the encode that follows.
+fn statsToSyncStatuses(
+    arena: std.mem.Allocator,
+    stats: []const PolicyStatsSnapshot,
+) !std.ArrayList(PolicySyncStatus) {
+    var list: std.ArrayList(PolicySyncStatus) = .empty;
+    try list.ensureTotalCapacity(arena, stats.len);
+    for (stats) |snap| {
+        const tr = snap.transform_result;
+        list.appendAssumeCapacity(.{
+            .id = snap.id,
+            .match_hits = snap.hits,
+            .match_misses = snap.misses,
+            .errors = .{ .items = @constCast(snap.errors), .capacity = snap.errors.len },
+            .remove = if (tr.removes_attempted > 0)
+                .{
+                    .hits = @intCast(tr.removes_applied),
+                    .misses = @intCast(tr.removes_attempted - tr.removes_applied),
+                }
+            else
+                null,
+            .redact = if (tr.redacts_attempted > 0)
+                .{
+                    .hits = @intCast(tr.redacts_applied),
+                    .misses = @intCast(tr.redacts_attempted - tr.redacts_applied),
+                }
+            else
+                null,
+            .rename = if (tr.renames_attempted > 0)
+                .{
+                    .hits = @intCast(tr.renames_applied),
+                    .misses = @intCast(tr.renames_attempted - tr.renames_applied),
+                }
+            else
+                null,
+            .add = if (tr.adds_attempted > 0)
+                .{
+                    .hits = @intCast(tr.adds_applied),
+                    .misses = @intCast(tr.adds_attempted - tr.adds_applied),
+                }
+            else
+                null,
+        });
+    }
+    return list;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
 
 const testing = std.testing;
 
-test "HttpProvider: recordPolicyStats accumulates hits and misses" {
+test "HttpProvider: setStatsCollector stores the collector" {
     const allocator = testing.allocator;
 
     var noop_bus: o11y.NoopEventBus = undefined;
@@ -629,70 +528,75 @@ test "HttpProvider: recordPolicyStats accumulates hits and misses" {
     );
     defer provider.deinit();
 
-    // Record initial stats
-    provider.recordPolicyStats("policy-1", 10, 5, .{});
+    try testing.expect(provider.stats_collector == null);
 
-    // Verify stats were recorded
-    {
-        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
-        defer provider.sync_state_mutex.unlock(provider.bus.io);
-
-        const record = provider.policy_statuses.get("policy-1");
-        try testing.expect(record != null);
-        try testing.expectEqual(@as(i64, 10), record.?.hits);
-        try testing.expectEqual(@as(i64, 5), record.?.misses);
-    }
-
-    // Accumulate more stats for the same policy
-    provider.recordPolicyStats("policy-1", 20, 10, .{});
-
-    // Verify stats were accumulated
-    {
-        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
-        defer provider.sync_state_mutex.unlock(provider.bus.io);
-
-        const record = provider.policy_statuses.get("policy-1");
-        try testing.expect(record != null);
-        try testing.expectEqual(@as(i64, 30), record.?.hits);
-        try testing.expectEqual(@as(i64, 15), record.?.misses);
-    }
+    const Stub = struct {
+        fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+            return &.{};
+        }
+    };
+    var ctx: u8 = 0;
+    provider.setStatsCollector(.{ .context = &ctx, .collect = Stub.collect });
+    try testing.expect(provider.stats_collector != null);
 }
 
-test "HttpProvider: clearPolicyStatuses resets all counters" {
-    const allocator = testing.allocator;
+test "statsToSyncStatuses: maps hits/misses/errors and reports every policy" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-    var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
+    const errs = [_][]const u8{ "boom", "bad regex" };
+    const stats = [_]PolicyStatsSnapshot{
+        .{ .id = "hot", .hits = 7, .misses = 2, .errors = &errs },
+        .{ .id = "cold", .hits = 0, .misses = 0 }, // zero-hit policy still reported
+    };
 
-    var provider = try HttpProvider.init(
-        allocator,
-        std.Options.debug_io,
-        noop_bus.eventBus(),
-        .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
-    );
-    defer provider.deinit();
+    const list = try statsToSyncStatuses(a, &stats);
 
-    // Record stats for multiple policies
-    provider.recordPolicyStats("policy-1", 10, 5, .{});
-    provider.recordPolicyStats("policy-2", 20, 10, .{});
-    provider.recordPolicyStats("policy-3", 30, 15, .{});
+    // Every policy is present, in order.
+    try testing.expectEqual(@as(usize, 2), list.items.len);
 
-    // Verify all policies have stats
-    {
-        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
-        defer provider.sync_state_mutex.unlock(provider.bus.io);
-        try testing.expectEqual(@as(usize, 3), provider.policy_statuses.count());
-    }
+    const hot = list.items[0];
+    try testing.expectEqualStrings("hot", hot.id);
+    try testing.expectEqual(@as(i64, 7), hot.match_hits);
+    try testing.expectEqual(@as(i64, 2), hot.match_misses);
+    try testing.expectEqual(@as(usize, 2), hot.errors.items.len);
+    try testing.expectEqualStrings("boom", hot.errors.items[0]);
+    // No transforms attempted -> all stage statuses omitted.
+    try testing.expect(hot.remove == null);
+    try testing.expect(hot.redact == null);
 
-    // Clear all statuses
-    provider.clearPolicyStatuses();
+    const cold = list.items[1];
+    try testing.expectEqualStrings("cold", cold.id);
+    try testing.expectEqual(@as(i64, 0), cold.match_hits);
+    try testing.expectEqual(@as(usize, 0), cold.errors.items.len);
+}
 
-    // Verify all stats are cleared
-    {
-        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
-        defer provider.sync_state_mutex.unlock(provider.bus.io);
-        try testing.expectEqual(@as(usize, 0), provider.policy_statuses.count());
-    }
+test "statsToSyncStatuses: transform counters map to stage hits/misses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const stats = [_]PolicyStatsSnapshot{
+        .{
+            .id = "p",
+            .transform_result = .{
+                .redacts_attempted = 5,
+                .redacts_applied = 3,
+            },
+        },
+    };
+
+    const list = try statsToSyncStatuses(arena.allocator(), &stats);
+    const status = list.items[0];
+
+    // redact stage: hits = applied (3), misses = attempted - applied (2).
+    try testing.expect(status.redact != null);
+    try testing.expectEqual(@as(i64, 3), status.redact.?.hits);
+    try testing.expectEqual(@as(i64, 2), status.redact.?.misses);
+    // Stages with nothing attempted stay omitted.
+    try testing.expect(status.remove == null);
+    try testing.expect(status.rename == null);
+    try testing.expect(status.add == null);
 }
 
 // =============================================================================
@@ -1118,40 +1022,5 @@ test "SyncResponse JSON: traces_overlapping" {
         const matcher = trace.match.items[0];
         try testing.expectEqual(proto.policy.TraceField.TRACE_FIELD_NAME, matcher.field.?.trace_field);
         try testing.expectEqualStrings("health", matcher.match.?.contains);
-    }
-}
-
-test "HttpProvider: recordPolicyStats after clear starts fresh" {
-    const allocator = testing.allocator;
-
-    var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-
-    var provider = try HttpProvider.init(
-        allocator,
-        std.Options.debug_io,
-        noop_bus.eventBus(),
-        .{ .id = "test-provider", .url = "http://test.local/policies", .poll_interval_seconds = 60 },
-    );
-    defer provider.deinit();
-
-    // Record initial stats
-    provider.recordPolicyStats("policy-1", 100, 50, .{});
-
-    // Clear
-    provider.clearPolicyStatuses();
-
-    // Record new stats for the same policy
-    provider.recordPolicyStats("policy-1", 5, 2, .{});
-
-    // Verify stats start fresh (not accumulated with previous values)
-    {
-        provider.sync_state_mutex.lockUncancelable(provider.bus.io);
-        defer provider.sync_state_mutex.unlock(provider.bus.io);
-
-        const record = provider.policy_statuses.get("policy-1");
-        try testing.expect(record != null);
-        try testing.expectEqual(@as(i64, 5), record.?.hits);
-        try testing.expectEqual(@as(i64, 2), record.?.misses);
     }
 }

@@ -25,7 +25,7 @@
 //! const file_provider = try policy.FileProvider.init(allocator, bus, .{ .id = "local", .path = "policies.json" });
 //! defer file_provider.deinit();
 //!
-//! try registry.registerProvider(.{ .file = file_provider });
+//! try registry.subscribe(.{ .file = file_provider });
 //! ```
 
 const std = @import("std");

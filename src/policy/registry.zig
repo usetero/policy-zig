@@ -57,16 +57,6 @@ pub const PolicyAtomicStats = struct {
 // Observability Events
 // =============================================================================
 
-const PolicyErrorNoProvider = struct {
-    policy_id: []const u8,
-    message: []const u8,
-};
-
-const PolicyErrorNotFound = struct {
-    policy_id: []const u8,
-    message: []const u8,
-};
-
 const PolicyRegistryUnchanged = struct {};
 
 /// Policy config types - derived from the Policy.target field
@@ -249,9 +239,10 @@ pub const PolicyRegistry = struct {
     // Snapshots pending cleanup after grace period
     pending_snapshots: std.ArrayList(PendingSnapshot),
 
-    // Provider references for error/stats routing, keyed by provider ID
-    // These are not owned by the registry - caller must ensure they outlive the registry
-    providers: std.StringHashMapUnmanaged(Provider),
+    // Compile errors per policy id, replaced wholesale on each recompile.
+    // The registry owns these (both keys and message strings) and surfaces them
+    // to providers through the stats collector so they reach the control plane.
+    policy_errors: std.StringHashMapUnmanaged(std.ArrayList([]const u8)),
 
     // Subscription contexts (stable pointers for callbacks)
     subscriptions: std.ArrayList(*Subscription),
@@ -290,28 +281,17 @@ pub const PolicyRegistry = struct {
             .version = std.atomic.Value(u64).init(0),
             .current_snapshot = std.atomic.Value(?*const PolicySnapshot).init(null),
             .pending_snapshots = .empty,
-            .providers = .empty,
+            .policy_errors = .empty,
             .subscriptions = .empty,
             .bus = bus,
         };
     }
 
-    /// Register a provider for error routing.
-    /// The provider must outlive the registry.
-    pub fn registerProvider(self: *PolicyRegistry, prov: Provider) !void {
-        const id = prov.getId();
-        const id_copy = try self.allocator.dupe(u8, id);
-        errdefer self.allocator.free(id_copy);
-        try self.providers.put(self.allocator, id_copy, prov);
-    }
-
-    /// Subscribe a provider to the registry in one step.
-    /// Registers the provider for error/stats routing and subscribes
-    /// to its policy updates with an internal callback that feeds
-    /// updates into the registry.
+    /// Subscribe a provider to the registry in one step: hand it our stats
+    /// collector (so it can pull per-policy hit/miss/error rows before each sync)
+    /// and subscribe to its policy updates with an internal callback that feeds
+    /// updates back into the registry.
     pub fn subscribe(self: *PolicyRegistry, prov: Provider) !void {
-        try self.registerProvider(prov);
-
         const sub = try self.allocator.create(Subscription);
         errdefer self.allocator.destroy(sub);
         sub.* = Subscription.init(self, prov.sourceType());
@@ -319,76 +299,104 @@ pub const PolicyRegistry = struct {
         try self.subscriptions.append(self.allocator, sub);
         errdefer _ = self.subscriptions.pop();
 
+        prov.setStatsCollector(.{
+            .context = self,
+            .collect = collectStatsThunk,
+        });
+
         try prov.subscribe(.{
             .context = @ptrCast(sub),
             .onUpdate = Subscription.handleUpdate,
         });
     }
 
-    /// Flush lock-free per-policy stats from the current snapshot to providers.
-    /// Reads and resets atomic counters, then routes stats to the appropriate
-    /// provider via recordPolicyStats.
-    pub fn flushStats(self: *PolicyRegistry) void {
-        const snapshot = self.getSnapshot() orelse return;
-        for (snapshot.policies, 0..) |*p, i| {
-            const stats = snapshot.getStats(@intCast(i)) orelse continue;
-            const counters = stats.readAndReset();
-            if (counters.hits > 0 or counters.misses > 0 or counters.transforms > 0) {
-                self.recordPolicyStats(p.id, counters.hits, counters.misses, .{});
-            }
-        }
+    fn collectStatsThunk(arena: std.mem.Allocator, context: *anyopaque) anyerror![]policy_provider.PolicyStatsSnapshot {
+        const self: *PolicyRegistry = @ptrCast(@alignCast(context));
+        return self.collectStats(arena);
     }
 
-    /// Report an error encountered when applying a policy.
-    /// Routes the error to the appropriate provider based on the policy's source.
+    /// Collect a stats row for every policy in the current snapshot, resetting
+    /// the underlying atomic counters, and attach any compile errors recorded
+    /// since the last recompile. Every policy is reported, including zero-hit
+    /// ones, so the control plane knows the policy is live and being evaluated.
+    ///
+    /// Results (ids and error strings) are allocated in `arena` so they survive
+    /// a concurrent recompile on another provider's thread; the registry retains
+    /// no ownership of the returned slice.
+    pub fn collectStats(self: *PolicyRegistry, arena: std.mem.Allocator) ![]policy_provider.PolicyStatsSnapshot {
+        const snapshot = self.getSnapshot() orelse return &.{};
+
+        self.mutex.lockUncancelable(self.bus.io);
+        defer self.mutex.unlock(self.bus.io);
+
+        const out = try arena.alloc(policy_provider.PolicyStatsSnapshot, snapshot.policies.len);
+        for (snapshot.policies, 0..) |*p, i| {
+            var hits: i64 = 0;
+            var misses: i64 = 0;
+            if (snapshot.getStats(@intCast(i))) |s| {
+                const counters = s.readAndReset();
+                hits = counters.hits;
+                misses = counters.misses;
+            }
+
+            var errors: []const []const u8 = &.{};
+            if (self.policy_errors.get(p.id)) |list| {
+                const copy = try arena.alloc([]const u8, list.items.len);
+                for (list.items, 0..) |msg, j| copy[j] = try arena.dupe(u8, msg);
+                errors = copy;
+            }
+
+            out[i] = .{
+                .id = try arena.dupe(u8, p.id),
+                .hits = hits,
+                .misses = misses,
+                .transform_result = .{},
+                .errors = errors,
+            };
+        }
+        return out;
+    }
+
+    /// Record a compile error for a policy. Errors persist until the next
+    /// recompile (which clears them via `clearPolicyErrorsLocked`) and are sent
+    /// on every sync in between via `collectStats`.
     pub fn recordPolicyError(self: *PolicyRegistry, policy_id: []const u8, error_message: []const u8) void {
         self.mutex.lockUncancelable(self.bus.io);
         defer self.mutex.unlock(self.bus.io);
         self.recordPolicyErrorLocked(policy_id, error_message);
     }
 
-    /// Route a policy error to its provider. Assumes the registry mutex is
-    /// already held by the caller (used from `createSnapshot`, which runs under
+    /// Store a policy error in the registry-owned map. Assumes the registry mutex
+    /// is already held by the caller (used from `createSnapshot`, which runs under
     /// the lock — `recordPolicyError` would otherwise deadlock re-locking it).
     fn recordPolicyErrorLocked(self: *PolicyRegistry, policy_id: []const u8, error_message: []const u8) void {
-        if (self.policy_sources.get(policy_id)) |metadata| {
-            if (self.providers.get(metadata.provider_id)) |provider| {
-                provider.recordPolicyError(policy_id, error_message);
-            } else {
-                const event: PolicyErrorNoProvider = .{
-                    .policy_id = policy_id,
-                    .message = error_message,
-                };
-                self.bus.err(event);
-            }
-        } else {
-            const event: PolicyErrorNotFound = .{
-                .policy_id = policy_id,
-                .message = error_message,
+        const msg_copy = self.allocator.dupe(u8, error_message) catch return;
+
+        const gop = self.policy_errors.getOrPut(self.allocator, policy_id) catch {
+            self.allocator.free(msg_copy);
+            return;
+        };
+        if (!gop.found_existing) {
+            const id_copy = self.allocator.dupe(u8, policy_id) catch {
+                self.allocator.free(msg_copy);
+                _ = self.policy_errors.remove(policy_id);
+                return;
             };
-            self.bus.err(event);
+            gop.key_ptr.* = id_copy;
+            gop.value_ptr.* = .empty;
         }
+        gop.value_ptr.append(self.allocator, msg_copy) catch self.allocator.free(msg_copy);
     }
 
-    /// Report statistics about policy hits, misses, and transform results.
-    /// Routes the stats to the appropriate provider based on the policy's source.
-    pub fn recordPolicyStats(
-        self: *PolicyRegistry,
-        policy_id: []const u8,
-        hits: i64,
-        misses: i64,
-        transform_result: policy_provider.TransformResult,
-    ) void {
-        self.mutex.lockUncancelable(self.bus.io);
-        defer self.mutex.unlock(self.bus.io);
-
-        if (self.policy_sources.get(policy_id)) |metadata| {
-            if (self.providers.get(metadata.provider_id)) |provider| {
-                provider.recordPolicyStats(policy_id, hits, misses, transform_result);
-            }
-            // No fallback logging for stats - silent drop if no provider
+    /// Free all stored policy errors. Assumes the registry mutex is held.
+    fn clearPolicyErrorsLocked(self: *PolicyRegistry) void {
+        var it = self.policy_errors.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |msg| self.allocator.free(msg);
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
         }
-        // Silent drop if policy not found - stats are best-effort
+        self.policy_errors.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *PolicyRegistry) void {
@@ -407,12 +415,9 @@ pub const PolicyRegistry = struct {
         }
         self.policy_sources.deinit();
 
-        // Free provider keys
-        var prov_it = self.providers.keyIterator();
-        while (prov_it.next()) |key| {
-            self.allocator.free(key.*);
-        }
-        self.providers.deinit(self.allocator);
+        // Free stored policy errors (keys + message strings + lists)
+        self.clearPolicyErrorsLocked();
+        self.policy_errors.deinit(self.allocator);
 
         // Free subscription contexts
         for (self.subscriptions.items) |sub| {
@@ -677,7 +682,12 @@ pub const PolicyRegistry = struct {
         );
         errdefer trace_idx.deinit();
 
-        // Surface compilation errors via the provider's PolicySyncStatus.errors.
+        // Surface compilation errors via collectStats -> PolicySyncStatus.errors.
+        // Replace the prior recompile's errors wholesale: this recompile is the
+        // authoritative set, so stale errors for now-fixed policies must not
+        // linger. createSnapshot runs under the registry mutex, so the locked
+        // helpers are safe to call here.
+        self.clearPolicyErrorsLocked();
         for (comp_errors.items.items) |entry| {
             self.recordPolicyErrorLocked(entry.policy_id, entry.message);
         }
@@ -1631,23 +1641,120 @@ test "PolicySnapshot: indices update when policies change" {
 // Policy Error Routing Tests
 // -----------------------------------------------------------------------------
 
-test "PolicyRegistry: registerProvider and recordPolicyError routes to correct provider" {
+/// Test helper: find the collected stats row for a policy id.
+fn findStats(
+    stats: []const policy_provider.PolicyStatsSnapshot,
+    id: []const u8,
+) ?policy_provider.PolicyStatsSnapshot {
+    for (stats) |s| {
+        if (std.mem.eql(u8, s.id, id)) return s;
+    }
+    return null;
+}
+
+/// Test helper: does the collected stats row for `id` contain error `msg`?
+fn statsHasError(
+    stats: []const policy_provider.PolicyStatsSnapshot,
+    id: []const u8,
+    msg: []const u8,
+) bool {
+    const s = findStats(stats, id) orelse return false;
+    for (s.errors) |e| {
+        if (std.mem.eql(u8, e, msg)) return true;
+    }
+    return false;
+}
+
+test "PolicyRegistry: collectStats drains hit/miss counters and reports every policy" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    // Create test providers that record errors
-    var file_mock = TestProvider.init(allocator, "file-provider", .file);
-    defer file_mock.deinit();
+    var hot = try createTestPolicy(allocator, "hot-policy");
+    defer freeTestPolicy(allocator, &hot);
+    var cold = try createTestPolicy(allocator, "cold-policy");
+    defer freeTestPolicy(allocator, &cold);
+    try registry.updatePolicies(&.{ hot, cold }, "http-provider", .http);
 
-    var http_mock = TestProvider.init(allocator, "http-provider", .http);
-    defer http_mock.deinit();
+    // Simulate the data path bumping lock-free counters on the live snapshot.
+    const snapshot = registry.getSnapshot() orelse return error.NoSnapshot;
+    for (snapshot.policies, 0..) |*p, i| {
+        if (std.mem.eql(u8, p.id, "hot-policy")) {
+            const s = snapshot.getStats(@intCast(i)).?;
+            s.addHit();
+            s.addHit();
+            s.addHit();
+            s.addMiss();
+        }
+    }
 
-    // Register providers
-    try registry.registerProvider(file_mock.provider());
-    try registry.registerProvider(http_mock.provider());
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const stats = try registry.collectStats(arena.allocator());
+
+    // Both policies are reported, including the one that never matched.
+    try testing.expectEqual(@as(usize, 2), stats.len);
+    const hot_row = findStats(stats, "hot-policy") orelse return error.MissingHot;
+    try testing.expectEqual(@as(i64, 3), hot_row.hits);
+    try testing.expectEqual(@as(i64, 1), hot_row.misses);
+    const cold_row = findStats(stats, "cold-policy") orelse return error.MissingCold;
+    try testing.expectEqual(@as(i64, 0), cold_row.hits);
+    try testing.expectEqual(@as(i64, 0), cold_row.misses);
+
+    // A second collect reports zeros — the first collect reset the counters.
+    const stats2 = try registry.collectStats(arena.allocator());
+    const hot_row2 = findStats(stats2, "hot-policy") orelse return error.MissingHot;
+    try testing.expectEqual(@as(i64, 0), hot_row2.hits);
+    try testing.expectEqual(@as(i64, 0), hot_row2.misses);
+}
+
+test "PolicyRegistry: collectStats reports exactly the current policy set across updates" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Start with two policies.
+    var a = try createTestPolicy(allocator, "policy-a");
+    defer freeTestPolicy(allocator, &a);
+    var b = try createTestPolicy(allocator, "policy-b");
+    defer freeTestPolicy(allocator, &b);
+    try registry.updatePolicies(&.{ a, b }, "http-provider", .http);
+
+    {
+        const stats = try registry.collectStats(arena.allocator());
+        try testing.expectEqual(@as(usize, 2), stats.len);
+        try testing.expect(findStats(stats, "policy-a") != null);
+        try testing.expect(findStats(stats, "policy-b") != null);
+    }
+
+    // Replace the provider's set with a different policy: b is gone, c is added.
+    var c = try createTestPolicy(allocator, "policy-c");
+    defer freeTestPolicy(allocator, &c);
+    try registry.updatePolicies(&.{ a, c }, "http-provider", .http);
+
+    {
+        const stats = try registry.collectStats(arena.allocator());
+        // Exactly the current set — no stale policy-b, no duplicates.
+        try testing.expectEqual(@as(usize, 2), stats.len);
+        try testing.expect(findStats(stats, "policy-a") != null);
+        try testing.expect(findStats(stats, "policy-c") != null);
+        try testing.expect(findStats(stats, "policy-b") == null);
+    }
+}
+
+test "PolicyRegistry: recordPolicyError is surfaced per policy via collectStats" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
 
     // Add policies from different sources
     var file_policy = try createTestPolicy(allocator, "file-policy-1");
@@ -1659,20 +1766,21 @@ test "PolicyRegistry: registerProvider and recordPolicyError routes to correct p
     try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
     try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
 
-    // Record errors
+    // Record errors (after the last recompile, so they persist until the next)
     registry.recordPolicyError("file-policy-1", "Invalid regex in file policy");
     registry.recordPolicyError("http-policy-1", "Invalid regex in http policy");
 
-    // Verify errors routed to correct providers
-    try testing.expectEqual(@as(usize, 1), file_mock.getErrorCount());
-    try testing.expectEqual(@as(usize, 1), http_mock.getErrorCount());
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const stats = try registry.collectStats(arena.allocator());
 
-    try testing.expect(file_mock.hasError("file-policy-1", "Invalid regex in file policy"));
-    try testing.expect(http_mock.hasError("http-policy-1", "Invalid regex in http policy"));
+    // Each error is attached to its own policy's stats row...
+    try testing.expect(statsHasError(stats, "file-policy-1", "Invalid regex in file policy"));
+    try testing.expect(statsHasError(stats, "http-policy-1", "Invalid regex in http policy"));
 
-    // Verify no cross-contamination
-    try testing.expect(!file_mock.hasError("http-policy-1", "Invalid regex in http policy"));
-    try testing.expect(!http_mock.hasError("file-policy-1", "Invalid regex in file policy"));
+    // ...with no cross-contamination.
+    try testing.expect(!statsHasError(stats, "file-policy-1", "Invalid regex in http policy"));
+    try testing.expect(!statsHasError(stats, "http-policy-1", "Invalid regex in file policy"));
 }
 
 test "PolicyRegistry: invalid policy is inert and reported, valid policy in same batch still compiles" {
@@ -1681,10 +1789,6 @@ test "PolicyRegistry: invalid policy is inert and reported, valid policy in same
     noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-
-    var mock = TestProvider.init(allocator, "file-provider", .file);
-    defer mock.deinit();
-    try registry.registerProvider(mock.provider());
 
     // One valid policy and one with an uncompilable regex, in the same batch.
     const policies = try parser.parsePoliciesBytes(allocator,
@@ -1714,40 +1818,41 @@ test "PolicyRegistry: invalid policy is inert and reported, valid policy in same
     try testing.expect(snapshot.log_index.getPolicy("aaa-valid") != null);
     try testing.expect(snapshot.log_index.getPolicy("zzz-broken") == null);
 
-    // The broken policy's compilation error is reported to its provider, and
+    // The broken policy's compilation error is surfaced via collectStats, and
     // the valid policy produces no error.
-    try testing.expect(mock.getErrorCount() >= 1);
-    var found_broken = false;
-    for (mock.recorded_errors.items) |entry| {
-        if (std.mem.eql(u8, entry.policy_id, "zzz-broken")) found_broken = true;
-        try testing.expect(!std.mem.eql(u8, entry.policy_id, "aaa-valid"));
-    }
-    try testing.expect(found_broken);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const stats = try registry.collectStats(arena.allocator());
+
+    const broken = findStats(stats, "zzz-broken") orelse return error.MissingBroken;
+    try testing.expect(broken.errors.len >= 1);
+
+    const valid = findStats(stats, "aaa-valid") orelse return error.MissingValid;
+    try testing.expectEqual(@as(usize, 0), valid.errors.len);
 }
 
-test "PolicyRegistry: recordPolicyError for unknown policy does not route to provider" {
+test "PolicyRegistry: error for unknown policy is not surfaced by collectStats" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var mock = TestProvider.init(allocator, "file-provider", .file);
-    defer mock.deinit();
-
-    try registry.registerProvider(mock.provider());
-
-    // Add a real policy so we can test error routing works
     var real_policy = try createTestPolicy(allocator, "real-policy");
     defer freeTestPolicy(allocator, &real_policy);
     try registry.updatePolicies(&.{real_policy}, "file-provider", .file);
 
-    // Record error for the real policy - should be routed
+    // An error for a real policy is surfaced; one for an absent policy is not
+    // (collectStats only emits rows for policies in the current snapshot).
     registry.recordPolicyError("real-policy", "Some error");
+    registry.recordPolicyError("ghost-policy", "Should be dropped");
 
-    // Verify the error was recorded
-    try testing.expectEqual(@as(usize, 1), mock.getErrorCount());
-    try testing.expect(mock.hasError("real-policy", "Some error"));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const stats = try registry.collectStats(arena.allocator());
+
+    try testing.expect(statsHasError(stats, "real-policy", "Some error"));
+    try testing.expect(findStats(stats, "ghost-policy") == null);
 }
 
 test "PolicyRegistry: multiple errors for same policy accumulate" {
@@ -1756,11 +1861,6 @@ test "PolicyRegistry: multiple errors for same policy accumulate" {
     noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-
-    var mock = TestProvider.init(allocator, "file-provider", .file);
-    defer mock.deinit();
-
-    try registry.registerProvider(mock.provider());
 
     var policy = try createTestPolicy(allocator, "error-prone-policy");
     defer freeTestPolicy(allocator, &policy);
@@ -1771,11 +1871,15 @@ test "PolicyRegistry: multiple errors for same policy accumulate" {
     registry.recordPolicyError("error-prone-policy", "Second error");
     registry.recordPolicyError("error-prone-policy", "Third error");
 
-    // All errors should be recorded
-    try testing.expectEqual(@as(usize, 3), mock.getErrorCount());
-    try testing.expect(mock.hasError("error-prone-policy", "First error"));
-    try testing.expect(mock.hasError("error-prone-policy", "Second error"));
-    try testing.expect(mock.hasError("error-prone-policy", "Third error"));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const stats = try registry.collectStats(arena.allocator());
+
+    const row = findStats(stats, "error-prone-policy") orelse return error.MissingPolicy;
+    try testing.expectEqual(@as(usize, 3), row.errors.len);
+    try testing.expect(statsHasError(stats, "error-prone-policy", "First error"));
+    try testing.expect(statsHasError(stats, "error-prone-policy", "Second error"));
+    try testing.expect(statsHasError(stats, "error-prone-policy", "Third error"));
 }
 
 test "PolicyRegistry: policies keyed by id not name" {

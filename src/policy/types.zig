@@ -582,21 +582,12 @@ pub const Provider = union(enum) {
         };
     }
 
-    pub fn recordPolicyError(self: Provider, policy_id: []const u8, error_message: []const u8) void {
+    /// Hand the provider a stats collector to pull per-policy stats from before
+    /// each sync. Only the HTTP provider reports upstream; file/testing ignore it.
+    pub fn setStatsCollector(self: Provider, collector: policy_provider.StatsCollector) void {
         switch (self) {
-            inline else => |p| p.recordPolicyError(policy_id, error_message),
-        }
-    }
-
-    pub fn recordPolicyStats(
-        self: Provider,
-        policy_id: []const u8,
-        hits: i64,
-        misses: i64,
-        transform_result: TransformResult,
-    ) void {
-        switch (self) {
-            inline else => |p| p.recordPolicyStats(policy_id, hits, misses, transform_result),
+            .http => |p| p.setStatsCollector(collector),
+            .file, .testing => {},
         }
     }
 
@@ -622,15 +613,6 @@ pub const TestProvider = struct {
     source_type: SourceType,
     policies: std.ArrayList(Policy),
     callbacks: std.ArrayList(PolicyCallback),
-    recorded_errors: std.ArrayList(struct { policy_id: []const u8, message: []const u8 }),
-    recorded_stats: std.ArrayList(StatsCall),
-
-    pub const StatsCall = struct {
-        policy_id: []const u8,
-        hits: i64,
-        misses: i64,
-        transform_result: TransformResult,
-    };
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, source_type: SourceType) TestProvider {
         return .{
@@ -639,8 +621,6 @@ pub const TestProvider = struct {
             .source_type = source_type,
             .policies = .empty,
             .callbacks = .empty,
-            .recorded_errors = .empty,
-            .recorded_stats = .empty,
         };
     }
 
@@ -652,15 +632,6 @@ pub const TestProvider = struct {
         }
         self.policies.deinit(self.allocator);
         self.callbacks.deinit(self.allocator);
-        for (self.recorded_errors.items) |entry| {
-            self.allocator.free(entry.policy_id);
-            self.allocator.free(entry.message);
-        }
-        self.recorded_errors.deinit(self.allocator);
-        for (self.recorded_stats.items) |call| {
-            self.allocator.free(call.policy_id);
-        }
-        self.recorded_stats.deinit(self.allocator);
     }
 
     pub fn getId(self: *TestProvider) []const u8 {
@@ -709,64 +680,7 @@ pub const TestProvider = struct {
         });
     }
 
-    pub fn recordPolicyError(self: *TestProvider, policy_id: []const u8, error_message: []const u8) void {
-        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
-        const msg_copy = self.allocator.dupe(u8, error_message) catch {
-            self.allocator.free(id_copy);
-            return;
-        };
-        self.recorded_errors.append(self.allocator, .{
-            .policy_id = id_copy,
-            .message = msg_copy,
-        }) catch {
-            self.allocator.free(id_copy);
-            self.allocator.free(msg_copy);
-        };
-    }
-
-    pub fn recordPolicyStats(
-        self: *TestProvider,
-        policy_id: []const u8,
-        hits: i64,
-        misses: i64,
-        transform_result: TransformResult,
-    ) void {
-        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
-        self.recorded_stats.append(self.allocator, .{
-            .policy_id = id_copy,
-            .hits = hits,
-            .misses = misses,
-            .transform_result = transform_result,
-        }) catch {
-            self.allocator.free(id_copy);
-        };
-    }
-
     pub fn provider(self: *TestProvider) Provider {
         return .{ .testing = self };
-    }
-
-    pub fn getErrorCount(self: *TestProvider) usize {
-        return self.recorded_errors.items.len;
-    }
-
-    pub fn hasError(self: *TestProvider, policy_id: []const u8, message: []const u8) bool {
-        for (self.recorded_errors.items) |entry| {
-            if (std.mem.eql(u8, entry.policy_id, policy_id) and
-                std.mem.eql(u8, entry.message, message))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    pub fn getStats(self: *const TestProvider, policy_id: []const u8) ?StatsCall {
-        for (self.recorded_stats.items) |call| {
-            if (std.mem.eql(u8, call.policy_id, policy_id)) {
-                return call;
-            }
-        }
-        return null;
     }
 };
