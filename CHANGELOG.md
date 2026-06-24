@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/usetero/policy-zig/compare/v0.4.2...v0.4.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* pin correct dep for bench ([#71](https://github.com/usetero/policy-zig/issues/71)) ([e4f30a6](https://github.com/usetero/policy-zig/commit/e4f30a671689c300136e6ddaafcecde0095b84d2))
+
 ## [0.4.2](https://github.com/usetero/policy-zig/compare/v0.4.1...v0.4.2) (2026-06-24)
 
 
