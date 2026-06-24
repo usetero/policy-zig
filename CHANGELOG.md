@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/usetero/policy-zig/compare/v0.4.1...v0.4.2) (2026-06-24)
+
+
+### Bug Fixes
+
+* stats collector refactor ([#69](https://github.com/usetero/policy-zig/issues/69)) ([38eca1f](https://github.com/usetero/policy-zig/commit/38eca1f866cde9bf1992ee980f67df9619b661eb))
+
 ## [0.4.1](https://github.com/usetero/policy-zig/compare/v0.4.0...v0.4.1) (2026-06-18)
 
 
