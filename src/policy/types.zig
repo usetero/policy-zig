@@ -323,6 +323,12 @@ pub const LogAccessor = struct {
     /// Returns null when the field is absent OR its underlying value is not a
     /// string. Consumers that want exists-matchers to fire on non-string
     /// fields should wire `exists` to report presence independently.
+    ///
+    /// Exception — identifier fields (`LOG_FIELD_TRACE_ID`, `LOG_FIELD_SPAN_ID`):
+    /// return the RAW id bytes here, not null. The engine hex-renders them before
+    /// matching (so hex literals in policies match), and consults this primitive,
+    /// not `typed_value`, for string matchers. Returning null hides the id from
+    /// exact/contains/regex matching.
     value: *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8,
 
     /// Returns true if the field is present, regardless of underlying type.
@@ -397,6 +403,13 @@ pub const MetricAccessor = struct {
 /// writes when probabilistic sampling produces a threshold; consumers wire
 /// `set` to merge that threshold into their tracestate representation.
 pub const TraceAccessor = struct {
+    /// Read field as bytes for pattern matching; null when absent/non-string.
+    ///
+    /// Exception — identifier fields (`TRACE_FIELD_TRACE_ID`,
+    /// `TRACE_FIELD_SPAN_ID`, `TRACE_FIELD_PARENT_SPAN_ID`): return the RAW id
+    /// bytes here, not null. The engine hex-renders them before matching and
+    /// consults this primitive, not `typed_value`, for string matchers.
+    /// Returning null hides the id from exact/contains/regex matching.
     value: *const fn (ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8,
 
     exists: ?*const fn (ctx: *const anyopaque, field: TraceFieldRef) bool = null,
