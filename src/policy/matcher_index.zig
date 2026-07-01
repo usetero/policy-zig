@@ -150,6 +150,10 @@ pub const LogMatcherKey = struct {
     field: FieldRef,
     exists_entries: []const ExistsEntry = &.{},
     has_value_db: bool = false,
+    /// Value-pattern database for this key, resolved at build time so the hot
+    /// scan loop reads it directly instead of re-hashing into `databases`.
+    /// Non-null exactly when `has_value_db`. Not part of hash/eql (field only).
+    db: ?*MatcherDatabase = null,
 
     pub fn hash(self: LogMatcherKey) u64 {
         return hashFieldRef(FieldRef, self.field);
@@ -165,6 +169,8 @@ pub const MetricMatcherKey = struct {
     field: MetricFieldRef,
     exists_entries: []const ExistsEntry = &.{},
     has_value_db: bool = false,
+    /// See LogMatcherKey.db.
+    db: ?*MatcherDatabase = null,
 
     pub fn hash(self: MetricMatcherKey) u64 {
         return hashFieldRef(MetricFieldRef, self.field);
@@ -264,6 +270,8 @@ pub const TraceMatcherKey = struct {
     field: TraceFieldRef,
     exists_entries: []const ExistsEntry = &.{},
     has_value_db: bool = false,
+    /// See LogMatcherKey.db.
+    db: ?*MatcherDatabase = null,
 
     pub fn hash(self: TraceMatcherKey) u64 {
         return hashFieldRef(TraceFieldRef, self.field);
@@ -630,13 +638,30 @@ pub const MatcherDatabase = struct {
     negated_db: ?hyperscan.Database,
     scratch_pool: [scratch_pool_size]?hyperscan.Scratch,
     scratch_locks: [scratch_pool_size]std.atomic.Value(bool),
-    next_scratch: std.atomic.Value(usize),
     positive_patterns: []const PatternMeta,
     negated_patterns: []const PatternMeta,
     allocator: std.mem.Allocator,
     bus: *EventBus,
 
-    pub const scratch_pool_size: usize = 8;
+    // note: must be >= the host's scan-thread count so each worker gets its
+    // own slot and never contends a lock. 64 covers typical hosts; if a host has
+    // more scan threads than this, size the pool to std.Thread.getCpuCount() at
+    // build time instead (would require heap-slicing the pool + locks).
+    pub const scratch_pool_size: usize = 64;
+
+    /// Stable per-thread slot preference, assigned once per thread the first
+    /// time it scans. Replaces a shared atomic cursor that every worker RMW'd on
+    /// *every* scan — that single location was the dominant contention hot spot
+    /// (~13% of CPU in profiling), not the matching itself.
+    var scratch_thread_seq = std.atomic.Value(usize).init(0);
+    threadlocal var scratch_thread_slot: usize = std.math.maxInt(usize);
+
+    fn scratchThreadSlot() usize {
+        if (scratch_thread_slot == std.math.maxInt(usize)) {
+            scratch_thread_slot = scratch_thread_seq.fetchAdd(1, .monotonic);
+        }
+        return scratch_thread_slot;
+    }
 
     const ScratchHandle = struct {
         scratch: *hyperscan.Scratch,
@@ -649,7 +674,9 @@ pub const MatcherDatabase = struct {
     };
 
     fn acquireScratch(self: *MatcherDatabase) ?ScratchHandle {
-        const base = self.next_scratch.fetchAdd(1, .monotonic);
+        // Start from this thread's stable slot; with pool_size >= thread count
+        // the first try hits an uncontended slot the thread effectively owns.
+        const base = scratchThreadSlot();
         // Try each slot once
         for (0..scratch_pool_size) |offset| {
             const slot = (base +% offset) % scratch_pool_size;
@@ -662,7 +689,8 @@ pub const MatcherDatabase = struct {
                 };
             }
         }
-        // All slots busy — spin on original slot (extremely rare with 8 slots)
+        // All slots busy — spin on this thread's home slot (extremely rare:
+        // needs more concurrent scanners than scratch_pool_size).
         const slot = base % scratch_pool_size;
         while (self.scratch_locks[slot].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
@@ -1495,15 +1523,16 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 // patterns. Exists-only keys live in `matcher_keys` without
                 // a corresponding database entry.
                 const has_value_db = patterns.positive.items.len > 0 or patterns.negated.items.len > 0;
-                if (has_value_db) {
-                    const db = try compileDatabase(
+                const db: ?*MatcherDatabase = if (has_value_db) blk: {
+                    const compiled = try compileDatabase(
                         self.allocator,
                         self.bus,
                         patterns.positive.items,
                         patterns.negated.items,
                     );
-                    try databases.put(matcher_key, db);
-                }
+                    try databases.put(matcher_key, compiled);
+                    break :blk compiled;
+                } else null;
 
                 // Materialize exists entries into long-lived storage; the
                 // temp_allocator-backed list is dropped at builder end.
@@ -1516,6 +1545,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     .field = matcher_key.field,
                     .exists_entries = exists_entries,
                     .has_value_db = has_value_db,
+                    .db = db,
                 });
             }
 
@@ -1606,9 +1636,9 @@ pub const LogMatcherIndex = struct {
         return self.databases.get(key);
     }
 
-    pub fn getPolicyByIndex(self: *const LogMatcherIndex, index: PolicyIndex) ?PolicyInfo {
+    pub fn getPolicyByIndex(self: *const LogMatcherIndex, index: PolicyIndex) ?*const PolicyInfo {
         if (index >= self.policies.len) return null;
-        return self.policies[index];
+        return &self.policies[index];
     }
 
     pub fn getPolicy(self: *const LogMatcherIndex, id: []const u8) ?PolicyInfo {
@@ -1760,9 +1790,9 @@ pub const MetricMatcherIndex = struct {
         return self.databases.get(key);
     }
 
-    pub fn getPolicyByIndex(self: *const MetricMatcherIndex, index: PolicyIndex) ?PolicyInfo {
+    pub fn getPolicyByIndex(self: *const MetricMatcherIndex, index: PolicyIndex) ?*const PolicyInfo {
         if (index >= self.policies.len) return null;
-        return self.policies[index];
+        return &self.policies[index];
     }
 
     pub fn getPolicy(self: *const MetricMatcherIndex, id: []const u8) ?PolicyInfo {
@@ -1909,9 +1939,9 @@ pub const TraceMatcherIndex = struct {
         return self.databases.get(key);
     }
 
-    pub fn getPolicyByIndex(self: *const TraceMatcherIndex, index: PolicyIndex) ?PolicyInfo {
+    pub fn getPolicyByIndex(self: *const TraceMatcherIndex, index: PolicyIndex) ?*const PolicyInfo {
         if (index >= self.policies.len) return null;
-        return self.policies[index];
+        return &self.policies[index];
     }
 
     pub fn getPolicy(self: *const TraceMatcherIndex, id: []const u8) ?PolicyInfo {
@@ -2057,7 +2087,6 @@ fn compileDatabase(
         .negated_db = negated_db,
         .scratch_pool = scratch_pool,
         .scratch_locks = scratch_locks,
-        .next_scratch = std.atomic.Value(usize).init(0),
         .positive_patterns = positive_patterns,
         .negated_patterns = negated_patterns,
         .allocator = allocator,

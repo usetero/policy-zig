@@ -555,7 +555,7 @@ pub const PolicyEngine = struct {
         // Sort active policies by index so iteration order = alphanumeric policy ID order.
         // Policy indices are assigned from an ID-sorted policies_slice in createSnapshot.
         // This sorts only the active set (typically 3-5 elements), not all policies.
-        // ponytail: insertion sort — active set is small (typically 3-5, a few
+        // note: insertion sort — active set is small (typically 3-5, a few
         // dozen worst case); beats std block sort's constant overhead here.
         // If active_count ever grows large, switch back to std.mem.sort (O(n log n)).
         std.sort.insertion(PolicyIndex, state.active_policies[0..state.active_count], {}, std.sort.asc(PolicyIndex));
