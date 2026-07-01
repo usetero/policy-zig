@@ -285,7 +285,7 @@ pub const PolicyEngine = struct {
     /// Result of finding matching policies from scan state
     const MatchState = struct {
         matched_indices: [max_matches_per_scan]PolicyIndex,
-        matched_policies: [max_matches_per_scan]PolicyInfo,
+        matched_policies: [max_matches_per_scan]*const PolicyInfo,
         matched_decisions: [max_matches_per_scan]FilterDecision,
         matched_count: usize,
         decision: FilterDecision,
@@ -474,8 +474,8 @@ pub const PolicyEngine = struct {
                 self.bus.debug(event);
             }
 
-            // has_value_db guarantees getDatabase returns non-null.
-            const db = index.getDatabase(matcher_key).?;
+            // has_value_db guarantees the cached db pointer is non-null.
+            const db = matcher_key.db.?;
 
             // Scan positive patterns - increment match counts
             const positive_result = db.scanPositive(value, &result_buf);
@@ -555,7 +555,10 @@ pub const PolicyEngine = struct {
         // Sort active policies by index so iteration order = alphanumeric policy ID order.
         // Policy indices are assigned from an ID-sorted policies_slice in createSnapshot.
         // This sorts only the active set (typically 3-5 elements), not all policies.
-        std.mem.sort(PolicyIndex, state.active_policies[0..state.active_count], {}, std.sort.asc(PolicyIndex));
+        // ponytail: insertion sort — active set is small (typically 3-5, a few
+        // dozen worst case); beats std block sort's constant overhead here.
+        // If active_count ever grows large, switch back to std.mem.sort (O(n log n)).
+        std.sort.insertion(PolicyIndex, state.active_policies[0..state.active_count], {}, std.sort.asc(PolicyIndex));
     }
 
     /// Get raw bytes for probabilistic sampling.
@@ -572,7 +575,7 @@ pub const PolicyEngine = struct {
         comptime T: TelemetryType,
         comptime accessor: *const AccessorType(T),
         ctx: *anyopaque,
-        policy_info: PolicyInfo,
+        policy_info: *const PolicyInfo,
     ) ?[]const u8 {
         if (T == .trace) {
             const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
@@ -800,7 +803,7 @@ pub const PolicyEngine = struct {
 
     /// Apply policy's keep value for non-percentage policies.
     /// Percentage sampling is handled by ProbabilisticSampler in findMatchingPolicies.
-    fn applyKeepValue(io: ?std.Io, policy_info: PolicyInfo) FilterDecision {
+    fn applyKeepValue(io: ?std.Io, policy_info: *const PolicyInfo) FilterDecision {
         return switch (policy_info.keep) {
             .none => .drop,
             .all => .keep,
