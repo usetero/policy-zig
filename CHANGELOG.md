@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.4](https://github.com/usetero/policy-zig/compare/v0.4.3...v0.4.4) (2026-07-02)
+
+
+### Bug Fixes
+
+* hex support ([#73](https://github.com/usetero/policy-zig/issues/73)) ([1067abd](https://github.com/usetero/policy-zig/commit/1067abd8a6acafaa887588eff3b9e6ddfdd69760))
+* use reference for policy info, threadlocal scratch pooling ([#74](https://github.com/usetero/policy-zig/issues/74)) ([fae3389](https://github.com/usetero/policy-zig/commit/fae338946c35d55c3d89e53d57ffe75b4994f8b0))
+
 ## [0.4.3](https://github.com/usetero/policy-zig/compare/v0.4.2...v0.4.3) (2026-06-24)
 
 
