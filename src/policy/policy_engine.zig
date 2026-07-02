@@ -167,6 +167,47 @@ fn AccessorType(comptime T: TelemetryType) type {
     };
 }
 
+/// True for the OTLP identifier `bytes` fields (trace_id/span_id/parent_span_id)
+/// that are carried as raw bytes in memory — matching the binary wire path — but
+/// written as lowercase-hex literals by policy authors. The string matchers
+/// (exact/contains/regex) therefore compare against a hex rendering of these
+/// fields; numeric/binary matchers (`equals` on `.bytes`) keep comparing raw.
+/// Mirrors the JSON codec's `hex_bytes_fields` set, matched by proto field name.
+fn isHexBytesField(comptime T: TelemetryType, field_ref: FieldRefType(T)) bool {
+    return switch (T) {
+        .trace => switch (field_ref) {
+            .trace_field => |tf| switch (tf) {
+                .TRACE_FIELD_TRACE_ID, .TRACE_FIELD_SPAN_ID, .TRACE_FIELD_PARENT_SPAN_ID => true,
+                else => false,
+            },
+            else => false,
+        },
+        .log => switch (field_ref) {
+            .log_field => |lf| switch (lf) {
+                .LOG_FIELD_TRACE_ID, .LOG_FIELD_SPAN_ID => true,
+                else => false,
+            },
+            else => false,
+        },
+        .metric => false,
+    };
+}
+
+/// trace_id is 16 bytes, span_id 8 — 32 covers both with headroom.
+const max_hex_id_bytes = 32;
+
+/// Render raw id bytes as lowercase hex into `buf`. Returns the rendered slice,
+/// or the raw bytes unchanged when they don't fit (degrade, never overflow).
+fn hexRenderId(bytes: []const u8, buf: []u8) []const u8 {
+    if (bytes.len * 2 > buf.len) return bytes;
+    const hex = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        buf[i * 2] = hex[b >> 4];
+        buf[i * 2 + 1] = hex[b & 0x0f];
+    }
+    return buf[0 .. bytes.len * 2];
+}
+
 /// Runtime inputs to `PolicyEngine.evaluate`.
 ///
 /// `scratch` is consumed by regex-redact transforms (logs) for substitution
@@ -446,7 +487,7 @@ pub const PolicyEngine = struct {
             // they have no Hyperscan DB and don't read the field value.
             if (!matcher_key.has_value_db) continue;
 
-            const value = accessor.value(ctx, field_ref) orelse {
+            const raw_value = accessor.value(ctx, field_ref) orelse {
                 if (self.bus.isEnabled(.debug)) {
                     const event: MatcherKeyFieldNotPresent = .{
                         .telemetry_type = T,
@@ -460,6 +501,14 @@ pub const PolicyEngine = struct {
                 }
                 continue;
             };
+
+            // Identifier fields are stored as raw bytes but written as hex
+            // literals in policies — render before string matching.
+            var id_hex_buf: [max_hex_id_bytes * 2]u8 = undefined;
+            const value = if (isHexBytesField(T, field_ref))
+                hexRenderId(raw_value, &id_hex_buf)
+            else
+                raw_value;
 
             if (self.bus.isEnabled(.debug)) {
                 const event: MatcherKeyFieldValue = .{
@@ -4769,6 +4818,74 @@ test "PolicyEngine: trace sampling drop does not write threshold" {
     const result = evalTrace(&engine, &ctx, &policy_id_buf);
     try testing.expectEqual(FilterDecision.drop, result.decision);
     try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
+}
+
+// Context whose `value(trace_id)` returns the raw 16 bytes (the canonical
+// in-memory form for both wire paths). Exercises the engine's hex rendering of
+// identifier bytes before string matching.
+const TestHexTraceContext = struct {
+    trace_id: ?[]const u8 = null,
+
+    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
+        const self: *const TestHexTraceContext = @ptrCast(@alignCast(ctx_ptr));
+        return switch (field) {
+            .trace_field => |tf| switch (tf) {
+                .TRACE_FIELD_TRACE_ID => self.trace_id,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    pub fn noopSet(_: *anyopaque, _: TraceFieldRef, _: []const u8) void {}
+
+    pub const accessor: TraceAccessor = .{ .value = fieldAccessor, .set = noopSet };
+};
+
+test "PolicyEngine: string matcher on trace_id renders raw bytes as hex" {
+    const allocator = testing.allocator;
+
+    // 16 raw bytes; the lowercase-hex form is the literal a policy author writes.
+    const raw_id = [16]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    const hex_id = "aabbccdd000102030405060708090a0b";
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "trace-id-exact"),
+        .name = try allocator.dupe(u8, "id-exact"),
+        .enabled = true,
+        .target = .{ .trace = .{
+            .keep = .{ .percentage = 100.0 },
+        } },
+    };
+    try policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_TRACE_ID },
+        .match = .{ .exact = try allocator.dupe(u8, hex_id) },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Matching raw bytes → hex render matches the literal → policy fires.
+    var hit: TestHexTraceContext = .{ .trace_id = &raw_id };
+    const r_hit = engine.evaluate(.trace, &TestHexTraceContext.accessor, &hit, &policy_id_buf, .{
+        .io = std.Options.debug_io,
+    });
+    try testing.expectEqual(@as(usize, 1), r_hit.matched_policy_ids.len);
+
+    // Different bytes → different hex → no match.
+    const other_id = [16]u8{ 0x11, 0x22, 0x33, 0x44, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    var miss: TestHexTraceContext = .{ .trace_id = &other_id };
+    const r_miss = engine.evaluate(.trace, &TestHexTraceContext.accessor, &miss, &policy_id_buf, .{
+        .io = std.Options.debug_io,
+    });
+    try testing.expectEqual(@as(usize, 0), r_miss.matched_policy_ids.len);
 }
 
 // The previous "trace sampling without mutator" test exercised an opt-out
