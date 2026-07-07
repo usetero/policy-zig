@@ -202,10 +202,9 @@ pub fn applyRemove(
 ///
 /// When `options.compiled` is null, replaces the entire field value with
 /// `rule.replacement`. When non-null, runs the pre-compiled regex over the
-/// textual representation returned by `accessor.value` and substitutes each
-/// match using the pre-parsed replacement template. If the accessor returns
-/// null (field missing or non-string), or the regex finds no match, the
-/// operation is a no-op.
+/// `.string` value returned by `accessor.typed_value` and substitutes each
+/// match using the pre-parsed replacement template. If the field is missing
+/// or non-string, or the regex finds no match, the operation is a no-op.
 ///
 /// Returns true if the field was redacted.
 pub fn applyRedact(
@@ -220,7 +219,9 @@ pub fn applyRedact(
     if (options.compiled) |c| {
         const allocator = options.scratch orelse return false;
         const io = options.io orelse return false;
-        const value = accessor.value(ctx, field_ref) orelse return false;
+        const tv = accessor.typed_value(ctx, field_ref) orelse return false;
+        if (tv != .string) return false; // regex redact no-ops on non-string values
+        const value = tv.string;
 
         var out: std.ArrayList(u8) = .empty;
         // No deinit: `out.items` is handed to the accessor.set by reference
@@ -243,7 +244,7 @@ pub fn applyRedact(
     }
 
     // Whole-value redact: only fires if the field exists.
-    if (accessor.value(ctx, field_ref) == null) return false;
+    if (!accessor.callExists(ctx, field_ref)) return false;
 
     accessor.set.?(ctx, field_ref, rule.replacement);
     return true;
@@ -414,8 +415,12 @@ const TestContext = struct {
         self.allocator.free(removed.value);
     }
 
+    fn accessorTypedValue(ctx: *const anyopaque, field: FieldRef) ?types.TypedValue {
+        return .{ .string = accessorValue(ctx, field) orelse return null };
+    }
+
     const accessor: LogAccessor = .{
-        .value = accessorValue,
+        .typed_value = accessorTypedValue,
         .set = accessorSet,
         .delete = accessorDelete,
         .move = accessorMove,
@@ -568,10 +573,10 @@ test "applyRedact: regex output outlives applyRedact return" {
 
         stored: ?[]const u8 = null,
 
-        fn valueFn(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+        fn valueFn(ctx: *const anyopaque, field: FieldRef) ?types.TypedValue {
             _ = field;
             const self: *const Self = @ptrCast(@alignCast(ctx));
-            return self.stored;
+            return .{ .string = self.stored orelse return null };
         }
 
         fn setFn(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
@@ -585,7 +590,7 @@ test "applyRedact: regex output outlives applyRedact return" {
         }
         fn moveFn(_: *anyopaque, _: FieldRef, _: []const u8) void {}
         const accessor: LogAccessor = .{
-            .value = valueFn,
+            .typed_value = valueFn,
             .set = setFn,
             .delete = deleteFn,
             .move = moveFn,

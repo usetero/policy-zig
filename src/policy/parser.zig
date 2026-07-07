@@ -124,6 +124,7 @@ const LogMatcherJson = struct {
     //   equals: true   → bool_value
     //   equals: 200    → int_value
     //   equals: 0.5    → double_value
+    //   equals: "foo"  → string_value (v1.6.0)
     //   equals: { hex_value: "deadbeef" }  → canonical
     // gt/gte/lt/lte accept integer or float literals only.
     equals: ?std.json.Value = null,
@@ -523,13 +524,14 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
 ///   bool   → bool_value
 ///   int    → int_value
 ///   float  → double_value
-///   object with hex_value/bytes_value/bool_value/int_value/double_value → canonical
-/// A bare string literal is rejected per spec (use `exact` for strings).
+///   string → string_value (v1.6.0)
+///   object with hex_value/bytes_value/bool_value/int_value/double_value/string_value → canonical
 fn parseValue(allocator: std.mem.Allocator, json_val: std.json.Value) !Value {
     switch (json_val) {
         .bool => |b| return Value{ .value = .{ .bool_value = b } },
         .integer => |i| return Value{ .value = .{ .int_value = i } },
         .float => |f| return Value{ .value = .{ .double_value = f } },
+        .string => |s| return Value{ .value = .{ .string_value = try allocator.dupe(u8, s) } },
         .object => |obj| {
             if (obj.get("bool_value")) |v| {
                 return Value{ .value = .{ .bool_value = v.bool } };
@@ -549,9 +551,11 @@ fn parseValue(allocator: std.mem.Allocator, json_val: std.json.Value) !Value {
                 const bytes = try allocator.dupe(u8, v.string);
                 return Value{ .value = .{ .bytes_value = bytes } };
             }
+            if (obj.get("string_value")) |v| {
+                return Value{ .value = .{ .string_value = try allocator.dupe(u8, v.string) } };
+            }
             return error.InvalidValue;
         },
-        .string => return error.InvalidValue, // use `exact` for strings
         else => return error.InvalidValue,
     }
 }
@@ -2670,9 +2674,23 @@ test "parseValue: hex_value canonical" {
     try std.testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, v.value.?.bytes_value);
 }
 
-test "parseValue: string rejected" {
+test "parseValue: string shorthand (v1.6.0)" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .string = "foo" }));
+    const v = try parseValue(allocator, .{ .string = "foo" });
+    defer allocator.free(v.value.?.string_value);
+    try std.testing.expect(v.value.? == .string_value);
+    try std.testing.expectEqualStrings("foo", v.value.?.string_value);
+}
+
+test "parseValue: string_value canonical (v1.6.0)" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "string_value", .{ .string = "checkout-api" });
+    const v = try parseValue(allocator, .{ .object = obj });
+    defer allocator.free(v.value.?.string_value);
+    try std.testing.expect(v.value.? == .string_value);
+    try std.testing.expectEqualStrings("checkout-api", v.value.?.string_value);
 }
 
 test "parseNumericValue: int" {
@@ -2736,6 +2754,36 @@ test "parsePoliciesBytes: log policy with equals bool" {
     try std.testing.expect(matcher.match.? == .equals);
     try std.testing.expect(matcher.match.?.equals.value.? == .bool_value);
     try std.testing.expect(matcher.match.?.equals.value.?.bool_value == true);
+}
+
+test "parsePoliciesBytes: log policy with equals string (v1.6.0)" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-checkout",
+        \\    "name": "Drop checkout logs",
+        \\    "log": {
+        \\      "match": [
+        \\        { "resource_attribute": ["service.name"], "equals": "checkout-api" }
+        \\      ],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const matcher = policies[0].target.?.log.match.items[0];
+    try std.testing.expect(matcher.match.? == .equals);
+    try std.testing.expect(matcher.match.?.equals.value.? == .string_value);
+    try std.testing.expectEqualStrings("checkout-api", matcher.match.?.equals.value.?.string_value);
 }
 
 test "parsePoliciesBytes: log policy with gte int" {

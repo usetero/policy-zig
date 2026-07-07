@@ -487,7 +487,17 @@ pub const PolicyEngine = struct {
             // they have no Hyperscan DB and don't read the field value.
             if (!matcher_key.has_value_db) continue;
 
-            const raw_value = accessor.value(ctx, field_ref) orelse {
+            // String matchers consume the `.string` variant. Identifier
+            // fields arrive as `.bytes` and are hex-rendered before matching
+            // (policies write them as hex literals). Other variants are not
+            // string-matchable and skip the scan like an absent field.
+            var id_hex_buf: [max_hex_id_bytes * 2]u8 = undefined;
+            const value = blk: {
+                if (accessor.typed_value(ctx, field_ref)) |tv| switch (tv) {
+                    .string => |s| break :blk s,
+                    .bytes => |b| if (isHexBytesField(T, field_ref)) break :blk hexRenderId(b, &id_hex_buf),
+                    else => {},
+                };
                 if (self.bus.isEnabled(.debug)) {
                     const event: MatcherKeyFieldNotPresent = .{
                         .telemetry_type = T,
@@ -501,14 +511,6 @@ pub const PolicyEngine = struct {
                 }
                 continue;
             };
-
-            // Identifier fields are stored as raw bytes but written as hex
-            // literals in policies — render before string matching.
-            var id_hex_buf: [max_hex_id_bytes * 2]u8 = undefined;
-            const value = if (isHexBytesField(T, field_ref))
-                hexRenderId(raw_value, &id_hex_buf)
-            else
-                raw_value;
 
             if (self.bus.isEnabled(.debug)) {
                 const event: MatcherKeyFieldValue = .{
@@ -577,12 +579,7 @@ pub const PolicyEngine = struct {
         //    comparison fires (negation failed), leave alone when it doesn't
         //    (negation succeeded).
         for (index.getTypedChecks()) |check| {
-            const typed_val: ?policy_types.TypedValue = if (comptime accessor.typed_value != null)
-                accessor.typed_value.?(ctx, check.field_ref)
-            else if (accessor.value(ctx, check.field_ref)) |s|
-                policy_types.TypedValue{ .string = s }
-            else
-                null;
+            const typed_val = accessor.typed_value(ctx, check.field_ref);
 
             const fired = check.matcher.evaluate(typed_val);
 
@@ -612,10 +609,9 @@ pub const PolicyEngine = struct {
 
     /// Get raw bytes for probabilistic sampling.
     ///
-    /// Prefers `accessor.typed_value` to get `TypedValue.bytes` directly —
-    /// the sampler expects raw bytes and no longer accepts hex-encoded strings.
-    /// Falls back to `accessor.value` (treating the result as raw bytes) when
-    /// `typed_value` is not wired or returns a non-bytes variant.
+    /// The sampler expects raw bytes: `.bytes` values are used directly
+    /// (identifiers, no hex-encoded strings), `.string` values as their byte
+    /// content. Other variants cannot seed randomness and return null.
     ///
     /// - Traces: `TRACE_FIELD_TRACE_ID` raw bytes (16 bytes per OTel spec).
     /// - Logs with sample_key: sample key field value as raw bytes.
@@ -626,27 +622,20 @@ pub const PolicyEngine = struct {
         ctx: *anyopaque,
         policy_info: *const PolicyInfo,
     ) ?[]const u8 {
-        if (T == .trace) {
-            const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
-            if (comptime accessor.typed_value != null) {
-                if (accessor.typed_value.?(ctx, trace_id_ref)) |tv| {
-                    if (tv == .bytes) return tv.bytes;
-                }
-            }
-            return accessor.value(ctx, trace_id_ref);
-        } else if (T == .log) {
-            if (policy_info.sample_key) |sample_key| {
-                if (FieldRef.fromSampleKeyField(sample_key.field)) |field_ref| {
-                    if (comptime accessor.typed_value != null) {
-                        if (accessor.typed_value.?(ctx, field_ref)) |tv| {
-                            if (tv == .bytes) return tv.bytes;
-                        }
-                    }
-                    return accessor.value(ctx, field_ref);
-                }
-            }
-        }
-        return null;
+        const field_ref: FieldRefType(T) = switch (T) {
+            .trace => .{ .trace_field = .TRACE_FIELD_TRACE_ID },
+            .log => blk: {
+                const sample_key = policy_info.sample_key orelse return null;
+                break :blk FieldRef.fromSampleKeyField(sample_key.field) orelse return null;
+            },
+            .metric => return null,
+        };
+        const tv = accessor.typed_value(ctx, field_ref) orelse return null;
+        return switch (tv) {
+            .bytes => |b| b,
+            .string => |s| s,
+            else => null,
+        };
     }
 
     /// Find all matching policies, apply sampling/rate limiting, and determine final decision.
@@ -709,7 +698,10 @@ pub const PolicyEngine = struct {
                         if (T == .trace) {
                             // Trace sampling: read tracestate, run full sample(), write threshold back
                             const ts_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_STATE };
-                            const tracestate = accessor.value(ctx, ts_ref) orelse "";
+                            const tracestate = ts: {
+                                const tv = accessor.typed_value(ctx, ts_ref) orelse break :ts "";
+                                break :ts if (tv == .string) tv.string else "";
+                            };
                             const sr = s.sample(input, tracestate);
 
                             if (sr.keep) {
@@ -730,7 +722,13 @@ pub const PolicyEngine = struct {
                             break :blk if (sr.keep) FilterDecision.keep else FilterDecision.drop;
                         }
 
-                        // Non-trace: simple keep/drop from shouldKeep
+                        // Non-trace (log): with no sample_key (or a missing/empty
+                        // key value) the spec requires an independent random
+                        // decision per record, so empty input takes the random
+                        // path instead of failing closed.
+                        if (input.len == 0) {
+                            break :blk if (s.shouldKeepRandom(io)) FilterDecision.keep else FilterDecision.drop;
+                        }
                         break :blk if (s.shouldKeep(input)) FilterDecision.keep else FilterDecision.drop;
                     }
                     break :blk applyKeepValue(io, policy_info);
@@ -924,7 +922,11 @@ const TestLogContext = struct {
         };
     }
 
-    pub const accessor: LogAccessor = .{ .value = fieldAccessor };
+    fn typedAccessor(ctx_ptr: *const anyopaque, field: FieldRef) ?TypedValue {
+        return .{ .string = fieldAccessor(ctx_ptr, field) orelse return null };
+    }
+
+    pub const accessor: LogAccessor = .{ .typed_value = typedAccessor };
 };
 
 fn evalTestLog(
@@ -1835,8 +1837,12 @@ const MutableTestLogContext = struct {
         if (value) |v| self.setAttribute(to, v) catch return;
     }
 
+    fn typedAccessor(ctx_ptr: *const anyopaque, field: FieldRef) ?TypedValue {
+        return .{ .string = fieldAccessor(ctx_ptr, field) orelse return null };
+    }
+
     pub const accessor: LogAccessor = .{
-        .value = fieldAccessor,
+        .typed_value = typedAccessor,
         .set = accessorSet,
         .delete = accessorDelete,
         .move = accessorMove,
@@ -1921,15 +1927,6 @@ const TypedLogContext = struct {
         };
     }
 
-    fn fieldValue(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
-        const self: *const TypedLogContext = @ptrCast(@alignCast(ctx_ptr));
-        const key = attrKey(field) orelse return null;
-        return switch (self.attrs.get(key) orelse return null) {
-            .string => |s| s,
-            else => null, // non-string → null for string-match path
-        };
-    }
-
     fn fieldTypedValue(ctx_ptr: *const anyopaque, field: FieldRef) ?TypedValue {
         const self: *const TypedLogContext = @ptrCast(@alignCast(ctx_ptr));
         const key = attrKey(field) orelse return null;
@@ -1942,7 +1939,6 @@ const TypedLogContext = struct {
     }
 
     pub const accessor: LogAccessor = .{
-        .value = fieldValue,
         .typed_value = fieldTypedValue,
     };
 };
@@ -2246,6 +2242,76 @@ test "typed: negated equals" {
     defer ctx500.deinit();
     _ = try ctx500.withInt("status", 500);
     try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx500, &policy_id_buf).decision);
+}
+
+test "typed: equals string_value matches like exact (v1.6.0)" {
+    const allocator = testing.allocator;
+
+    const sv: proto.policy.Value = .{ .value = .{ .string_value = try allocator.dupe(u8, "checkout-api") } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-checkout", "service.name", .{ .equals = sv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("service.name", "checkout-api");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
+
+    // Prefix is not equality
+    var ctx2 = TypedLogContext.init(allocator);
+    defer ctx2.deinit();
+    _ = try ctx2.withString("service.name", "checkout-api-v2");
+    try testing.expectEqual(FilterDecision.unset, evalTypedLog(&engine, &ctx2, &policy_id_buf).decision);
+
+    // Different case does not match without case_insensitive
+    var ctx3 = TypedLogContext.init(allocator);
+    defer ctx3.deinit();
+    _ = try ctx3.withString("service.name", "CHECKOUT-API");
+    try testing.expectEqual(FilterDecision.unset, evalTypedLog(&engine, &ctx3, &policy_id_buf).decision);
+}
+
+test "typed: equals string_value with case_insensitive (v1.6.0)" {
+    const allocator = testing.allocator;
+
+    var attr_path: proto.policy.AttributePath = .{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "env"));
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "drop-prod"),
+        .name = try allocator.dupe(u8, "drop-prod"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = attr_path },
+        .match = .{ .equals = .{ .value = .{ .string_value = try allocator.dupe(u8, "production") } } },
+        .case_insensitive = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("env", "PRODUCTION");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
 }
 
 test "evaluate: policy with keep=all and no transform" {
@@ -3386,7 +3452,11 @@ const TestMetricContext = struct {
         };
     }
 
-    pub const accessor: MetricAccessor = .{ .value = fieldAccessor };
+    fn typedAccessor(ctx_ptr: *const anyopaque, field: MetricFieldRef) ?TypedValue {
+        return .{ .string = fieldAccessor(ctx_ptr, field) orelse return null };
+    }
+
+    pub const accessor: MetricAccessor = .{ .typed_value = typedAccessor };
 };
 
 fn evalMetric(
@@ -4063,38 +4133,10 @@ test "PolicyEngine: percentage sampling - 100% keeps all" {
     try testing.expectEqual(FilterDecision.keep, result.decision);
 }
 
-test "PolicyEngine: percentage sampling - deterministic per context" {
-    const allocator = testing.allocator;
-
-    var policy: Policy = .{
-        .id = try allocator.dupe(u8, "policy-1"),
-        .name = try allocator.dupe(u8, "sample-50-percent"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "50%"),
-        } },
-    };
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "test") },
-    });
-    defer policy.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, "file-provider", .file);
-
-    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
-    var policy_id_buf: [16][]const u8 = undefined;
-
-    // Same context should produce same decision (deterministic)
-    var test_log: TestLogContext = .{ .message = "test message" };
-    const result1 = evalTestLog(&engine, &test_log, &policy_id_buf);
-    const result2 = evalTestLog(&engine, &test_log, &policy_id_buf);
-    try testing.expectEqual(result1.decision, result2.decision);
-}
+// Note: deterministic percentage sampling requires a sample_key (see the
+// "sample_key provides deterministic sampling" test). Without one, the spec
+// (v1.6.0) requires an independent random decision per record — covered by
+// "percentage sampling without sample_key is independent random".
 
 test "PolicyEngine: rate limiting - respects limit" {
     const allocator = testing.allocator;
@@ -4479,12 +4521,54 @@ test "PolicyEngine: sample_key missing field falls back to default" {
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
-    // Should still work (falls back to context pointer hash)
+    // Missing key value falls back to the independent random default
     var log1: TestLogContext = .{ .message = "test message" };
     const result = evalTestLog(&engine, &log1, &policy_id_buf);
 
-    // Should get a decision (either keep or drop based on hash)
+    // Should get a decision (either keep or drop, randomly)
     try testing.expect(result.decision == .keep or result.decision == .drop);
+}
+
+test "PolicyEngine: percentage sampling without sample_key is independent random (v1.6.0)" {
+    const allocator = testing.allocator;
+
+    // 50% log sampling with no sample_key: each record must get an
+    // independent random decision — previously this failed closed and
+    // dropped everything.
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "sample-unkeyed"),
+        .name = try allocator.dupe(u8, "sample-unkeyed"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "^.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var kept: u32 = 0;
+    const total: u32 = 2000;
+    for (0..total) |_| {
+        var log: TestLogContext = .{ .message = "same message every time" };
+        if (evalTestLog(&engine, &log, &policy_id_buf).decision == .keep) kept += 1;
+    }
+
+    // Identical records must not all get the same decision, and the split
+    // should be roughly 50% (wide bounds keep this test deterministic enough).
+    const ratio = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(total));
+    try testing.expect(ratio > 0.4 and ratio < 0.6);
 }
 
 test "PolicyEngine: log resource_schema_url matching" {
@@ -4680,27 +4764,16 @@ const TestTraceContext = struct {
     last_mutate_value: ?[]const u8 = null,
     mutate_count: usize = 0,
 
-    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
-        const self: *const TestTraceContext = @ptrCast(@alignCast(ctx_ptr));
-        return switch (field) {
-            .trace_field => |tf| switch (tf) {
-                .TRACE_FIELD_NAME => self.name,
-                .TRACE_FIELD_SPAN_ID => self.span_id,
-                .TRACE_FIELD_TRACE_STATE => self.trace_state,
-                // trace_id is bytes — return null from the string path so
-                // string matchers don't fire on it; sampling uses typed_value.
-                .TRACE_FIELD_TRACE_ID => null,
-                else => null,
-            },
-            else => null,
-        };
-    }
-
     pub fn typedFieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?TypedValue {
         const self: *const TestTraceContext = @ptrCast(@alignCast(ctx_ptr));
         return switch (field) {
             .trace_field => |tf| switch (tf) {
-                .TRACE_FIELD_TRACE_ID => if (self.trace_id) |id| TypedValue{ .bytes = id } else null,
+                .TRACE_FIELD_NAME => .{ .string = self.name orelse return null },
+                .TRACE_FIELD_SPAN_ID => .{ .string = self.span_id orelse return null },
+                .TRACE_FIELD_TRACE_STATE => .{ .string = self.trace_state orelse return null },
+                // trace_id is raw bytes: the engine hex-renders it for string
+                // matchers and hands the raw bytes to the sampler.
+                .TRACE_FIELD_TRACE_ID => .{ .bytes = self.trace_id orelse return null },
                 else => null,
             },
             else => null,
@@ -4720,7 +4793,6 @@ const TestTraceContext = struct {
     }
 
     pub const accessor: TraceAccessor = .{
-        .value = fieldAccessor,
         .typed_value = typedFieldAccessor,
         .set = accessorSet,
     };
@@ -4820,17 +4892,17 @@ test "PolicyEngine: trace sampling drop does not write threshold" {
     try testing.expectEqual(@as(usize, 0), ctx.mutate_count);
 }
 
-// Context whose `value(trace_id)` returns the raw 16 bytes (the canonical
-// in-memory form for both wire paths). Exercises the engine's hex rendering of
-// identifier bytes before string matching.
+// Context whose `typed_value(trace_id)` returns the raw 16 bytes (the
+// canonical in-memory form for both wire paths). Exercises the engine's hex
+// rendering of identifier bytes before string matching.
 const TestHexTraceContext = struct {
     trace_id: ?[]const u8 = null,
 
-    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
+    pub fn typedFieldAccessor(ctx_ptr: *const anyopaque, field: TraceFieldRef) ?TypedValue {
         const self: *const TestHexTraceContext = @ptrCast(@alignCast(ctx_ptr));
         return switch (field) {
             .trace_field => |tf| switch (tf) {
-                .TRACE_FIELD_TRACE_ID => self.trace_id,
+                .TRACE_FIELD_TRACE_ID => .{ .bytes = self.trace_id orelse return null },
                 else => null,
             },
             else => null,
@@ -4839,7 +4911,7 @@ const TestHexTraceContext = struct {
 
     pub fn noopSet(_: *anyopaque, _: TraceFieldRef, _: []const u8) void {}
 
-    pub const accessor: TraceAccessor = .{ .value = fieldAccessor, .set = noopSet };
+    pub const accessor: TraceAccessor = .{ .typed_value = typedFieldAccessor, .set = noopSet };
 };
 
 test "PolicyEngine: string matcher on trace_id renders raw bytes as hex" {

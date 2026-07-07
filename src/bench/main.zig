@@ -16,6 +16,7 @@ const TraceFieldRef = policy_zig.TraceFieldRef;
 const LogAccessor = policy_zig.LogAccessor;
 const MetricAccessor = policy_zig.MetricAccessor;
 const TraceAccessor = policy_zig.TraceAccessor;
+const TypedValue = policy_zig.TypedValue;
 const NoopEventBus = o11y.NoopEventBus;
 
 const COUNTS = [_]usize{ 1, 10, 100, 1000 };
@@ -24,38 +25,38 @@ const COUNTS = [_]usize{ 1, 10, 100, 1000 };
 
 const BenchLog = struct {
     body: []const u8,
-    fn access(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+    fn access(ctx: *const anyopaque, field: FieldRef) ?TypedValue {
         const self: *const BenchLog = @ptrCast(@alignCast(ctx));
         return switch (field) {
-            .log_field => |lf| if (lf == .LOG_FIELD_BODY) self.body else null,
+            .log_field => |lf| if (lf == .LOG_FIELD_BODY) .{ .string = self.body } else null,
             else => null,
         };
     }
-    const accessor: LogAccessor = .{ .value = access };
+    const accessor: LogAccessor = .{ .typed_value = access };
 };
 
 const BenchMetric = struct {
     name: []const u8,
-    fn access(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
+    fn access(ctx: *const anyopaque, field: MetricFieldRef) ?TypedValue {
         const self: *const BenchMetric = @ptrCast(@alignCast(ctx));
         return switch (field) {
-            .metric_field => |mf| if (mf == .METRIC_FIELD_NAME) self.name else null,
+            .metric_field => |mf| if (mf == .METRIC_FIELD_NAME) .{ .string = self.name } else null,
             else => null,
         };
     }
-    const accessor: MetricAccessor = .{ .value = access };
+    const accessor: MetricAccessor = .{ .typed_value = access };
 };
 
 const BenchTrace = struct {
     name: []const u8,
-    fn access(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
+    fn access(ctx: *const anyopaque, field: TraceFieldRef) ?TypedValue {
         const self: *const BenchTrace = @ptrCast(@alignCast(ctx));
         return switch (field) {
-            .trace_field => |tf| if (tf == .TRACE_FIELD_NAME) self.name else null,
+            .trace_field => |tf| if (tf == .TRACE_FIELD_NAME) .{ .string = self.name } else null,
             else => null,
         };
     }
-    const accessor: TraceAccessor = .{ .value = access };
+    const accessor: TraceAccessor = .{ .typed_value = access };
 };
 
 // --- JSON builders (allocator passed per-call, Zig 0.16 style) ---
