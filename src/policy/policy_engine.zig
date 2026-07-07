@@ -193,20 +193,8 @@ fn isHexBytesField(comptime T: TelemetryType, field_ref: FieldRefType(T)) bool {
     };
 }
 
-/// trace_id is 16 bytes, span_id 8 — 32 covers both with headroom.
-const max_hex_id_bytes = 32;
-
-/// Render raw id bytes as lowercase hex into `buf`. Returns the rendered slice,
-/// or the raw bytes unchanged when they don't fit (degrade, never overflow).
-fn hexRenderId(bytes: []const u8, buf: []u8) []const u8 {
-    if (bytes.len * 2 > buf.len) return bytes;
-    const hex = "0123456789abcdef";
-    for (bytes, 0..) |b, i| {
-        buf[i * 2] = hex[b >> 4];
-        buf[i * 2 + 1] = hex[b & 0x0f];
-    }
-    return buf[0 .. bytes.len * 2];
-}
+const max_hex_id_bytes = policy_types.max_hex_id_bytes;
+const hexRenderId = policy_types.hexRenderId;
 
 /// Runtime inputs to `PolicyEngine.evaluate`.
 ///
@@ -227,11 +215,11 @@ fn hexRenderId(bytes: []const u8, buf: []u8) []const u8 {
 pub const EvaluateOptions = struct {
     scratch: ?std.mem.Allocator = null,
     /// Io for the io-dependent decision paths: rate-limiter timestamps
-    /// (`per_second`/`per_minute` policies) and regex-redact mutex
-    /// serialization. Only consulted when such policies fire; a null `io`
-    /// degrades those paths gracefully (rate limit defaults to keep, regex
-    /// redact no-ops) exactly like a null `scratch`.
-    io: ?std.Io = null,
+    /// (`per_second`/`per_minute` policies), unkeyed percentage sampling
+    /// (needs a random source), and regex-redact mutex serialization.
+    /// Required — without it, rate limiting and unkeyed percentage sampling
+    /// cannot make a real decision, so there is no safe default to degrade to.
+    io: std.Io,
 };
 
 // =============================================================================
@@ -374,7 +362,7 @@ pub const PolicyEngine = struct {
 
         // Phase 2: Find matching policies and determine decision
         var match_state: MatchState = undefined;
-        self.findMatchingPolicies(T, accessor, options.io, ctx, index, &scan_state, policy_id_buf, &match_state);
+        self.findMatchingPolicies(options.io, T, accessor, ctx, index, &scan_state, policy_id_buf, &match_state);
 
         const result_event: EvaluateResult = .{
             .decision = match_state.decision,
@@ -395,8 +383,8 @@ pub const PolicyEngine = struct {
             for (0..match_state.matched_count) |i| {
                 const policy_index = match_state.matched_indices[i];
                 const result = self.applyLogTransforms(
-                    accessor,
                     options.io,
+                    accessor,
                     ctx,
                     snapshot,
                     policy_index,
@@ -648,9 +636,9 @@ pub const PolicyEngine = struct {
     /// the actual W3C tracestate header as `ot=th:VALUE`.
     inline fn findMatchingPolicies(
         self: *const PolicyEngine,
+        io: std.Io,
         comptime T: TelemetryType,
         comptime accessor: *const AccessorType(T),
-        io: ?std.Io,
         ctx: *anyopaque,
         index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
@@ -756,8 +744,8 @@ pub const PolicyEngine = struct {
     /// Returns the transform result for stats recording.
     inline fn applyLogTransforms(
         self: *const PolicyEngine,
+        io: std.Io,
         comptime accessor: *const LogAccessor,
-        io: ?std.Io,
         ctx: *anyopaque,
         snapshot: *const PolicySnapshot,
         policy_index: PolicyIndex,
@@ -850,17 +838,14 @@ pub const PolicyEngine = struct {
 
     /// Apply policy's keep value for non-percentage policies.
     /// Percentage sampling is handled by ProbabilisticSampler in findMatchingPolicies.
-    fn applyKeepValue(io: ?std.Io, policy_info: *const PolicyInfo) FilterDecision {
+    fn applyKeepValue(io: std.Io, policy_info: *const PolicyInfo) FilterDecision {
         return switch (policy_info.keep) {
             .none => .drop,
             .all => .keep,
             .percentage => .keep, // Should not reach here; handled by ProbabilisticSampler
             .per_second, .per_minute => {
                 if (policy_info.rate_limiter) |rl| {
-                    // Without io we cannot read the clock to rate-limit; default
-                    // to keep (same as "no rate limiter configured").
-                    const real_io = io orelse return .keep;
-                    return if (rl.shouldKeep(real_io)) .keep else .drop;
+                    return if (rl.shouldKeep(io)) .keep else .drop;
                 }
                 return .keep; // No rate limiter configured, default to keep
             },
@@ -2312,6 +2297,86 @@ test "typed: equals string_value with case_insensitive (v1.6.0)" {
     defer ctx.deinit();
     _ = try ctx.withString("env", "PRODUCTION");
     try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
+}
+
+test "typed: equals string_value treats regex metacharacters as literal" {
+    const allocator = testing.allocator;
+
+    const sv: proto.policy.Value = .{ .value = .{ .string_value = try allocator.dupe(u8, "a.b") } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-literal", "service.name", .{ .equals = sv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Exact literal match still fires.
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("service.name", "a.b");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
+
+    // '.' must not act as a regex wildcard: "axb" should not match "a.b".
+    var ctx2 = TypedLogContext.init(allocator);
+    defer ctx2.deinit();
+    _ = try ctx2.withString("service.name", "axb");
+    try testing.expectEqual(FilterDecision.unset, evalTypedLog(&engine, &ctx2, &policy_id_buf).decision);
+}
+
+test "typed: equals string_value with regex-special literal is a valid pattern" {
+    const allocator = testing.allocator;
+
+    // Previously rejected at validation because the unescaped '(' made an
+    // invalid regex; must now compile and match literally.
+    const sv: proto.policy.Value = .{ .value = .{ .string_value = try allocator.dupe(u8, "a(b") } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-paren", "service.name", .{ .equals = sv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("service.name", "a(b");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
+}
+
+test "typed: equals empty string_value matches only empty string" {
+    const allocator = testing.allocator;
+
+    const sv: proto.policy.Value = .{ .value = .{ .string_value = try allocator.dupe(u8, "") } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-empty", "service.name", .{ .equals = sv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("service.name", "");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
+
+    var ctx2 = TypedLogContext.init(allocator);
+    defer ctx2.deinit();
+    _ = try ctx2.withString("service.name", "nonempty");
+    try testing.expectEqual(FilterDecision.unset, evalTypedLog(&engine, &ctx2, &policy_id_buf).decision);
 }
 
 test "evaluate: policy with keep=all and no transform" {

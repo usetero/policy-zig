@@ -534,24 +534,29 @@ fn parseValue(allocator: std.mem.Allocator, json_val: std.json.Value) !Value {
         .string => |s| return Value{ .value = .{ .string_value = try allocator.dupe(u8, s) } },
         .object => |obj| {
             if (obj.get("bool_value")) |v| {
+                if (v != .bool) return error.InvalidValue;
                 return Value{ .value = .{ .bool_value = v.bool } };
             }
             if (obj.get("int_value")) |v| {
+                if (v != .integer) return error.InvalidValue;
                 return Value{ .value = .{ .int_value = v.integer } };
             }
             if (obj.get("double_value")) |v| {
+                if (v != .float) return error.InvalidValue;
                 return Value{ .value = .{ .double_value = v.float } };
             }
             if (obj.get("hex_value")) |v| {
-                const hex_str = v.string;
-                const bytes = try hexDecode(allocator, hex_str);
+                if (v != .string) return error.InvalidValue;
+                const bytes = try hexDecode(allocator, v.string);
                 return Value{ .value = .{ .bytes_value = bytes } };
             }
             if (obj.get("bytes_value")) |v| {
+                if (v != .string) return error.InvalidValue;
                 const bytes = try allocator.dupe(u8, v.string);
                 return Value{ .value = .{ .bytes_value = bytes } };
             }
             if (obj.get("string_value")) |v| {
+                if (v != .string) return error.InvalidValue;
                 return Value{ .value = .{ .string_value = try allocator.dupe(u8, v.string) } };
             }
             return error.InvalidValue;
@@ -2691,6 +2696,54 @@ test "parseValue: string_value canonical (v1.6.0)" {
     defer allocator.free(v.value.?.string_value);
     try std.testing.expect(v.value.? == .string_value);
     try std.testing.expectEqualStrings("checkout-api", v.value.?.string_value);
+}
+
+test "parseValue: string_value with non-string JSON type returns InvalidValue" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "string_value", .{ .integer = 123 });
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .object = obj }));
+}
+
+test "parseValue: bool_value with non-bool JSON type returns InvalidValue" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "bool_value", .{ .string = "true" });
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .object = obj }));
+}
+
+test "parseValue: int_value with non-integer JSON type returns InvalidValue" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "int_value", .{ .string = "200" });
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .object = obj }));
+}
+
+test "parseValue: double_value with non-float JSON type returns InvalidValue" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "double_value", .{ .integer = 5 });
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .object = obj }));
+}
+
+test "parseValue: hex_value with non-string JSON type returns InvalidValue" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "hex_value", .{ .integer = 5 });
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .object = obj }));
+}
+
+test "parseValue: bytes_value with non-string JSON type returns InvalidValue" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "bytes_value", .{ .bool = true });
+    try std.testing.expectError(error.InvalidValue, parseValue(allocator, .{ .object = obj }));
 }
 
 test "parseNumericValue: int" {

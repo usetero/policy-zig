@@ -127,13 +127,11 @@ pub const ProbabilisticSampler = struct {
     /// Per spec v1.6.0, without a sample_key each record MUST be sampled with a
     /// fresh high-quality random value — never derived from timestamps or
     /// record content — so this is intentionally not idempotent.
-    /// A null io fails open to keep (matching the rate limiter), except 0%.
-    pub fn shouldKeepRandom(self: ProbabilisticSampler, io: ?std.Io) bool {
+    pub fn shouldKeepRandom(self: ProbabilisticSampler, io: std.Io) bool {
         if (self.percentage >= 100.0) return true;
         if (self.percentage <= 0.0) return false;
-        const real_io = io orelse return true;
         var buf: [8]u8 = undefined;
-        real_io.random(&buf);
+        io.random(&buf);
         const r = std.mem.readInt(u64, &buf, .little) & (max_56bit - 1);
         return r >= self.threshold;
     }
@@ -691,14 +689,9 @@ test "ProbabilisticSampler: initFromPercentage" {
 test "ProbabilisticSampler: shouldKeepRandom edge cases and distribution" {
     const io = std.Options.debug_io;
 
-    // 100% keeps all, 0% rejects all — with or without io
+    // 100% keeps all, 0% rejects all
     try testing.expect(ProbabilisticSampler.initFromPercentage(100).shouldKeepRandom(io));
-    try testing.expect(ProbabilisticSampler.initFromPercentage(100).shouldKeepRandom(null));
     try testing.expect(!ProbabilisticSampler.initFromPercentage(0).shouldKeepRandom(io));
-    try testing.expect(!ProbabilisticSampler.initFromPercentage(0).shouldKeepRandom(null));
-
-    // Null io fails open to keep for a sampling percentage
-    try testing.expect(ProbabilisticSampler.initFromPercentage(50).shouldKeepRandom(null));
 
     // Independent random decisions approximate the configured percentage
     const sampler = ProbabilisticSampler.initFromPercentage(50);
