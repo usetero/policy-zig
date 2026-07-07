@@ -250,6 +250,10 @@ pub const PolicyRegistry = struct {
     // Event bus for observability
     bus: *EventBus,
 
+    // Optional extension resolver (v1.6.0), consulted at snapshot compile
+    // time to resolve/validate each policy's extension declarations.
+    extension_resolver: ?policy_types.ExtensionResolver,
+
     /// Subscription context for provider callbacks.
     /// Allocated with stable address so the callback pointer remains valid.
     const Subscription = struct {
@@ -284,7 +288,16 @@ pub const PolicyRegistry = struct {
             .policy_errors = .empty,
             .subscriptions = .empty,
             .bus = bus,
+            .extension_resolver = null,
         };
+    }
+
+    /// Wire an extension resolver (v1.6.0), consulted at snapshot compile
+    /// time. Call before providers deliver policies; takes effect on the next
+    /// recompile. Without one, declared extensions are skipped (fail-open)
+    /// and reported via PolicySyncStatus.errors.
+    pub fn setExtensionResolver(self: *PolicyRegistry, resolver: policy_types.ExtensionResolver) void {
+        self.extension_resolver = resolver;
     }
 
     /// Subscribe a provider to the registry in one step: hand it our stats
@@ -663,6 +676,7 @@ pub const PolicyRegistry = struct {
             self.bus,
             policies_slice,
             &comp_errors,
+            self.extension_resolver,
         );
         errdefer log_idx.deinit();
 
@@ -671,6 +685,7 @@ pub const PolicyRegistry = struct {
             self.bus,
             policies_slice,
             &comp_errors,
+            self.extension_resolver,
         );
         errdefer metric_idx.deinit();
 
@@ -679,6 +694,7 @@ pub const PolicyRegistry = struct {
             self.bus,
             policies_slice,
             &comp_errors,
+            self.extension_resolver,
         );
         errdefer trace_idx.deinit();
 

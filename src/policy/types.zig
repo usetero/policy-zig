@@ -23,6 +23,95 @@ pub const TelemetryType = enum {
 };
 
 // =============================================================================
+// Extensions (spec v1.6.0) — dispatch types
+// =============================================================================
+
+/// Which disjoint slice of the telemetry stream a record fell into, relative
+/// to one policy: matched and kept, matched but removed by the final keep
+/// outcome (which another policy may have caused), or unmatched. The proto
+/// ExtensionMode values MATCHED and ALL are unions over these, resolved to an
+/// ExtensionSliceSet at snapshot compile time.
+pub const ExtensionSlice = enum(u2) { kept, dropped, unmatched };
+
+pub const ExtensionSliceSet = std.EnumSet(ExtensionSlice);
+
+/// Resolve a proto ExtensionMode to the slice set it selects. UNSPECIFIED
+/// and unknown future modes resolve to MATCHED, the spec default.
+pub fn extensionSliceSet(mode: proto.policy.ExtensionMode) ExtensionSliceSet {
+    return switch (mode) {
+        .EXTENSION_MODE_KEPT => .init(.{ .kept = true }),
+        .EXTENSION_MODE_DROPPED => .init(.{ .dropped = true }),
+        .EXTENSION_MODE_UNMATCHED => .init(.{ .unmatched = true }),
+        .EXTENSION_MODE_ALL => .init(.{ .kept = true, .dropped = true, .unmatched = true }),
+        .EXTENSION_MODE_MATCHED, .EXTENSION_MODE_UNSPECIFIED, _ => .init(.{ .kept = true, .dropped = true }),
+    };
+}
+
+/// One (policy, extension) pair compiled into a signal's matcher index.
+/// `handler` and `slot` are assigned by the resolver at snapshot compile time
+/// and are opaque to policy_zig — the sink that receives the binding
+/// interprets them. Dispatch never re-parses the extension declaration or
+/// compares type strings.
+pub const ExtensionBinding = struct {
+    /// Index into the signal index's policy list (matcher_index.PolicyIndex).
+    policy_index: u16,
+    /// Policy id, owned by the index (valid for the snapshot's lifetime).
+    policy_id: []const u8,
+    /// Opaque handler identifier from the resolver (e.g. an enum tag value).
+    handler: u8,
+    /// Opaque per-binding slot from the resolver (e.g. a batch index).
+    slot: u32,
+    /// Slices of the stream this binding's mode selects.
+    slices: ExtensionSliceSet,
+    /// Extension config bytes, owned by the index.
+    config: []const u8,
+};
+
+/// Result of resolving one extension declaration to a handler.
+pub const ExtensionResolution = struct {
+    handler: u8,
+    slot: u32,
+};
+
+/// Resolves and validates one extension declaration at snapshot compile time.
+/// Implemented outside policy_zig (the extensions module); policy_zig only
+/// stores the opaque resolution in the binding. Return null when the
+/// extension is unsupported or its config is invalid: per spec rule 5 the
+/// extension is skipped (fail-open) and reported via PolicySyncStatus.errors,
+/// while the policy's core match/keep/transform still applies.
+pub const ExtensionResolver = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (
+        io: std.Io,
+        ctx: *anyopaque,
+        signal: TelemetryType,
+        policy_id: []const u8,
+        extension: *const proto.policy.Extension,
+    ) ?ExtensionResolution,
+};
+
+/// Receives records selected by an extension's mode. One function pointer +
+/// ctx (the shape of the accessor primitives, not a vtable): it exists only
+/// to break the module cycle — policy_zig cannot import the extensions
+/// module that implements it.
+///
+/// Called synchronously inside `evaluate`, after the final keep outcome is
+/// known and before transforms run, so implementations observe pre-transform
+/// records. `record` is borrowed and valid ONLY for the duration of the
+/// call; implementations copy (encode) what they keep and MUST NOT block.
+pub const ExtensionSink = struct {
+    ctx: *anyopaque,
+    deliver: *const fn (
+        ctx: *anyopaque,
+        io: ?std.Io,
+        signal: TelemetryType,
+        record: *const anyopaque,
+        binding: *const ExtensionBinding,
+        slice: ExtensionSlice,
+    ) void,
+};
+
+// =============================================================================
 // Service and Provider Configuration
 // =============================================================================
 

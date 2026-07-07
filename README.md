@@ -145,6 +145,7 @@ src/
     trace_sampler.zig   # Trace sampling
     rate_limiter.zig    # Rate limiting
     hyperscan.zig       # Vectorscan/Hyperscan C bindings
+  extensions/           # Policy extensions (spec v1.6.0): s3-dump handler
   observability/        # Event bus, spans, formatters
   proto/                # Generated protobuf definitions
 ```
@@ -159,6 +160,20 @@ src/
 
 This gives O(k \* n) performance where k = unique matcher keys and n = input
 text length, independent of policy count.
+
+## Supported Extensions
+
+Per policy-spec conformance item 9, this implementation supports the following
+extension `type`/`version` pairs (see `design/extensions.md` and the
+`extensions` module):
+
+| type                  | versions | notes                                              |
+| --------------------- | -------- | -------------------------------------------------- |
+| `com.usetero/s3-dump` | 1.0.x    | batched ndjson objects via z3 S3 client, no retry queue |
+
+Extensions declared by a policy but not supported (or with an unresolvable
+target) are skipped fail-open and reported via `PolicySyncStatus.errors`; the
+policy's core match/keep/transform still applies.
 
 ## Task Commands
 

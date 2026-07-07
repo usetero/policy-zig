@@ -878,6 +878,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         /// policies are compiled without validation (used by direct build()
         /// callers such as unit tests).
         errors: ?*CompilationErrors,
+        /// Optional resolver for policy extensions (v1.6.0). When null, any
+        /// declared extension is skipped and reported (fail-open).
+        extension_resolver: ?policy_types.ExtensionResolver,
         patterns_by_key: std.HashMap(
             MatcherKeyT,
             PatternsPerKey,
@@ -886,6 +889,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         ),
         policy_info_list: std.ArrayList(PolicyInfo),
         typed_checks_list: std.ArrayList(TypedCheckT),
+        extension_bindings_list: std.ArrayList(policy_types.ExtensionBinding),
         path_storage: std.ArrayList([]const []const u8),
         policy_id_storage: std.ArrayList([]const u8),
         policy_index: PolicyIndex,
@@ -903,12 +907,14 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             temp_allocator: std.mem.Allocator,
             bus: *EventBus,
             errors: ?*CompilationErrors,
+            extension_resolver: ?policy_types.ExtensionResolver,
         ) Self {
             return .{
                 .allocator = allocator,
                 .temp_allocator = temp_allocator,
                 .bus = bus,
                 .errors = errors,
+                .extension_resolver = extension_resolver,
                 .patterns_by_key = std.HashMap(
                     MatcherKeyT,
                     PatternsPerKey,
@@ -917,6 +923,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 ).init(temp_allocator),
                 .policy_info_list = .empty,
                 .typed_checks_list = .empty,
+                .extension_bindings_list = .empty,
                 .path_storage = .empty,
                 .policy_id_storage = .empty,
                 .policy_index = 0,
@@ -997,6 +1004,47 @@ fn IndexBuilder(comptime T: TelemetryType) type {
 
             const keep_value = parseKeepValue(target);
             try self.storePolicyInfo(policy, target, keep_value, global_index);
+            try self.compileExtensions(policy);
+        }
+
+        /// Compile the policy's extension declarations into bindings (v1.6.0).
+        /// Fail-open per spec rule 5: an extension that cannot be resolved (no
+        /// resolver wired, unsupported type/version, invalid config) is skipped
+        /// and reported WITHOUT invalidating the policy — its core
+        /// match/keep/transform still applies. Must run after storePolicyInfo
+        /// so the binding can reference the stored policy info.
+        fn compileExtensions(self: *Self, policy: *const Policy) !void {
+            if (policy.extensions.items.len == 0) return;
+            const info = &self.policy_info_list.items[self.policy_info_list.items.len - 1];
+            for (policy.extensions.items) |*ext| {
+                const resolution: ?policy_types.ExtensionResolution = blk: {
+                    const r = self.extension_resolver orelse break :blk null;
+                    break :blk r.resolve(self.bus.io, r.ctx, T, policy.id, ext);
+                };
+                const resolved = resolution orelse {
+                    if (self.errors) |sink| {
+                        try sink.addFmt(
+                            @tagName(T) ++ ": extension \"{s}\" unsupported or invalid; skipped",
+                            policy.id,
+                            .{ext.type},
+                        );
+                    }
+                    continue;
+                };
+                // Config bytes go into the index's owned-string storage so the
+                // binding stays valid for the snapshot's lifetime regardless of
+                // registry-side policy memory churn (same treatment as ids).
+                const config_copy = try self.allocator.dupe(u8, ext.config);
+                try self.policy_id_storage.append(self.allocator, config_copy);
+                try self.extension_bindings_list.append(self.temp_allocator, .{
+                    .policy_index = info.index,
+                    .policy_id = info.id,
+                    .handler = resolved.handler,
+                    .slot = resolved.slot,
+                    .slices = policy_types.extensionSliceSet(ext.mode),
+                    .config = config_copy,
+                });
+            }
         }
 
         /// Record a compilation error for the policy being compiled: marks it
@@ -1573,6 +1621,10 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const typed_checks = try self.allocator.dupe(TypedCheckT, self.typed_checks_list.items);
             // Free the builder's backing storage; the items are now in `typed_checks`.
             self.typed_checks_list.deinit(self.allocator);
+            const extension_bindings = try self.allocator.dupe(
+                policy_types.ExtensionBinding,
+                self.extension_bindings_list.items,
+            );
 
             return IndexT{
                 .allocator = self.allocator,
@@ -1581,6 +1633,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .policies_with_negation = policies_with_negation,
                 .matcher_keys = matcher_keys,
                 .typed_checks = typed_checks,
+                .extension_bindings = extension_bindings,
                 .path_storage = self.path_storage,
                 .policy_id_storage = self.policy_id_storage,
                 .bus = self.bus,
@@ -1605,6 +1658,7 @@ pub const LogMatcherIndex = struct {
     policies_with_negation: []PolicyIndex,
     matcher_keys: []LogMatcherKey,
     typed_checks: []TypedCheckType(.log),
+    extension_bindings: []policy_types.ExtensionBinding,
     path_storage: std.ArrayList([]const []const u8),
     policy_id_storage: std.ArrayList([]const u8),
     bus: *EventBus,
@@ -1620,6 +1674,7 @@ pub const LogMatcherIndex = struct {
         bus: *EventBus,
         policies_slice: []const Policy,
         errors: ?*CompilationErrors,
+        extension_resolver: ?policy_types.ExtensionResolver,
     ) !LogMatcherIndex {
         const started_event: MatcherIndexBuildStarted = .{
             .policy_count = policies_slice.len,
@@ -1634,7 +1689,7 @@ pub const LogMatcherIndex = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        var builder = IndexBuilder(.log).init(allocator, arena.allocator(), bus, errors);
+        var builder = IndexBuilder(.log).init(allocator, arena.allocator(), bus, errors, extension_resolver);
 
         for (policies_slice, 0..) |*policy, i| {
             try builder.processPolicy(policy, @intCast(i));
@@ -1684,6 +1739,10 @@ pub const LogMatcherIndex = struct {
         return self.typed_checks;
     }
 
+    pub fn getExtensionBindings(self: *const LogMatcherIndex) []const policy_types.ExtensionBinding {
+        return self.extension_bindings;
+    }
+
     pub fn isEmpty(self: *const LogMatcherIndex) bool {
         return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
     }
@@ -1731,6 +1790,7 @@ pub const LogMatcherIndex = struct {
             }
         }
         self.allocator.free(self.typed_checks);
+        self.allocator.free(self.extension_bindings);
 
         for (self.path_storage.items) |path| {
             for (path) |segment| {
@@ -1763,6 +1823,7 @@ pub const MetricMatcherIndex = struct {
     policies_with_negation: []PolicyIndex,
     matcher_keys: []MetricMatcherKey,
     typed_checks: []TypedCheckType(.metric),
+    extension_bindings: []policy_types.ExtensionBinding,
     path_storage: std.ArrayList([]const []const u8),
     policy_id_storage: std.ArrayList([]const u8),
     bus: *EventBus,
@@ -1774,6 +1835,7 @@ pub const MetricMatcherIndex = struct {
         bus: *EventBus,
         policies_slice: []const Policy,
         errors: ?*CompilationErrors,
+        extension_resolver: ?policy_types.ExtensionResolver,
     ) !MetricMatcherIndex {
         const started_event: MatcherIndexBuildStarted = .{
             .policy_count = policies_slice.len,
@@ -1788,7 +1850,7 @@ pub const MetricMatcherIndex = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        var builder = IndexBuilder(.metric).init(allocator, arena.allocator(), bus, errors);
+        var builder = IndexBuilder(.metric).init(allocator, arena.allocator(), bus, errors, extension_resolver);
 
         for (policies_slice, 0..) |*policy, i| {
             try builder.processPolicy(policy, @intCast(i));
@@ -1838,6 +1900,10 @@ pub const MetricMatcherIndex = struct {
         return self.typed_checks;
     }
 
+    pub fn getExtensionBindings(self: *const MetricMatcherIndex) []const policy_types.ExtensionBinding {
+        return self.extension_bindings;
+    }
+
     pub fn isEmpty(self: *const MetricMatcherIndex) bool {
         return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
     }
@@ -1880,6 +1946,7 @@ pub const MetricMatcherIndex = struct {
             }
         }
         self.allocator.free(self.typed_checks);
+        self.allocator.free(self.extension_bindings);
 
         for (self.path_storage.items) |path| {
             for (path) |segment| {
@@ -1912,6 +1979,7 @@ pub const TraceMatcherIndex = struct {
     policies_with_negation: []PolicyIndex,
     matcher_keys: []TraceMatcherKey,
     typed_checks: []TypedCheckType(.trace),
+    extension_bindings: []policy_types.ExtensionBinding,
     path_storage: std.ArrayList([]const []const u8),
     policy_id_storage: std.ArrayList([]const u8),
     bus: *EventBus,
@@ -1923,6 +1991,7 @@ pub const TraceMatcherIndex = struct {
         bus: *EventBus,
         policies_slice: []const Policy,
         errors: ?*CompilationErrors,
+        extension_resolver: ?policy_types.ExtensionResolver,
     ) !TraceMatcherIndex {
         const started_event: MatcherIndexBuildStarted = .{
             .policy_count = policies_slice.len,
@@ -1937,7 +2006,7 @@ pub const TraceMatcherIndex = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        var builder = IndexBuilder(.trace).init(allocator, arena.allocator(), bus, errors);
+        var builder = IndexBuilder(.trace).init(allocator, arena.allocator(), bus, errors, extension_resolver);
 
         for (policies_slice, 0..) |*policy, i| {
             try builder.processPolicy(policy, @intCast(i));
@@ -1987,6 +2056,10 @@ pub const TraceMatcherIndex = struct {
         return self.typed_checks;
     }
 
+    pub fn getExtensionBindings(self: *const TraceMatcherIndex) []const policy_types.ExtensionBinding {
+        return self.extension_bindings;
+    }
+
     pub fn isEmpty(self: *const TraceMatcherIndex) bool {
         return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
     }
@@ -2029,6 +2102,7 @@ pub const TraceMatcherIndex = struct {
             }
         }
         self.allocator.free(self.typed_checks);
+        self.allocator.free(self.extension_bindings);
 
         for (self.path_storage.items) |path| {
             for (path) |segment| {
@@ -2353,7 +2427,7 @@ test "LogMatcherIndex: build empty" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init(std.Options.debug_io);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{}, null, null);
     defer index.deinit();
 
     try testing.expect(index.isEmpty());
@@ -2365,7 +2439,7 @@ test "MetricMatcherIndex: build empty" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init(std.Options.debug_io);
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{}, null, null);
     defer index.deinit();
 
     try testing.expect(index.isEmpty());
@@ -2391,7 +2465,7 @@ test "LogMatcherIndex: build with single policy" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2428,7 +2502,7 @@ test "LogMatcherIndex: invalid regex policy is skipped (inert) and reported" {
     var errors = CompilationErrors.init(allocator);
     defer errors.deinit();
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, &errors);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, &errors, null);
     defer index.deinit();
 
     // Inert: not compiled into the index at all.
@@ -2467,7 +2541,7 @@ test "LogMatcherIndex: empty attribute path is skipped (inert) and reported" {
     var errors = CompilationErrors.init(allocator);
     defer errors.deinit();
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, &errors);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, &errors, null);
     defer index.deinit();
 
     try testing.expectEqual(@as(usize, 0), index.getPolicyCount());
@@ -2514,7 +2588,7 @@ test "LogMatcherIndex: valid and invalid policies in one batch — valid still c
     var errors = CompilationErrors.init(allocator);
     defer errors.deinit();
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{ valid, bad_keep }, &errors);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{ valid, bad_keep }, &errors, null);
     defer index.deinit();
 
     // Valid policy compiled; malformed-keep policy is inert and reported.
@@ -2543,7 +2617,7 @@ test "LogMatcherIndex: invalid policy is inert even without an error sink" {
     };
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expectEqual(@as(usize, 0), index.getPolicyCount());
@@ -2568,7 +2642,7 @@ test "MetricMatcherIndex: build with single policy" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2602,7 +2676,7 @@ test "LogMatcherIndex: build with keyed matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2637,7 +2711,7 @@ test "LogMatcherIndex: negated matcher creates negated database" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2668,7 +2742,7 @@ test "LogMatcherIndex: scan database" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } });
@@ -2705,7 +2779,7 @@ test "LogMatcherIndex: exists=true matcher is bucketed into exists_entries" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     // exists matchers no longer compile to Hyperscan patterns; they live in
@@ -2746,7 +2820,7 @@ test "LogMatcherIndex: exists=false matcher creates negated pattern" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     // exists=false lives in exists_entries with negate=true; no Hyperscan DB.
@@ -2791,7 +2865,7 @@ test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
         },
     };
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     // The index should have registered one policy with one matcher
@@ -2837,7 +2911,7 @@ test "TraceMatcherIndex: span_kind null match with second resource_attribute mat
         },
     };
 
-    var index = try TraceMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try TraceMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2880,7 +2954,7 @@ test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
         },
     };
 
-    var index = try TraceMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try TraceMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2915,7 +2989,7 @@ test "MetricMatcherIndex: exists=true matcher is bucketed into exists_entries" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     // exists=true is dispatched via accessor.callExists, not Hyperscan.
@@ -2954,7 +3028,7 @@ test "MetricMatcherIndex: metric_type exists is bucketed into exists_entries" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -2993,7 +3067,7 @@ test "MetricMatcherIndex: metric_type with regex pattern" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -3036,7 +3110,7 @@ test "MetricMatcherIndex: aggregation_temporality field creates Hyperscan databa
     });
     defer policy.deinit(allocator);
 
-    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null);
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -3096,7 +3170,7 @@ test "Mixed log and metric policies: each index only gets its type" {
     const policies = &[_]Policy{ log_policy, metric_policy };
 
     // Log index should only have log policy
-    var log_index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), policies, null);
+    var log_index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), policies, null, null);
     defer log_index.deinit();
     try testing.expectEqual(@as(usize, 1), log_index.getPolicyCount());
     try testing.expectEqual(@as(usize, 1), log_index.getDatabaseCount());
@@ -3108,7 +3182,7 @@ test "Mixed log and metric policies: each index only gets its type" {
     try testing.expect(metric_in_log == null);
 
     // Metric index should only have metric policy
-    var metric_index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), policies, null);
+    var metric_index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), policies, null, null);
     defer metric_index.deinit();
     try testing.expectEqual(@as(usize, 1), metric_index.getPolicyCount());
     try testing.expectEqual(@as(usize, 1), metric_index.getDatabaseCount());
@@ -3180,7 +3254,7 @@ test "Log matcher with starts_with" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
@@ -3218,7 +3292,7 @@ test "Log matcher with ends_with" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
@@ -3256,7 +3330,7 @@ test "Log matcher with contains" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
@@ -3297,7 +3371,7 @@ test "Log matcher with exact" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
@@ -3336,7 +3410,7 @@ test "Log matcher with case_insensitive" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
@@ -3378,7 +3452,7 @@ test "Log matcher with starts_with case_insensitive" {
     });
     defer policy.deinit(allocator);
 
-    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null);
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
     defer index.deinit();
 
     const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;

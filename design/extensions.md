@@ -3,7 +3,23 @@
 Design for implementing policy-spec v1.6.0 extensions in policy-zig, and the
 first concrete extension: dumping telemetry to S3-compatible storage.
 
-Status: proposal (no code yet).
+Status: **implemented** (see `src/extensions/`, engine dispatch in
+`src/policy/policy_engine.zig`, bindings in `src/policy/matcher_index.zig`).
+Deviations from the text below, made during implementation:
+
+- The resolver seam passes `io` first (`resolve(io, ctx, signal, policy_id,
+  ext)`) per ziglint's io-ordering rule, and resolution returns an opaque
+  `{handler, slot}` pair — the slot is the s3-dump batch index, assigned at
+  compile time so dispatch is an array lookup.
+- Per-signal `encode` callbacks are registered once on `Extensions.init`
+  rather than carried in each `DeliveredRecord` (the engine passes only
+  `(signal, record ctx)` across the module seam).
+- Credentials are consumer-provided at `S3Dump.init` (no built-in env
+  discovery — z3 has none either, and the edge binary owns its env).
+- `provider_http` gains `setExtensionSyncHooks` (a two-fn seam like
+  StatsCollector) for capability advertisement + config broadcast routing.
+- All batching knobs live in `S3Dump.Options`, a plain-data struct with
+  defaults, deserializable from a config file.
 
 ## What the spec requires (v1.6.0)
 
