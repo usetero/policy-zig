@@ -287,12 +287,9 @@ pub const MetricFieldRef = union(enum) {
 
 /// A typed field value returned by the `typed_value` accessor primitive.
 ///
-/// Used by the `equals`, `gt`, `gte`, `lt`, and `lte` matchers, which need
-/// to compare against non-string values (booleans, integers, floats, bytes).
-///
-/// The default string path (`value` accessor) is still used for string-typed
-/// matchers and for `typed_value`-less accessors that fall back to
-/// `TypedValue.string` wrapping.
+/// String matchers (exact/regex/starts_with/ends_with/contains) consume the
+/// `.string` variant; the typed matchers (`equals`, `gt`, `gte`, `lt`, `lte`)
+/// compare all variants.
 ///
 /// `string` and `bytes` slices are borrowed from the consumer record and must
 /// remain valid for the duration of the `engine.evaluate` call.
@@ -313,27 +310,29 @@ pub const TypedValue = union(enum) {
 /// the engine dispatches every read and write through these function
 /// pointers, with ctx being the consumer-owned record the pointers operate on.
 ///
-/// `value` is the only required field. Optional primitives advertise consumer
-/// capability: when an `apply*` transform needs a primitive that's null, the
-/// transform no-ops (does not count toward `*_applied`) — so a consumer that
-/// doesn't wire `set` simply won't apply redact/add even if a matching policy
-/// fires.
+/// `typed_value` is the only required field. Optional primitives advertise
+/// consumer capability: when an `apply*` transform needs a primitive that's
+/// null, the transform no-ops (does not count toward `*_applied`) — so a
+/// consumer that doesn't wire `set` simply won't apply redact/add even if a
+/// matching policy fires.
 pub const LogAccessor = struct {
-    /// Read field as bytes for pattern matching.
-    /// Returns null when the field is absent OR its underlying value is not a
-    /// string. Consumers that want exists-matchers to fire on non-string
-    /// fields should wire `exists` to report presence independently.
+    /// Read a field as a typed value. This is the single read primitive:
+    /// string matchers consume the `.string` variant, the typed matchers
+    /// (`equals`/`gt`/`gte`/`lt`/`lte`) compare all variants, sampling reads
+    /// `.bytes`/`.string`, and regex redact reads `.string`.
     ///
-    /// Exception — identifier fields (`LOG_FIELD_TRACE_ID`, `LOG_FIELD_SPAN_ID`):
-    /// return the RAW id bytes here, not null. The engine hex-renders them before
-    /// matching (so hex literals in policies match), and consults this primitive,
-    /// not `typed_value`, for string matchers. Returning null hides the id from
-    /// exact/contains/regex matching.
-    value: *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8,
+    /// Identifier fields (`LOG_FIELD_TRACE_ID`, `LOG_FIELD_SPAN_ID`): return
+    /// `.bytes` with the RAW id bytes. The engine hex-renders them for string
+    /// matchers (so hex literals in policies match) and uses the raw bytes
+    /// for sampling. Returning null hides the id from matching.
+    ///
+    /// Return null when the field is absent. A present-but-wrong-type value
+    /// causes a non-match (never a runtime error) consistent with fail-open.
+    typed_value: *const fn (ctx: *const anyopaque, field: FieldRef) ?TypedValue,
 
     /// Returns true if the field is present, regardless of underlying type.
-    /// When null, the engine falls back to `value(...) != null`, preserving
-    /// the old "non-null means present" semantics.
+    /// When null, the engine falls back to `typed_value(...) != null`,
+    /// preserving the "non-null means present" semantics.
     exists: ?*const fn (ctx: *const anyopaque, field: FieldRef) bool = null,
 
     /// Upsert a field. The engine pre-checks `upsert=false` conflicts via
@@ -364,37 +363,24 @@ pub const LogAccessor = struct {
     /// Wiring this enables: log.rename.
     move: ?*const fn (ctx: *anyopaque, from: FieldRef, to: []const u8) void = null,
 
-    /// Read a field as a typed value for `equals`/`gt`/`gte`/`lt`/`lte` matchers.
-    ///
-    /// When null, the engine falls back to `value()` and treats the result as
-    /// `TypedValue.string` — typed matchers will fire only against string fields.
-    /// Override to expose int/double/bool/bytes attribute values so typed
-    /// matchers can compare against them correctly.
-    ///
-    /// Return null when the field is absent. A present-but-wrong-type value
-    /// causes a non-match (never a runtime error) consistent with fail-open.
-    typed_value: ?*const fn (ctx: *const anyopaque, field: FieldRef) ?TypedValue = null,
-
     /// Returns true if the field is present. Uses the wired `exists` primitive
-    /// when available, otherwise falls back to `value != null`.
+    /// when available, otherwise falls back to `typed_value != null`.
     pub fn callExists(self: *const LogAccessor, ctx: *const anyopaque, field: FieldRef) bool {
         if (self.exists) |f| return f(ctx, field);
-        return self.value(ctx, field) != null;
+        return self.typed_value(ctx, field) != null;
     }
 };
 
 /// Read+write interface to a metric record.
 pub const MetricAccessor = struct {
-    value: *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8,
+    /// Read a field as a typed value. See `LogAccessor.typed_value`.
+    typed_value: *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?TypedValue,
 
     exists: ?*const fn (ctx: *const anyopaque, field: MetricFieldRef) bool = null,
 
-    /// Typed read for `equals`/`gt`/`gte`/`lt`/`lte` matchers. See `LogAccessor.typed_value`.
-    typed_value: ?*const fn (ctx: *const anyopaque, field: MetricFieldRef) ?TypedValue = null,
-
     pub fn callExists(self: *const MetricAccessor, ctx: *const anyopaque, field: MetricFieldRef) bool {
         if (self.exists) |f| return f(ctx, field);
-        return self.value(ctx, field) != null;
+        return self.typed_value(ctx, field) != null;
     }
 };
 
@@ -403,26 +389,22 @@ pub const MetricAccessor = struct {
 /// writes when probabilistic sampling produces a threshold; consumers wire
 /// `set` to merge that threshold into their tracestate representation.
 pub const TraceAccessor = struct {
-    /// Read field as bytes for pattern matching; null when absent/non-string.
+    /// Read a field as a typed value. See `LogAccessor.typed_value`.
     ///
-    /// Exception — identifier fields (`TRACE_FIELD_TRACE_ID`,
-    /// `TRACE_FIELD_SPAN_ID`, `TRACE_FIELD_PARENT_SPAN_ID`): return the RAW id
-    /// bytes here, not null. The engine hex-renders them before matching and
-    /// consults this primitive, not `typed_value`, for string matchers.
-    /// Returning null hides the id from exact/contains/regex matching.
-    value: *const fn (ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8,
+    /// Identifier fields (`TRACE_FIELD_TRACE_ID`, `TRACE_FIELD_SPAN_ID`,
+    /// `TRACE_FIELD_PARENT_SPAN_ID`): return `.bytes` with the RAW id bytes;
+    /// the engine hex-renders them for string matchers and uses the raw bytes
+    /// for sampling.
+    typed_value: *const fn (ctx: *const anyopaque, field: TraceFieldRef) ?TypedValue,
 
     exists: ?*const fn (ctx: *const anyopaque, field: TraceFieldRef) bool = null,
 
     /// Wiring this enables: trace sampling threshold writeback.
     set: ?*const fn (ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void = null,
 
-    /// Typed read for `equals`/`gt`/`gte`/`lt`/`lte` matchers. See `LogAccessor.typed_value`.
-    typed_value: ?*const fn (ctx: *const anyopaque, field: TraceFieldRef) ?TypedValue = null,
-
     pub fn callExists(self: *const TraceAccessor, ctx: *const anyopaque, field: TraceFieldRef) bool {
         if (self.exists) |f| return f(ctx, field);
-        return self.value(ctx, field) != null;
+        return self.typed_value(ctx, field) != null;
     }
 };
 
