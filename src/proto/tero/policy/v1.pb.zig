@@ -122,9 +122,7 @@ pub const AttributePath = struct {
     }
 };
 
-/// Value carries a typed, non-string scalar for the `equals` matcher. String
-/// equality is expressed with the `exact` match type, so this message
-/// intentionally has no string variant.
+/// Value carries a typed scalar for the `equals` matcher.
 ///
 /// `equals` matches when the field value has the same type and value as the set
 /// variant. Integer and floating-point values are compared in a single numeric
@@ -139,14 +137,16 @@ pub const AttributePath = struct {
 /// equals: true   ->  bool_value
 /// equals: 200    ->  int_value
 /// equals: 0.5    ->  double_value
+/// equals: "foo"  ->  string_value
 ///
 /// Bytes are authored either as proto-native base64 (`bytes_value`) or, more
 /// readably, as a lowercase-hex string (`hex_value`). The two are equivalent —
 /// hex_value is decoded to bytes at policy-compile time and yields the same bytes
 /// as the corresponding bytes_value — but hex_value keeps identifiers
 /// (trace/span ids) readable in the canonical proto/JSON form instead of base64.
-/// A bare string literal (e.g. `equals: "foo"`) MUST be rejected — use `exact`
-/// for strings.
+///
+/// String equality SHOULD be authored with string_value. The older matcher-level
+/// `exact` field is deprecated and will move to reserved in a future version.
 pub const Value = struct {
     value: ?value_union = null,
 
@@ -156,6 +156,7 @@ pub const Value = struct {
         double_value,
         bytes_value,
         hex_value,
+        string_value,
     };
     pub const value_union = union(_value_case) {
         bool_value: bool,
@@ -163,12 +164,14 @@ pub const Value = struct {
         double_value: f64,
         bytes_value: []const u8,
         hex_value: []const u8,
+        string_value: []const u8,
         pub const _desc_table = .{
             .bool_value = fd(1, .{ .scalar = .bool }),
             .int_value = fd(2, .{ .scalar = .int64 }),
             .double_value = fd(3, .{ .scalar = .double }),
             .bytes_value = fd(4, .{ .scalar = .bytes }),
             .hex_value = fd(5, .{ .scalar = .string }),
+            .string_value = fd(6, .{ .scalar = .string }),
         };
     };
 

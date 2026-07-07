@@ -579,6 +579,10 @@ fn compileValue(allocator: std.mem.Allocator, v: proto.policy.Value) !?CompiledV
             }
             break :blk .{ .bytes = bytes };
         },
+        // string_value is string equality (≡ the deprecated `exact`) and is
+        // routed to the Hyperscan pattern path by addMatcher; it never
+        // compiles to a typed check. Null keeps an unrouted one fail-open.
+        .string_value => null,
     };
 }
 
@@ -1061,6 +1065,15 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                     return null;
                 },
+                // equals.string_value compiles to a Hyperscan pattern like
+                // `exact`; other equals variants are typed checks.
+                .equals => |v| if (v.value != null and v.value.? == .string_value) {
+                    const p = v.value.?.string_value;
+                    if (!self.patternCompiles(p, .exact, matcher.case_insensitive)) {
+                        try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
+                        return null;
+                    }
+                },
                 else => {},
             }
             return field_ref;
@@ -1192,24 +1205,30 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             // primitive. An invalid/unset value is silently dropped (fail-open).
             switch (m) {
                 .equals => |v| {
-                    const compiled = (try compileValue(self.allocator, v)) orelse {
-                        self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                    // equals.string_value is string equality (≡ the deprecated
+                    // `exact`, v1.6.0) and falls through to the pattern path
+                    // below, so it gets Hyperscan and case_insensitive support.
+                    const is_string = v.value != null and v.value.? == .string_value;
+                    if (!is_string) {
+                        const compiled = (try compileValue(self.allocator, v)) orelse {
+                            self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
+                            return;
+                        };
+                        // typed checks count toward required_match_count so the
+                        // policy's match threshold is still enforced.
+                        if (matcher.negate) {
+                            self.current_negated_count += 1;
+                        } else {
+                            self.current_positive_count += 1;
+                        }
+                        try self.typed_checks_list.append(self.allocator, .{
+                            .policy_index = self.policy_index,
+                            .field_ref = field_ref,
+                            .matcher = .{ .equals = compiled },
+                            .negate = matcher.negate,
+                        });
                         return;
-                    };
-                    // typed checks count toward required_match_count so the
-                    // policy's match threshold is still enforced.
-                    if (matcher.negate) {
-                        self.current_negated_count += 1;
-                    } else {
-                        self.current_positive_count += 1;
                     }
-                    try self.typed_checks_list.append(self.allocator, .{
-                        .policy_index = self.policy_index,
-                        .field_ref = field_ref,
-                        .matcher = .{ .equals = compiled },
-                        .negate = matcher.negate,
-                    });
-                    return;
                 },
                 .gt => |v| {
                     const compiled = compileNumericValue(v) orelse {
@@ -1273,11 +1292,12 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const pattern, const pattern_match_type, const negate = switch (m) {
                 .regex => |r| .{ r, match_type.regex, matcher.negate },
                 .exact => |e| .{ e, match_type.exact, matcher.negate },
+                .equals => |v| .{ v.value.?.string_value, match_type.exact, matcher.negate },
                 .exists => unreachable,
                 .starts_with => |s| .{ s, match_type.starts_with, matcher.negate },
                 .ends_with => |s| .{ s, match_type.ends_with, matcher.negate },
                 .contains => |s| .{ s, match_type.contains, matcher.negate },
-                .equals, .gt, .gte, .lt, .lte => unreachable,
+                .gt, .gte, .lt, .lte => unreachable,
             };
 
             if (pattern.len == 0) {

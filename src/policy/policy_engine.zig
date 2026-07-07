@@ -730,7 +730,13 @@ pub const PolicyEngine = struct {
                             break :blk if (sr.keep) FilterDecision.keep else FilterDecision.drop;
                         }
 
-                        // Non-trace: simple keep/drop from shouldKeep
+                        // Non-trace (log): with no sample_key (or a missing/empty
+                        // key value) the spec requires an independent random
+                        // decision per record, so empty input takes the random
+                        // path instead of failing closed.
+                        if (input.len == 0) {
+                            break :blk if (s.shouldKeepRandom(io)) FilterDecision.keep else FilterDecision.drop;
+                        }
                         break :blk if (s.shouldKeep(input)) FilterDecision.keep else FilterDecision.drop;
                     }
                     break :blk applyKeepValue(io, policy_info);
@@ -2246,6 +2252,76 @@ test "typed: negated equals" {
     defer ctx500.deinit();
     _ = try ctx500.withInt("status", 500);
     try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx500, &policy_id_buf).decision);
+}
+
+test "typed: equals string_value matches like exact (v1.6.0)" {
+    const allocator = testing.allocator;
+
+    const sv: proto.policy.Value = .{ .value = .{ .string_value = try allocator.dupe(u8, "checkout-api") } };
+    var policy = try makeLogTypedPolicy(allocator, "drop-checkout", "service.name", .{ .equals = sv }, "none");
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("service.name", "checkout-api");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
+
+    // Prefix is not equality
+    var ctx2 = TypedLogContext.init(allocator);
+    defer ctx2.deinit();
+    _ = try ctx2.withString("service.name", "checkout-api-v2");
+    try testing.expectEqual(FilterDecision.unset, evalTypedLog(&engine, &ctx2, &policy_id_buf).decision);
+
+    // Different case does not match without case_insensitive
+    var ctx3 = TypedLogContext.init(allocator);
+    defer ctx3.deinit();
+    _ = try ctx3.withString("service.name", "CHECKOUT-API");
+    try testing.expectEqual(FilterDecision.unset, evalTypedLog(&engine, &ctx3, &policy_id_buf).decision);
+}
+
+test "typed: equals string_value with case_insensitive (v1.6.0)" {
+    const allocator = testing.allocator;
+
+    var attr_path: proto.policy.AttributePath = .{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "env"));
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "drop-prod"),
+        .name = try allocator.dupe(u8, "drop-prod"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = attr_path },
+        .match = .{ .equals = .{ .value = .{ .string_value = try allocator.dupe(u8, "production") } } },
+        .case_insensitive = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var ctx = TypedLogContext.init(allocator);
+    defer ctx.deinit();
+    _ = try ctx.withString("env", "PRODUCTION");
+    try testing.expectEqual(FilterDecision.drop, evalTypedLog(&engine, &ctx, &policy_id_buf).decision);
 }
 
 test "evaluate: policy with keep=all and no transform" {
@@ -4479,12 +4555,54 @@ test "PolicyEngine: sample_key missing field falls back to default" {
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
-    // Should still work (falls back to context pointer hash)
+    // Missing key value falls back to the independent random default
     var log1: TestLogContext = .{ .message = "test message" };
     const result = evalTestLog(&engine, &log1, &policy_id_buf);
 
-    // Should get a decision (either keep or drop based on hash)
+    // Should get a decision (either keep or drop, randomly)
     try testing.expect(result.decision == .keep or result.decision == .drop);
+}
+
+test "PolicyEngine: percentage sampling without sample_key is independent random (v1.6.0)" {
+    const allocator = testing.allocator;
+
+    // 50% log sampling with no sample_key: each record must get an
+    // independent random decision — previously this failed closed and
+    // dropped everything.
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "sample-unkeyed"),
+        .name = try allocator.dupe(u8, "sample-unkeyed"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "^.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var kept: u32 = 0;
+    const total: u32 = 2000;
+    for (0..total) |_| {
+        var log: TestLogContext = .{ .message = "same message every time" };
+        if (evalTestLog(&engine, &log, &policy_id_buf).decision == .keep) kept += 1;
+    }
+
+    // Identical records must not all get the same decision, and the split
+    // should be roughly 50% (wide bounds keep this test deterministic enough).
+    const ratio = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(total));
+    try testing.expect(ratio > 0.4 and ratio < 0.6);
 }
 
 test "PolicyEngine: log resource_schema_url matching" {
