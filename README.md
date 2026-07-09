@@ -113,6 +113,7 @@ const engine = policy.PolicyEngine.init(bus, &registry);
 var policy_id_buf: [16][]const u8 = undefined;
 const result = engine.evaluate(.log, &my_log_accessor, &my_log_ctx, &policy_id_buf, .{
     .scratch = arena.allocator(),
+    .io = io,
 });
 
 // Transforms whose required primitive (set/delete/move) is unwired on the

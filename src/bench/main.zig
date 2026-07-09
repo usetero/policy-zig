@@ -155,7 +155,7 @@ const LogState = struct {
 
     pub fn run(self: *LogState, alloc: std.mem.Allocator) void {
         _ = alloc;
-        _ = self.engine.evaluate(.log, &BenchLog.accessor, &self.ctx, &self.policy_id_buf, .{});
+        _ = self.engine.evaluate(.log, &BenchLog.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
     }
 };
 
@@ -190,7 +190,7 @@ const MetricState = struct {
 
     pub fn run(self: *MetricState, alloc: std.mem.Allocator) void {
         _ = alloc;
-        _ = self.engine.evaluate(.metric, &BenchMetric.accessor, &self.ctx, &self.policy_id_buf, .{});
+        _ = self.engine.evaluate(.metric, &BenchMetric.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
     }
 };
 
@@ -225,7 +225,7 @@ const TraceState = struct {
 
     pub fn run(self: *TraceState, alloc: std.mem.Allocator) void {
         _ = alloc;
-        _ = self.engine.evaluate(.trace, &BenchTrace.accessor, &self.ctx, &self.policy_id_buf, .{});
+        _ = self.engine.evaluate(.trace, &BenchTrace.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
     }
 };
 
