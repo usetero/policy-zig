@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/usetero/policy-zig/compare/v0.4.4...v0.5.0) (2026-07-09)
+
+
+### Features
+
+* support log sampling and remove unused method ([#76](https://github.com/usetero/policy-zig/issues/76)) ([8e5868f](https://github.com/usetero/policy-zig/commit/8e5868fee79300b6cd81c884b7a61f7ec31c1e7e))
+* update to add S3 extension ([#79](https://github.com/usetero/policy-zig/issues/79)) ([7cfa432](https://github.com/usetero/policy-zig/commit/7cfa432d1f5ec42c0f34d680c9dda8a8967542ec))
+
+
+### Bug Fixes
+
+* require io and better type checking ([#78](https://github.com/usetero/policy-zig/issues/78)) ([17bb6e3](https://github.com/usetero/policy-zig/commit/17bb6e39c4a841d929ba4bc616acdb55d43c88c8))
+
 ## [0.4.4](https://github.com/usetero/policy-zig/compare/v0.4.3...v0.4.4) (2026-07-02)
 
 
