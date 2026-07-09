@@ -146,6 +146,7 @@ src/
     trace_sampler.zig   # Trace sampling
     rate_limiter.zig    # Rate limiting
     hyperscan.zig       # Vectorscan/Hyperscan C bindings
+  extensions/           # Policy extensions (spec v1.6.0): s3-dump handler
   observability/        # Event bus, spans, formatters
   proto/                # Generated protobuf definitions
 ```
@@ -161,23 +162,83 @@ src/
 This gives O(k \* n) performance where k = unique matcher keys and n = input
 text length, independent of policy count.
 
+## Supported Extensions
+
+Per policy-spec conformance item 9, this implementation supports the following
+extension `type`/`version` pairs (see `design/extensions.md` and the
+`extensions` module):
+
+| type                  | versions | notes                                                                                      |
+| --------------------- | -------- | ------------------------------------------------------------------------------------------ |
+| `com.usetero/s3-dump` | 1.0.x    | batched ndjson objects via z3; failed uploads retried in-memory (bounded), idempotent keys |
+
+Extensions declared by a policy but not supported (or with an unresolvable
+target) are skipped fail-open and reported via `PolicySyncStatus.errors`; the
+policy's core match/keep/transform still applies.
+
+Enabling extensions in a consumer (the `extensions` module owns the handlers
+and adapts them to policy_zig's seams):
+
+```zig
+const ext = @import("extensions");
+
+// One Extensions object owns every enabled handler. Encoders are per-signal
+// because the engine hands the sink an opaque record it can't serialize.
+var exts = ext.Extensions.init(allocator, .{ .log = encodeLog });
+defer exts.deinit();
+
+// Enable s3-dump and configure targets directly on the returned handle.
+// Credentials come from the consumer (env/secrets) — never from policies.
+const s3 = exts.enableS3Dump(allocator, .{}, .{
+    .access_key_id = key,
+    .secret_access_key = secret,
+});
+try s3.addTarget(io, "eu-bucket",
+    \\{"bucket": "tero-waste", "region": "eu-west-1", "prefix": "dumps/"}
+);
+
+// One call wires the resolver (snapshot compile) + sync hooks (advertised on
+// each provider). subscribe() then pushes the hooks to every provider — the
+// HTTP provider advertises capabilities and receives broadcast targets; a
+// file provider accepts and ignores them.
+exts.register(&registry);
+try registry.subscribe(.{ .http = http_provider });
+
+// Per evaluate: pass the sink so selected records are delivered.
+_ = engine.evaluate(.log, &accessor, &record, &buf, .{
+    .io = io,
+    .extension_sink = exts.sink(),
+});
+
+// From a background loop: flush uploads and read the result as metrics.
+const r = exts.flush(io, .{});
+// r.objects_uploaded / .records_dropped / .backlog_bytes → your metrics client
+```
+
+`com.usetero/s3-dump`'s upload path is verified two ways: `zig build test`
+(covered by `task test`) includes a hermetic test against an in-process HTTP
+stub — no network or docker needed — and `task test:s3-e2e` spins up a real
+MinIO container via docker and round-trips an upload through it.
+
 ## Task Commands
 
 This project uses [Task](https://taskfile.dev/) for common operations:
 
-| Command              | Description                                      |
-| -------------------- | ------------------------------------------------ |
-| `task`               | Build (debug)                                    |
-| `task test`          | Run all tests                                    |
-| `task build:release` | Build with ReleaseFast                           |
-| `task build:safe`    | Build with ReleaseSafe                           |
-| `task format`        | Format source files                              |
-| `task format:check`  | Check formatting                                 |
-| `task lint`          | Run linting checks                               |
-| `task clean`         | Clean build artifacts                            |
-| `task do`            | Run all pre-commit checks (format + lint + test) |
-| `task signoff`       | Full signoff (do + build:safe + gh signoff)      |
-| `task ci:setup`      | Install CI/dev dependencies                      |
+| Command              | Description                                                     |
+| -------------------- | --------------------------------------------------------------- |
+| `task`               | Build (debug)                                                   |
+| `task test`          | Run all tests                                                   |
+| `task test:s3-e2e`   | Real-storage s3-dump smoke test against MinIO (requires docker) |
+| `task bench:s3`      | s3-dump scale benchmarks against MinIO (requires docker)        |
+| `task build:release` | Build with ReleaseFast                                          |
+| `task build:safe`    | Build with ReleaseSafe                                          |
+| `task format`        | Format source files                                             |
+| `task format:check`  | Check formatting                                                |
+| `task lint`          | Run linting checks                                              |
+| `task clean`         | Clean build artifacts                                           |
+| `task do`            | Run all pre-commit checks (format + lint + test)                |
+| `task signoff`       | Full signoff (do + build:safe + gh signoff)                     |
+| `task ci:setup`      | Install CI/dev dependencies                                     |
 
 ## License
 

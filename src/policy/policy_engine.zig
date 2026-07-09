@@ -220,6 +220,12 @@ pub const EvaluateOptions = struct {
     /// Required — without it, rate limiting and unkeyed percentage sampling
     /// cannot make a real decision, so there is no safe default to degrade to.
     io: std.Io,
+    /// Extension dispatch sink (v1.6.0). When set and the snapshot compiled
+    /// extension bindings, each record is classified per binding
+    /// (kept/dropped/unmatched against the final keep outcome) and selected
+    /// records are handed to the sink after keep resolution, before
+    /// transforms. Null costs a single branch.
+    extension_sink: ?policy_types.ExtensionSink = null,
 };
 
 // =============================================================================
@@ -372,6 +378,30 @@ pub const PolicyEngine = struct {
 
         // Record hit/miss stats using lock-free atomics
         self.recordMatchedPolicyStats(snapshot, &match_state);
+
+        // Extension dispatch (v1.6.0): classify this record for every compiled
+        // (policy, extension) binding against the final keep outcome and hand
+        // selected records to the sink. Runs after keep resolution and BEFORE
+        // transforms (and before the drop return below — `mode: dropped` is
+        // the flagship use), so sinks observe pre-transform records. The
+        // record is borrowed only for the duration of each deliver call.
+        if (options.extension_sink) |sink| {
+            const bindings = index.getExtensionBindings();
+            const kept = match_state.decision != .drop;
+            for (bindings) |*binding| {
+                const info = index.getPolicyByIndex(binding.policy_index) orelse continue;
+                // A disabled policy's extensions are inactive with it.
+                if (!info.enabled) continue;
+                const matched = scan_state.match_counts[binding.policy_index] == info.required_match_count;
+                const slice: policy_types.ExtensionSlice = if (matched)
+                    (if (kept) .kept else .dropped)
+                else
+                    .unmatched;
+                if (binding.slices.contains(slice)) {
+                    sink.deliver(sink.ctx, options.io, T, ctx, binding, slice);
+                }
+            }
+        }
 
         if (match_state.decision == .drop) {
             return .dropped;
@@ -5289,4 +5319,860 @@ test "PolicyEngine: mixed signal policies scope stats to own signal type" {
     // Policy 2 (drop-health-spans): should have exactly 1 hit from the trace eval
     const trace_stats = snapshot.getStats(2).?;
     try testing.expectEqual(@as(i64, 1), trace_stats.hits.load(.monotonic));
+}
+
+// =============================================================================
+// Extension dispatch tests (v1.6.0)
+// =============================================================================
+
+/// Test resolver: accepts extensions of type "test/record", assigns handler 7
+/// and sequential slots; anything else is unsupported (returns null).
+const TestExtensionResolver = struct {
+    next_slot: u32 = 0,
+
+    fn resolveFn(
+        io: std.Io,
+        ctx_ptr: *anyopaque,
+        signal: TelemetryType,
+        policy_id: []const u8,
+        extension: *const proto.policy.Extension,
+    ) ?policy_types.ExtensionResolution {
+        _ = io;
+        _ = signal;
+        _ = policy_id;
+        const self: *TestExtensionResolver = @ptrCast(@alignCast(ctx_ptr));
+        if (!std.mem.eql(u8, extension.type, "test/record")) return null;
+        defer self.next_slot += 1;
+        return .{ .handler = 7, .slot = self.next_slot };
+    }
+
+    fn resolver(self: *TestExtensionResolver) policy_types.ExtensionResolver {
+        return .{ .ctx = self, .resolve = resolveFn };
+    }
+};
+
+/// Test sink: records every delivery. Policy ids are duped because they are
+/// only guaranteed valid for the snapshot's lifetime.
+const RecordingExtensionSink = struct {
+    const Delivery = struct {
+        policy_id: []const u8,
+        handler: u8,
+        slot: u32,
+        slice: policy_types.ExtensionSlice,
+    };
+
+    allocator: std.mem.Allocator,
+    deliveries: std.ArrayList(Delivery) = .empty,
+
+    fn deinit(self: *RecordingExtensionSink) void {
+        defer self.* = undefined;
+        for (self.deliveries.items) |d| self.allocator.free(d.policy_id);
+        self.deliveries.deinit(self.allocator);
+    }
+
+    fn deliverFn(
+        ctx_ptr: *anyopaque,
+        io: ?std.Io,
+        signal: TelemetryType,
+        record: *const anyopaque,
+        binding: *const policy_types.ExtensionBinding,
+        slice: policy_types.ExtensionSlice,
+    ) void {
+        _ = io;
+        _ = signal;
+        _ = record;
+        const self: *RecordingExtensionSink = @ptrCast(@alignCast(ctx_ptr));
+        const id = self.allocator.dupe(u8, binding.policy_id) catch return;
+        self.deliveries.append(self.allocator, .{
+            .policy_id = id,
+            .handler = binding.handler,
+            .slot = binding.slot,
+            .slice = slice,
+        }) catch self.allocator.free(id);
+    }
+
+    fn sink(self: *RecordingExtensionSink) policy_types.ExtensionSink {
+        return .{ .ctx = self, .deliver = deliverFn };
+    }
+};
+
+fn makeExtensionLogPolicy(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    pattern: []const u8,
+    keep: []const u8,
+    ext_type: []const u8,
+    mode: proto.policy.ExtensionMode,
+) !Policy {
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, id),
+        .name = try allocator.dupe(u8, id),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, keep),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, pattern) },
+    });
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, ext_type),
+        .version = try allocator.dupe(u8, "1.0.0"),
+        .config = try allocator.dupe(u8, "cfg-bytes"),
+        .mode = mode,
+    });
+    return policy;
+}
+
+fn evalTestLogWithSink(
+    engine: *const PolicyEngine,
+    ctx: *TestLogContext,
+    policy_id_buf: [][]const u8,
+    sink: policy_types.ExtensionSink,
+) PolicyResult {
+    return engine.evaluate(.log, &TestLogContext.accessor, ctx, policy_id_buf, .{
+        .io = std.Options.debug_io,
+        .extension_sink = sink,
+    });
+}
+
+test "extensions: mode dropped delivers matched-and-dropped records only" {
+    const allocator = testing.allocator;
+
+    var policy = try makeExtensionLogPolicy(
+        allocator,
+        "dump-waste",
+        "^drop",
+        "none",
+        "test/record",
+        .EXTENSION_MODE_DROPPED,
+    );
+    defer policy.deinit(allocator);
+
+    var res: TestExtensionResolver = .{};
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(res.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+    var rec: RecordingExtensionSink = .{ .allocator = allocator };
+    defer rec.deinit();
+
+    // Matched and dropped: delivered with slice .dropped.
+    var log1: TestLogContext = .{ .message = "drop me" };
+    const r1 = evalTestLogWithSink(&engine, &log1, &policy_id_buf, rec.sink());
+    try testing.expectEqual(FilterDecision.drop, r1.decision);
+    try testing.expectEqual(@as(usize, 1), rec.deliveries.items.len);
+    try testing.expectEqual(policy_types.ExtensionSlice.dropped, rec.deliveries.items[0].slice);
+    try testing.expectEqualStrings("dump-waste", rec.deliveries.items[0].policy_id);
+    try testing.expectEqual(@as(u8, 7), rec.deliveries.items[0].handler);
+
+    // Unmatched: mode dropped does not select unmatched records.
+    var log2: TestLogContext = .{ .message = "keep me" };
+    _ = evalTestLogWithSink(&engine, &log2, &policy_id_buf, rec.sink());
+    try testing.expectEqual(@as(usize, 1), rec.deliveries.items.len);
+}
+
+test "extensions: default mode (unspecified) selects matched, kept and dropped" {
+    const allocator = testing.allocator;
+
+    var policy = try makeExtensionLogPolicy(
+        allocator,
+        "observe",
+        "payment",
+        "all",
+        "test/record",
+        .EXTENSION_MODE_UNSPECIFIED,
+    );
+    defer policy.deinit(allocator);
+
+    var res: TestExtensionResolver = .{};
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(res.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+    var rec: RecordingExtensionSink = .{ .allocator = allocator };
+    defer rec.deinit();
+
+    // Matched and kept → delivered as .kept.
+    var log1: TestLogContext = .{ .message = "payment ok" };
+    const r1 = evalTestLogWithSink(&engine, &log1, &policy_id_buf, rec.sink());
+    try testing.expectEqual(FilterDecision.keep, r1.decision);
+    try testing.expectEqual(@as(usize, 1), rec.deliveries.items.len);
+    try testing.expectEqual(policy_types.ExtensionSlice.kept, rec.deliveries.items[0].slice);
+
+    // Unmatched → not selected by MATCHED.
+    var log2: TestLogContext = .{ .message = "healthcheck" };
+    _ = evalTestLogWithSink(&engine, &log2, &policy_id_buf, rec.sink());
+    try testing.expectEqual(@as(usize, 1), rec.deliveries.items.len);
+}
+
+test "extensions: mode all delivers unmatched records" {
+    const allocator = testing.allocator;
+
+    var policy = try makeExtensionLogPolicy(allocator, "mirror", "payment", "all", "test/record", .EXTENSION_MODE_ALL);
+    defer policy.deinit(allocator);
+
+    var res: TestExtensionResolver = .{};
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(res.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+    var rec: RecordingExtensionSink = .{ .allocator = allocator };
+    defer rec.deinit();
+
+    var log1: TestLogContext = .{ .message = "healthcheck" };
+    _ = evalTestLogWithSink(&engine, &log1, &policy_id_buf, rec.sink());
+    try testing.expectEqual(@as(usize, 1), rec.deliveries.items.len);
+    try testing.expectEqual(policy_types.ExtensionSlice.unmatched, rec.deliveries.items[0].slice);
+}
+
+test "extensions: dropped slice reflects final outcome across policies" {
+    const allocator = testing.allocator;
+
+    // Policy A drops payment logs; policy B keeps them but wants the waste.
+    // B's extension must see the record as .dropped because the FINAL pipeline
+    // outcome (most restrictive across all policies) is drop.
+    var drop_policy: Policy = .{
+        .id = try allocator.dupe(u8, "a-drop"),
+        .name = try allocator.dupe(u8, "a-drop"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "payment") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    var dump_policy = try makeExtensionLogPolicy(
+        allocator,
+        "b-dump",
+        "payment",
+        "all",
+        "test/record",
+        .EXTENSION_MODE_DROPPED,
+    );
+    defer dump_policy.deinit(allocator);
+
+    var res: TestExtensionResolver = .{};
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(res.resolver());
+    try registry.updatePolicies(&.{ drop_policy, dump_policy }, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+    var rec: RecordingExtensionSink = .{ .allocator = allocator };
+    defer rec.deinit();
+
+    var log1: TestLogContext = .{ .message = "payment failed" };
+    const r1 = evalTestLogWithSink(&engine, &log1, &policy_id_buf, rec.sink());
+    try testing.expectEqual(FilterDecision.drop, r1.decision);
+    try testing.expectEqual(@as(usize, 1), rec.deliveries.items.len);
+    try testing.expectEqualStrings("b-dump", rec.deliveries.items[0].policy_id);
+    try testing.expectEqual(policy_types.ExtensionSlice.dropped, rec.deliveries.items[0].slice);
+}
+
+test "extensions: unsupported type is skipped fail-open and reported" {
+    const allocator = testing.allocator;
+
+    var policy = try makeExtensionLogPolicy(
+        allocator,
+        "unknown-ext",
+        "^drop",
+        "none",
+        "vendor/unknown",
+        .EXTENSION_MODE_DROPPED,
+    );
+    defer policy.deinit(allocator);
+
+    var res: TestExtensionResolver = .{};
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(res.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    // The unsupported extension is reported via the compile-error channel...
+    try testing.expect(registry.policy_errors.count() == 1);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+    var rec: RecordingExtensionSink = .{ .allocator = allocator };
+    defer rec.deinit();
+
+    // ...but the policy's core keep semantics still apply (fail-open), and no
+    // delivery happens.
+    var log1: TestLogContext = .{ .message = "drop me" };
+    const r1 = evalTestLogWithSink(&engine, &log1, &policy_id_buf, rec.sink());
+    try testing.expectEqual(FilterDecision.drop, r1.decision);
+    try testing.expectEqual(@as(usize, 0), rec.deliveries.items.len);
+}
+
+test "extensions: sink observes pre-transform record values" {
+    const allocator = testing.allocator;
+
+    var transform: proto.policy.LogTransform = .{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
+        .replacement = try allocator.dupe(u8, "[REDACTED]"),
+    });
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "redact-and-dump"),
+        .name = try allocator.dupe(u8, "redact-and-dump"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "sensitive") },
+    });
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, "test/record"),
+        .version = try allocator.dupe(u8, "1.0.0"),
+        .config = try allocator.dupe(u8, ""),
+        .mode = .EXTENSION_MODE_KEPT,
+    });
+    defer policy.deinit(allocator);
+
+    var res: TestExtensionResolver = .{};
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(res.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    // Sink that snapshots the record's `service` value at delivery time.
+    const ObservingSink = struct {
+        observed: ?[]const u8 = null,
+        buf: [64]u8 = undefined,
+
+        fn deliverFn(
+            ctx_ptr: *anyopaque,
+            io: ?std.Io,
+            signal: TelemetryType,
+            record: *const anyopaque,
+            binding: *const policy_types.ExtensionBinding,
+            slice: policy_types.ExtensionSlice,
+        ) void {
+            _ = io;
+            _ = signal;
+            _ = binding;
+            _ = slice;
+            const Self = @This();
+            const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+            const rec_ctx: *const MutableTestLogContext = @ptrCast(@alignCast(record));
+            const service = rec_ctx.service orelse return;
+            const n = @min(service.len, self.buf.len);
+            @memcpy(self.buf[0..n], service[0..n]);
+            self.observed = self.buf[0..n];
+        }
+    };
+    var obs: ObservingSink = .{};
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "sensitive data here";
+    ctx.service = "secret-service";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &MutableTestLogContext.accessor, &ctx, &policy_id_buf, .{
+        .io = std.Options.debug_io,
+        .extension_sink = .{ .ctx = &obs, .deliver = ObservingSink.deliverFn },
+    });
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // The sink saw the pre-transform value...
+    try testing.expectEqualStrings("secret-service", obs.observed.?);
+    // ...and the transform still applied afterwards.
+    try testing.expectEqualStrings("[REDACTED]", ctx.service.?);
+}
+
+// =============================================================================
+// Mock extension: spec-conformance tests (v1.6.0 §Extensions)
+// =============================================================================
+
+/// A full mock extension implementation, acting as both resolver and sink the
+/// way a real handler module would: it declares a type id, gates on semver
+/// major, validates config at resolve time, and records every delivery. Used
+/// to verify the engine's dispatch behavior matches the spec.
+const MockExtension = struct {
+    const type_id = "test/mock";
+    const handler_id: u8 = 42;
+
+    const Delivery = struct {
+        policy_id: []const u8,
+        signal: TelemetryType,
+        slice: policy_types.ExtensionSlice,
+        config: []const u8,
+        slot: u32,
+    };
+
+    allocator: std.mem.Allocator,
+    deliveries: std.ArrayList(Delivery) = .empty,
+    resolve_rejections: u32 = 0,
+    next_slot: u32 = 0,
+
+    fn deinit(self: *MockExtension) void {
+        defer self.* = undefined;
+        for (self.deliveries.items) |d| {
+            self.allocator.free(d.policy_id);
+            self.allocator.free(d.config);
+        }
+        self.deliveries.deinit(self.allocator);
+    }
+
+    fn resolver(self: *MockExtension) policy_types.ExtensionResolver {
+        return .{ .ctx = self, .resolve = resolveFn };
+    }
+
+    fn sink(self: *MockExtension) policy_types.ExtensionSink {
+        return .{ .ctx = self, .deliver = deliverFn };
+    }
+
+    fn resolveFn(
+        io: std.Io,
+        ctx_ptr: *anyopaque,
+        signal: TelemetryType,
+        policy_id: []const u8,
+        extension: *const proto.policy.Extension,
+    ) ?policy_types.ExtensionResolution {
+        _ = io;
+        _ = signal;
+        _ = policy_id;
+        const self: *MockExtension = @ptrCast(@alignCast(ctx_ptr));
+        // Spec rule 4: implementations declare which types they support.
+        if (!std.mem.eql(u8, extension.type, type_id)) {
+            self.resolve_rejections += 1;
+            return null;
+        }
+        // Semver gate: only major 1 of this mock's schema is supported.
+        const version = std.SemanticVersion.parse(extension.version) catch {
+            self.resolve_rejections += 1;
+            return null;
+        };
+        if (version.major != 1) {
+            self.resolve_rejections += 1;
+            return null;
+        }
+        // Config validation at compile time (spec: reject unsatisfiable
+        // config; the engine must skip the extension fail-open).
+        if (std.mem.eql(u8, extension.config, "invalid")) {
+            self.resolve_rejections += 1;
+            return null;
+        }
+        defer self.next_slot += 1;
+        return .{ .handler = handler_id, .slot = self.next_slot };
+    }
+
+    fn deliverFn(
+        ctx_ptr: *anyopaque,
+        io: ?std.Io,
+        signal: TelemetryType,
+        record: *const anyopaque,
+        binding: *const policy_types.ExtensionBinding,
+        slice: policy_types.ExtensionSlice,
+    ) void {
+        _ = io;
+        _ = record;
+        const self: *MockExtension = @ptrCast(@alignCast(ctx_ptr));
+        std.debug.assert(binding.handler == handler_id);
+        const id = self.allocator.dupe(u8, binding.policy_id) catch return;
+        const config = self.allocator.dupe(u8, binding.config) catch {
+            self.allocator.free(id);
+            return;
+        };
+        self.deliveries.append(self.allocator, .{
+            .policy_id = id,
+            .signal = signal,
+            .slice = slice,
+            .config = config,
+            .slot = binding.slot,
+        }) catch {
+            self.allocator.free(id);
+            self.allocator.free(config);
+        };
+    }
+
+    fn count(self: *const MockExtension, policy_id: []const u8, slice: policy_types.ExtensionSlice) usize {
+        var n: usize = 0;
+        for (self.deliveries.items) |d| {
+            if (d.slice == slice and std.mem.eql(u8, d.policy_id, policy_id)) n += 1;
+        }
+        return n;
+    }
+
+    fn total(self: *const MockExtension, policy_id: []const u8) usize {
+        var n: usize = 0;
+        for (self.deliveries.items) |d| {
+            if (std.mem.eql(u8, d.policy_id, policy_id)) n += 1;
+        }
+        return n;
+    }
+};
+
+test "mock extension: full mode x record-class dispatch matrix (spec Extension Input table)" {
+    const allocator = testing.allocator;
+    var mock: MockExtension = .{ .allocator = allocator };
+    defer mock.deinit();
+
+    // One policy per mode, all matching "payment" with keep "all", plus a
+    // separate drop policy so a record can be removed by a *different*
+    // policy's keep (the spec's final-pipeline-outcome semantics).
+    var policies: [6]Policy = undefined;
+    var initialized: usize = 0;
+    defer for (policies[0..initialized]) |*p| p.deinit(allocator);
+
+    policies[0] = .{
+        .id = try allocator.dupe(u8, "0-drop-declined"),
+        .name = try allocator.dupe(u8, "0-drop-declined"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    try policies[0].target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "declined") },
+    });
+    initialized = 1;
+
+    const mode_policies = [_]struct { id: []const u8, mode: proto.policy.ExtensionMode }{
+        .{ .id = "mode-kept", .mode = .EXTENSION_MODE_KEPT },
+        .{ .id = "mode-dropped", .mode = .EXTENSION_MODE_DROPPED },
+        .{ .id = "mode-unmatched", .mode = .EXTENSION_MODE_UNMATCHED },
+        .{ .id = "mode-matched", .mode = .EXTENSION_MODE_MATCHED },
+        .{ .id = "mode-all", .mode = .EXTENSION_MODE_ALL },
+    };
+    for (mode_policies, 1..) |mp, i| {
+        policies[i] = try makeExtensionLogPolicy(
+            allocator,
+            mp.id,
+            "payment",
+            "all",
+            MockExtension.type_id,
+            mp.mode,
+        );
+        initialized = i + 1;
+    }
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(mock.resolver());
+    try registry.updatePolicies(&policies, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Record class 1: matches the mode policies, kept.
+    var kept_log: TestLogContext = .{ .message = "payment ok" };
+    const r1 = evalTestLogWithSink(&engine, &kept_log, &policy_id_buf, mock.sink());
+    try testing.expectEqual(FilterDecision.keep, r1.decision);
+
+    // Record class 2: matches the mode policies AND the drop policy — the
+    // final outcome is drop, caused by a different policy.
+    var dropped_log: TestLogContext = .{ .message = "payment declined" };
+    const r2 = evalTestLogWithSink(&engine, &dropped_log, &policy_id_buf, mock.sink());
+    try testing.expectEqual(FilterDecision.drop, r2.decision);
+
+    // Record class 3: matches nothing.
+    var unmatched_log: TestLogContext = .{ .message = "healthcheck" };
+    const r3 = evalTestLogWithSink(&engine, &unmatched_log, &policy_id_buf, mock.sink());
+    try testing.expectEqual(FilterDecision.unset, r3.decision);
+
+    // The spec's Extension Input table, row by row:
+    // kept: matched and survived keep.
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-kept", .kept));
+    try testing.expectEqual(@as(usize, 1), mock.total("mode-kept"));
+    // dropped: matched but removed by the final keep outcome.
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-dropped", .dropped));
+    try testing.expectEqual(@as(usize, 1), mock.total("mode-dropped"));
+    // unmatched: did not match the policy's matchers.
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-unmatched", .unmatched));
+    try testing.expectEqual(@as(usize, 1), mock.total("mode-unmatched"));
+    // matched = kept + dropped, never unmatched.
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-matched", .kept));
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-matched", .dropped));
+    try testing.expectEqual(@as(usize, 2), mock.total("mode-matched"));
+    // all = every record of the signal.
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-all", .kept));
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-all", .dropped));
+    try testing.expectEqual(@as(usize, 1), mock.count("mode-all", .unmatched));
+    try testing.expectEqual(@as(usize, 8), mock.deliveries.items.len);
+}
+
+test "mock extension: multiple extensions per policy, opaque config routed per declaration" {
+    const allocator = testing.allocator;
+    var mock: MockExtension = .{ .allocator = allocator };
+    defer mock.deinit();
+
+    // Spec rule 1: a policy MAY declare multiple extensions. Each has its own
+    // mode and its own opaque config.
+    var policy = try makeExtensionLogPolicy(
+        allocator,
+        "multi-ext",
+        "payment",
+        "all",
+        MockExtension.type_id,
+        .EXTENSION_MODE_KEPT,
+    );
+    defer policy.deinit(allocator);
+    // Overwrite first extension's config, then add a second extension.
+    allocator.free(@constCast(policy.extensions.items[0].config));
+    policy.extensions.items[0].config = try allocator.dupe(u8, "cfg-A");
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, MockExtension.type_id),
+        .version = try allocator.dupe(u8, "1.2.3"),
+        .config = try allocator.dupe(u8, "cfg-B"),
+        .mode = .EXTENSION_MODE_DROPPED,
+    });
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(mock.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Kept record: only the mode-kept extension (cfg-A) fires.
+    var log1: TestLogContext = .{ .message = "payment ok" };
+    _ = evalTestLogWithSink(&engine, &log1, &policy_id_buf, mock.sink());
+    try testing.expectEqual(@as(usize, 1), mock.deliveries.items.len);
+    try testing.expectEqualStrings("cfg-A", mock.deliveries.items[0].config);
+    try testing.expectEqual(policy_types.ExtensionSlice.kept, mock.deliveries.items[0].slice);
+
+    // Re-evaluating delivers through the same binding with a stable slot.
+    const slot_a = mock.deliveries.items[0].slot;
+    var log2: TestLogContext = .{ .message = "payment ok" };
+    _ = evalTestLogWithSink(&engine, &log2, &policy_id_buf, mock.sink());
+    try testing.expectEqual(@as(usize, 2), mock.deliveries.items.len);
+    try testing.expectEqual(slot_a, mock.deliveries.items[1].slot);
+}
+
+test "mock extension: version and config validation reject fail-open at compile time" {
+    const allocator = testing.allocator;
+    var mock: MockExtension = .{ .allocator = allocator };
+    defer mock.deinit();
+
+    // Three extensions: unsupported major, invalid config, and a good one.
+    var policy = try makeExtensionLogPolicy(
+        allocator,
+        "gate-ext",
+        "^drop",
+        "none",
+        MockExtension.type_id,
+        .EXTENSION_MODE_DROPPED,
+    );
+    defer policy.deinit(allocator);
+    allocator.free(@constCast(policy.extensions.items[0].version));
+    policy.extensions.items[0].version = try allocator.dupe(u8, "2.0.0");
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, MockExtension.type_id),
+        .version = try allocator.dupe(u8, "1.0.0"),
+        .config = try allocator.dupe(u8, "invalid"),
+        .mode = .EXTENSION_MODE_DROPPED,
+    });
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, MockExtension.type_id),
+        .version = try allocator.dupe(u8, "1.0.0"),
+        .config = try allocator.dupe(u8, "good"),
+        .mode = .EXTENSION_MODE_DROPPED,
+    });
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(mock.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    // Both rejects were reported under the policy's id...
+    try testing.expectEqual(@as(u32, 2), mock.resolve_rejections);
+    try testing.expectEqual(@as(usize, 2), registry.policy_errors.get("gate-ext").?.items.len);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // ...the policy's core keep still applies (fail-open), and only the valid
+    // extension fires.
+    var log1: TestLogContext = .{ .message = "drop me" };
+    const r1 = evalTestLogWithSink(&engine, &log1, &policy_id_buf, mock.sink());
+    try testing.expectEqual(FilterDecision.drop, r1.decision);
+    try testing.expectEqual(@as(usize, 1), mock.deliveries.items.len);
+    try testing.expectEqualStrings("good", mock.deliveries.items[0].config);
+}
+
+test "mock extension: dispatch MUST NOT change the evaluation outcome" {
+    const allocator = testing.allocator;
+    var mock: MockExtension = .{ .allocator = allocator };
+    defer mock.deinit();
+
+    // keep-all policy with a transform AND a mode-all extension: the result
+    // with a sink wired must be identical to the result without one, and the
+    // transform must still apply.
+    var transform: proto.policy.LogTransform = .{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
+        .replacement = try allocator.dupe(u8, "[REDACTED]"),
+    });
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "redact-observed"),
+        .name = try allocator.dupe(u8, "redact-observed"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "sensitive") },
+    });
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, MockExtension.type_id),
+        .version = try allocator.dupe(u8, "1.0.0"),
+        .config = try allocator.dupe(u8, "cfg"),
+        .mode = .EXTENSION_MODE_ALL,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(mock.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var with_sink = MutableTestLogContext.init(allocator);
+    defer with_sink.deinit();
+    with_sink.message = "sensitive data";
+    with_sink.service = "secret-service";
+    const r_with = engine.evaluate(.log, &MutableTestLogContext.accessor, &with_sink, &policy_id_buf, .{
+        .io = std.Options.debug_io,
+        .extension_sink = mock.sink(),
+    });
+
+    var without_sink = MutableTestLogContext.init(allocator);
+    defer without_sink.deinit();
+    without_sink.message = "sensitive data";
+    without_sink.service = "secret-service";
+    var policy_id_buf2: [16][]const u8 = undefined;
+    const r_without = engine.evaluate(.log, &MutableTestLogContext.accessor, &without_sink, &policy_id_buf2, .{
+        .io = std.Options.debug_io,
+    });
+
+    // Identical decision, matches, and transform effects either way.
+    try testing.expectEqual(r_without.decision, r_with.decision);
+    try testing.expectEqual(r_without.was_transformed, r_with.was_transformed);
+    try testing.expectEqual(r_without.matched_policy_ids.len, r_with.matched_policy_ids.len);
+    try testing.expectEqualStrings("[REDACTED]", with_sink.service.?);
+    try testing.expectEqualStrings("[REDACTED]", without_sink.service.?);
+    try testing.expectEqual(@as(usize, 1), mock.deliveries.items.len);
+}
+
+test "mock extension: disabled policy's extensions are inactive" {
+    const allocator = testing.allocator;
+    var mock: MockExtension = .{ .allocator = allocator };
+    defer mock.deinit();
+
+    var policy = try makeExtensionLogPolicy(
+        allocator,
+        "disabled-ext",
+        "payment",
+        "all",
+        MockExtension.type_id,
+        .EXTENSION_MODE_ALL,
+    );
+    policy.enabled = false;
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(mock.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var log1: TestLogContext = .{ .message = "payment ok" };
+    _ = evalTestLogWithSink(&engine, &log1, &policy_id_buf, mock.sink());
+    try testing.expectEqual(@as(usize, 0), mock.deliveries.items.len);
+}
+
+test "mock extension: metric policies dispatch with the metric signal" {
+    const allocator = testing.allocator;
+    var mock: MockExtension = .{ .allocator = allocator };
+    defer mock.deinit();
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "metric-ext"),
+        .name = try allocator.dupe(u8, "metric-ext"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = true } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^cpu") },
+    });
+    try policy.extensions.append(allocator, .{
+        .type = try allocator.dupe(u8, MockExtension.type_id),
+        .version = try allocator.dupe(u8, "1.0.0"),
+        .config = try allocator.dupe(u8, "cfg"),
+        .mode = .EXTENSION_MODE_MATCHED,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    registry.setExtensionResolver(mock.resolver());
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var metric: TestMetricContext = .{ .name = "cpu.usage" };
+    const result = engine.evaluate(.metric, &TestMetricContext.accessor, &metric, &policy_id_buf, .{
+        .io = std.Options.debug_io,
+        .extension_sink = mock.sink(),
+    });
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expectEqual(@as(usize, 1), mock.deliveries.items.len);
+    try testing.expectEqual(TelemetryType.metric, mock.deliveries.items[0].signal);
+    try testing.expectEqual(policy_types.ExtensionSlice.kept, mock.deliveries.items[0].slice);
 }

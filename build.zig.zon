@@ -50,6 +50,10 @@
             .url = "git+https://github.com/hendriknielaender/zBench.git#b2b89c475e3ef1bb2bd71255c80478a82d3e0ca8",
             .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
         },
+        .z3 = .{
+            .url = "git+https://codeberg.org/fellowtraveler/z3#83b1f8d6222188f39c09966b8572bc9168813d04",
+            .hash = "z3-0.4.1-N25-cH-fAQAbj6ABBY0Bq85Kv-d7sdIvANgLCE9NCaEF",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

@@ -58,6 +58,7 @@ pub const PolicyMetadata = source.PolicyMetadata;
 pub const provider = @import("./provider.zig");
 pub const PolicyCallback = provider.PolicyCallback;
 pub const PolicyUpdate = provider.PolicyUpdate;
+pub const ExtensionSyncHooks = provider.ExtensionSyncHooks;
 
 /// Re-export registry
 pub const registry = @import("./registry.zig");
@@ -100,6 +101,14 @@ pub const MetricAccessor = types.MetricAccessor;
 pub const TraceAccessor = types.TraceAccessor;
 pub const TypedValue = types.TypedValue;
 pub const TelemetryType = types.TelemetryType;
+
+// Extensions (spec v1.6.0)
+pub const ExtensionSlice = types.ExtensionSlice;
+pub const ExtensionSliceSet = types.ExtensionSliceSet;
+pub const ExtensionBinding = types.ExtensionBinding;
+pub const ExtensionResolution = types.ExtensionResolution;
+pub const ExtensionResolver = types.ExtensionResolver;
+pub const ExtensionSink = types.ExtensionSink;
 
 // =============================================================================
 // Matcher Index (Hyperscan-based pattern matching)

@@ -9,6 +9,276 @@ const google_api = @import("../../google/api.pb.zig");
 /// import package opentelemetry.proto.common.v1
 const opentelemetry_proto_common_v1 = @import("../../opentelemetry/proto/common/v1.pb.zig");
 
+/// ExtensionMode selects which slice of the telemetry stream the engine delivers
+/// to an extension, relative to its policy. {KEPT, DROPPED, UNMATCHED} are
+/// disjoint and partition the stream; MATCHED and ALL are convenience unions.
+pub const ExtensionMode = enum(i32) {
+    EXTENSION_MODE_UNSPECIFIED = 0,
+    EXTENSION_MODE_KEPT = 1,
+    EXTENSION_MODE_DROPPED = 2,
+    EXTENSION_MODE_UNMATCHED = 3,
+    EXTENSION_MODE_MATCHED = 4,
+    EXTENSION_MODE_ALL = 5,
+    _,
+};
+
+/// Extension attaches implementation-specific behavior to a policy.
+///
+/// Implementations MUST declare which extension types they support. An extension
+/// with an unrecognized type is handled per the spec (fail-open, or reject policy
+/// load when the extension is required for the policy's behavior).
+pub const Extension = struct {
+    type: []const u8 = &.{},
+    version: []const u8 = &.{},
+    config: []const u8 = &.{},
+    mode: ExtensionMode = @enumFromInt(0),
+
+    pub const _desc_table = .{
+        .type = fd(1, .{ .scalar = .string }),
+        .version = fd(2, .{ .scalar = .string }),
+        .config = fd(3, .{ .scalar = .bytes }),
+        .mode = fd(4, .@"enum"),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Decodes the message from the JSON string, honoring pb options
+    /// (e.g. hex_bytes_fields for OTLP trace_id/span_id).
+    pub fn jsonDecodeOpts(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decodeOpts(@This(), input, options, pb_options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// ExtensionCapability declares a client's support for one extension type. The
+/// repeated `config` entries are opaque, type-defined capability descriptors —
+/// for example, the destinations the client can route to. The policy engine does
+/// not interpret them; the extension handler does. Providers use this to avoid
+/// sending policies whose extensions the client cannot satisfy.
+pub const ExtensionCapability = struct {
+    type: []const u8 = &.{},
+    min_version: []const u8 = &.{},
+    config: std.ArrayList([]const u8) = .empty,
+
+    pub const _desc_table = .{
+        .type = fd(1, .{ .scalar = .string }),
+        .min_version = fd(2, .{ .scalar = .string }),
+        .config = fd(3, .{ .repeated = .{ .scalar = .bytes } }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Decodes the message from the JSON string, honoring pb options
+    /// (e.g. hex_bytes_fields for OTLP trace_id/span_id).
+    pub fn jsonDecodeOpts(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decodeOpts(@This(), input, options, pb_options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// ExtensionConfig broadcasts opaque, type-defined configuration for one
+/// extension type to clients (via SyncResponse.extension_configs). Each `config`
+/// entry is parsed by the handler registered for `type`. For tero's s3-dump
+/// these are serialized ExtensionTargets (see tero_extensions.proto).
+pub const ExtensionConfig = struct {
+    type: []const u8 = &.{},
+    config: std.ArrayList([]const u8) = .empty,
+
+    pub const _desc_table = .{
+        .type = fd(1, .{ .scalar = .string }),
+        .config = fd(2, .{ .repeated = .{ .scalar = .bytes } }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Decodes the message from the JSON string, honoring pb options
+    /// (e.g. hex_bytes_fields for OTLP trace_id/span_id).
+    pub fn jsonDecodeOpts(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decodeOpts(@This(), input, options, pb_options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
 /// AttributePath specifies how to access an attribute value.
 ///
 /// The path is represented as an array of string segments. Each segment represents
@@ -1873,6 +2143,7 @@ pub const Policy = struct {
     created_at_unix_nano: u64 = 0,
     modified_at_unix_nano: u64 = 0,
     labels: std.ArrayList(opentelemetry_proto_common_v1.KeyValue) = .empty,
+    extensions: std.ArrayList(Extension) = .empty,
     target: ?target_union = null,
 
     pub const _target_case = enum {
@@ -1899,6 +2170,7 @@ pub const Policy = struct {
         .created_at_unix_nano = fd(5, .{ .scalar = .fixed64 }),
         .modified_at_unix_nano = fd(6, .{ .scalar = .fixed64 }),
         .labels = fd(7, .{ .repeated = .submessage }),
+        .extensions = fd(20, .{ .repeated = .submessage }),
         .target = fd(null, .{ .oneof = target_union }),
     };
 
@@ -1977,11 +2249,13 @@ pub const ClientMetadata = struct {
     supported_policy_stages: std.ArrayList(PolicyStage) = .empty,
     labels: std.ArrayList(opentelemetry_proto_common_v1.KeyValue) = .empty,
     resource_attributes: std.ArrayList(opentelemetry_proto_common_v1.KeyValue) = .empty,
+    supported_extensions: std.ArrayList(ExtensionCapability) = .empty,
 
     pub const _desc_table = .{
         .supported_policy_stages = fd(1, .{ .packed_repeated = .@"enum" }),
         .labels = fd(2, .{ .repeated = .submessage }),
         .resource_attributes = fd(3, .{ .repeated = .submessage }),
+        .supported_extensions = fd(4, .{ .repeated = .submessage }),
     };
 
     /// Encodes the message to the writer
@@ -2321,6 +2595,7 @@ pub const SyncResponse = struct {
     recommended_sync_interval_seconds: u32 = 0,
     sync_type: SyncType = @enumFromInt(0),
     error_message: []const u8 = &.{},
+    extension_configs: std.ArrayList(ExtensionConfig) = .empty,
 
     pub const _desc_table = .{
         .policies = fd(1, .{ .repeated = .submessage }),
@@ -2329,6 +2604,7 @@ pub const SyncResponse = struct {
         .recommended_sync_interval_seconds = fd(4, .{ .scalar = .uint32 }),
         .sync_type = fd(5, .@"enum"),
         .error_message = fd(6, .{ .scalar = .string }),
+        .extension_configs = fd(7, .{ .repeated = .submessage }),
     };
 
     /// Encodes the message to the writer
@@ -2411,3 +2687,175 @@ pub fn PolicyService(comptime UserDataType: type, comptime ErrorSet: type) type 
         Sync: *const fn (userdata: *UserDataType, request: SyncRequest) ErrorSet!SyncResponse,
     };
 }
+
+/// ExtensionTarget is a pre-configured, named destination an extension can route
+/// telemetry to (for example, an S3 bucket or a downstream OTLP endpoint).
+///
+/// Targets are configured out of band on the implementation, or broadcast to
+/// clients via SyncResponse.extension_configs (serialized into the s3-dump
+/// extension's config). Policies reference a target by (kind, name) via
+/// ExtensionTargetRef and never carry its configuration inline.
+pub const ExtensionTarget = struct {
+    kind: []const u8 = &.{},
+    name: []const u8 = &.{},
+    config: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .kind = fd(1, .{ .scalar = .string }),
+        .name = fd(2, .{ .scalar = .string }),
+        .config = fd(3, .{ .scalar = .bytes }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Decodes the message from the JSON string, honoring pb options
+    /// (e.g. hex_bytes_fields for OTLP trace_id/span_id).
+    pub fn jsonDecodeOpts(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decodeOpts(@This(), input, options, pb_options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+/// ExtensionTargetRef references a pre-configured ExtensionTarget by identity.
+/// Carried inside an Extension's config (to name where it routes) and inside an
+/// ExtensionCapability's config (to advertise reachable destinations). The
+/// referenced target MUST be known to the implementation — locally configured or
+/// received via SyncResponse.extension_configs.
+pub const ExtensionTargetRef = struct {
+    kind: []const u8 = &.{},
+    name: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .kind = fd(1, .{ .scalar = .string }),
+        .name = fd(2, .{ .scalar = .string }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Decodes the message from the JSON string, honoring pb options
+    /// (e.g. hex_bytes_fields for OTLP trace_id/span_id).
+    pub fn jsonDecodeOpts(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decodeOpts(@This(), input, options, pb_options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};

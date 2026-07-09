@@ -42,6 +42,12 @@ const HttpSyncStatusReported = struct { id: []const u8, match_hits: i64, match_m
 const HttpFetchStarted = struct {};
 const HttpFetchCompleted = struct {};
 
+/// Extension sync plumbing lives in the generic provider layer now (it's
+/// handed to every provider variant by the registry, like `StatsCollector`).
+/// Re-exported here so existing `HttpProvider.ExtensionSyncHooks` references
+/// keep resolving.
+pub const ExtensionSyncHooks = policy_provider.ExtensionSyncHooks;
+
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
     allocator: std.mem.Allocator,
@@ -72,6 +78,9 @@ pub const HttpProvider = struct {
     // Pull-based stats source, set by PolicyRegistry.subscribe. Called before
     // each sync to obtain the per-policy hit/miss/error rows to report.
     stats_collector: ?StatsCollector,
+
+    // Extension sync plumbing (v1.6.0), set via setExtensionSyncHooks.
+    extension_hooks: ?ExtensionSyncHooks,
 
     pub const Config = struct {
         id: []const u8,
@@ -133,6 +142,7 @@ pub const HttpProvider = struct {
             .sync_state_mutex = .init,
             .bus = bus,
             .stats_collector = null,
+            .extension_hooks = null,
         };
 
         return self;
@@ -141,6 +151,11 @@ pub const HttpProvider = struct {
     /// Get the unique identifier for this provider
     pub fn getId(self: *HttpProvider) []const u8 {
         return self.id;
+    }
+
+    /// Wire extension sync plumbing (v1.6.0). Call before start().
+    pub fn setExtensionSyncHooks(self: *HttpProvider, hooks: ExtensionSyncHooks) void {
+        self.extension_hooks = hooks;
     }
 
     /// Record the hash from a successful sync.
@@ -275,6 +290,12 @@ pub const HttpProvider = struct {
             self.bus.info(event);
         }
 
+        // Route broadcast extension configs first, so targets they carry are
+        // known before the registry compiles the policies that reference them.
+        if (self.extension_hooks) |hooks| {
+            hooks.apply_configs(self.bus.io, hooks.ctx, response.extension_configs.items);
+        }
+
         // Notify callback with policies from response
         if (self.callback) |cb| {
             try cb.call(.{
@@ -354,9 +375,20 @@ pub const HttpProvider = struct {
             last_hash = self.last_successful_hash orelse &.{};
         }
 
+        // Extension capability advertisement (v1.6.0). Failure here must not
+        // block a sync: advertise nothing instead.
+        const supported_extensions: []proto.policy.ExtensionCapability = if (self.extension_hooks) |hooks|
+            hooks.capabilities(self.bus.io, hooks.ctx, temp_allocator) catch &.{}
+        else
+            &.{};
+
         // Create SyncRequest with the new structure
         const sync_request: SyncRequest = .{
             .client_metadata = .{
+                .supported_extensions = .{
+                    .items = supported_extensions,
+                    .capacity = supported_extensions.len,
+                },
                 .supported_policy_stages = .{
                     .items = @constCast(supported_policy_stages),
                     .capacity = supported_policy_stages.len,

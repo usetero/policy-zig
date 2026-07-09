@@ -250,6 +250,14 @@ pub const PolicyRegistry = struct {
     // Event bus for observability
     bus: *EventBus,
 
+    // Optional extension resolver (v1.6.0), consulted at snapshot compile
+    // time to resolve/validate each policy's extension declarations.
+    extension_resolver: ?policy_types.ExtensionResolver,
+
+    // Optional extension sync hooks (v1.6.0), pushed to each provider on
+    // subscribe for capability advertisement + broadcast-config routing.
+    extension_sync_hooks: ?policy_provider.ExtensionSyncHooks,
+
     /// Subscription context for provider callbacks.
     /// Allocated with stable address so the callback pointer remains valid.
     const Subscription = struct {
@@ -284,13 +292,32 @@ pub const PolicyRegistry = struct {
             .policy_errors = .empty,
             .subscriptions = .empty,
             .bus = bus,
+            .extension_resolver = null,
+            .extension_sync_hooks = null,
         };
     }
 
+    /// Wire an extension resolver (v1.6.0), consulted at snapshot compile
+    /// time. Call before providers deliver policies; takes effect on the next
+    /// recompile. Without one, declared extensions are skipped (fail-open)
+    /// and reported via PolicySyncStatus.errors.
+    pub fn setExtensionResolver(self: *PolicyRegistry, resolver: policy_types.ExtensionResolver) void {
+        self.extension_resolver = resolver;
+    }
+
+    /// Wire extension sync hooks (v1.6.0). Stored here and pushed to each
+    /// provider on `subscribe`, so the consumer wires them once instead of
+    /// per-provider. Call before `subscribe`; providers subscribed earlier
+    /// won't retroactively receive them (matches the stats-collector contract).
+    pub fn setExtensionSyncHooks(self: *PolicyRegistry, hooks: policy_provider.ExtensionSyncHooks) void {
+        self.extension_sync_hooks = hooks;
+    }
+
     /// Subscribe a provider to the registry in one step: hand it our stats
-    /// collector (so it can pull per-policy hit/miss/error rows before each sync)
-    /// and subscribe to its policy updates with an internal callback that feeds
-    /// updates back into the registry.
+    /// collector (so it can pull per-policy hit/miss/error rows before each sync),
+    /// hand it the extension sync hooks if any are wired, and subscribe to its
+    /// policy updates with an internal callback that feeds updates back into the
+    /// registry.
     pub fn subscribe(self: *PolicyRegistry, prov: Provider) !void {
         const sub = try self.allocator.create(Subscription);
         errdefer self.allocator.destroy(sub);
@@ -303,6 +330,10 @@ pub const PolicyRegistry = struct {
             .context = self,
             .collect = collectStatsThunk,
         });
+
+        if (self.extension_sync_hooks) |hooks| {
+            prov.setExtensionSyncHooks(hooks);
+        }
 
         try prov.subscribe(.{
             .context = @ptrCast(sub),
@@ -663,6 +694,7 @@ pub const PolicyRegistry = struct {
             self.bus,
             policies_slice,
             &comp_errors,
+            self.extension_resolver,
         );
         errdefer log_idx.deinit();
 
@@ -671,6 +703,7 @@ pub const PolicyRegistry = struct {
             self.bus,
             policies_slice,
             &comp_errors,
+            self.extension_resolver,
         );
         errdefer metric_idx.deinit();
 
@@ -679,6 +712,7 @@ pub const PolicyRegistry = struct {
             self.bus,
             policies_slice,
             &comp_errors,
+            self.extension_resolver,
         );
         errdefer trace_idx.deinit();
 

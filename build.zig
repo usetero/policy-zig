@@ -44,6 +44,23 @@ pub fn build(b: *std.Build) void {
     mod.link_libc = true;
     mod.linkSystemLibrary("hs", .{});
 
+    // Extensions module (spec v1.6.0): concrete extension handlers (s3-dump).
+    // Separate module so policy_zig stays free of I/O and of the z3
+    // dependency; only consumers that enable extensions link it.
+    const z3_dep = b.dependency("z3", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ext_mod = b.addModule("extensions", .{
+        .root_source_file = b.path("src/extensions/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "proto", .module = proto_mod },
+            .{ .name = "policy_zig", .module = mod },
+            .{ .name = "s3", .module = z3_dep.module("s3") },
+        },
+    });
+
     // Tests
     const mod_tests = b.addTest(.{
         .root_module = mod,
@@ -59,9 +76,60 @@ pub fn build(b: *std.Build) void {
     });
     const run_o11y_tests = b.addRunArtifact(o11y_tests);
 
+    // Extensions module tests (need libc/hyperscan transitively via policy_zig)
+    const ext_tests = b.addTest(.{
+        .root_module = ext_mod,
+    });
+    ext_tests.root_module.link_libc = true;
+    ext_tests.root_module.linkSystemLibrary("hs", .{});
+    const run_ext_tests = b.addRunArtifact(ext_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_o11y_tests.step);
+    test_step.dependOn(&run_ext_tests.step);
+
+    // Real-storage s3-dump smoke test (needs a running S3-compatible
+    // server — see `task test:s3-e2e`). Deliberately NOT part of `test`:
+    // it requires network I/O and external state, unlike every other test.
+    const s3_e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/extensions/s3_minio_test.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "proto", .module = proto_mod },
+                .{ .name = "policy_zig", .module = mod },
+                .{ .name = "s3", .module = z3_dep.module("s3") },
+            },
+        }),
+    });
+    s3_e2e_tests.root_module.link_libc = true;
+    s3_e2e_tests.root_module.linkSystemLibrary("hs", .{});
+    const run_s3_e2e_tests = b.addRunArtifact(s3_e2e_tests);
+    const s3_e2e_step = b.step("test-s3-e2e", "Run the s3-dump smoke test against a real S3-compatible server");
+    s3_e2e_step.dependOn(&run_s3_e2e_tests.step);
+
+    // s3-dump scale benchmarks (needs MinIO — see `task bench:s3`).
+    // ReleaseFast like the other benchmarks; excluded from `test`. A plain
+    // executable, not a test: it reports numbers, not pass/fail.
+    const s3_bench = b.addExecutable(.{
+        .name = "bench-s3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/extensions/s3_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "proto", .module = proto_mod },
+                .{ .name = "policy_zig", .module = mod },
+                .{ .name = "s3", .module = z3_dep.module("s3") },
+            },
+        }),
+    });
+    s3_bench.root_module.link_libc = true;
+    s3_bench.root_module.linkSystemLibrary("hs", .{});
+    const run_s3_bench = b.addRunArtifact(s3_bench);
+    const s3_bench_step = b.step("bench-s3", "Run s3-dump scale benchmarks against a real S3-compatible server");
+    s3_bench_step.dependOn(&run_s3_bench.step);
 
     // Benchmarks
     const zbench_dep = b.dependency("zbench", .{ .target = target, .optimize = .ReleaseFast });
@@ -96,6 +164,8 @@ pub fn build(b: *std.Build) void {
             .destination_directory = b.path("src/proto"),
             .source_files = &.{
                 b.path("proto/tero/policy/v1/policy.proto"),
+                b.path("proto/tero/policy/v1/extension.proto"),
+                b.path("proto/tero/policy/v1/tero_extensions.proto"),
                 b.path("proto/tero/policy/v1/log.proto"),
                 b.path("proto/tero/policy/v1/metric.proto"),
                 b.path("proto/tero/policy/v1/trace.proto"),
