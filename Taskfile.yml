@@ -71,6 +71,78 @@ tasks:
     cmds:
       - zig build test --summary all
 
+  test:s3-e2e:
+    desc: "Real-storage smoke test for the s3-dump extension against a local MinIO container (requires docker)"
+    cmds:
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "docker is required for task test:s3-e2e"
+          exit 1
+        fi
+        CONTAINER=policy-zig-minio-e2e
+        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        docker run -d --rm --name "$CONTAINER" \
+          -p 9000:9000 \
+          -e MINIO_ROOT_USER=minioadmin \
+          -e MINIO_ROOT_PASSWORD=minioadmin \
+          minio/minio server /data >/dev/null
+        trap 'docker rm -f "$CONTAINER" >/dev/null 2>&1' EXIT
+
+        echo "Waiting for MinIO..."
+        for i in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+            break
+          fi
+          if [ "$i" = 30 ]; then
+            echo "MinIO did not become healthy in time"
+            docker logs "$CONTAINER" || true
+            exit 1
+          fi
+          sleep 1
+        done
+
+        AWS_ACCESS_KEY_ID=minioadmin \
+        AWS_SECRET_ACCESS_KEY=minioadmin \
+        S3_ENDPOINT=http://127.0.0.1:9000 \
+        S3_BUCKET=policy-zig-e2e \
+          zig build test-s3-e2e --summary all
+
+  bench:s3:
+    desc: "s3-dump scale benchmarks against a local MinIO container (requires docker)"
+    cmds:
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "docker is required for task bench:s3"
+          exit 1
+        fi
+        CONTAINER=policy-zig-minio-bench
+        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        docker run -d --rm --name "$CONTAINER" \
+          -p 9000:9000 \
+          -e MINIO_ROOT_USER=minioadmin \
+          -e MINIO_ROOT_PASSWORD=minioadmin \
+          minio/minio server /data >/dev/null
+        trap 'docker rm -f "$CONTAINER" >/dev/null 2>&1' EXIT
+
+        echo "Waiting for MinIO..."
+        for i in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+            break
+          fi
+          if [ "$i" = 30 ]; then
+            echo "MinIO did not become healthy in time"
+            docker logs "$CONTAINER" || true
+            exit 1
+          fi
+          sleep 1
+        done
+
+        AWS_ACCESS_KEY_ID=minioadmin \
+        AWS_SECRET_ACCESS_KEY=minioadmin \
+        S3_ENDPOINT=http://127.0.0.1:9000 \
+        S3_BUCKET=policy-zig-bench \
+          zig build bench-s3
+
   format:
     desc: "Format all Zig source files"
     aliases: [fmt, f]

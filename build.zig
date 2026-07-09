@@ -89,6 +89,48 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_o11y_tests.step);
     test_step.dependOn(&run_ext_tests.step);
 
+    // Real-storage s3-dump smoke test (needs a running S3-compatible
+    // server — see `task test:s3-e2e`). Deliberately NOT part of `test`:
+    // it requires network I/O and external state, unlike every other test.
+    const s3_e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/extensions/s3_minio_test.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "proto", .module = proto_mod },
+                .{ .name = "policy_zig", .module = mod },
+                .{ .name = "s3", .module = z3_dep.module("s3") },
+            },
+        }),
+    });
+    s3_e2e_tests.root_module.link_libc = true;
+    s3_e2e_tests.root_module.linkSystemLibrary("hs", .{});
+    const run_s3_e2e_tests = b.addRunArtifact(s3_e2e_tests);
+    const s3_e2e_step = b.step("test-s3-e2e", "Run the s3-dump smoke test against a real S3-compatible server");
+    s3_e2e_step.dependOn(&run_s3_e2e_tests.step);
+
+    // s3-dump scale benchmarks (needs MinIO — see `task bench:s3`).
+    // ReleaseFast like the other benchmarks; excluded from `test`. A plain
+    // executable, not a test: it reports numbers, not pass/fail.
+    const s3_bench = b.addExecutable(.{
+        .name = "bench-s3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/extensions/s3_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "proto", .module = proto_mod },
+                .{ .name = "policy_zig", .module = mod },
+                .{ .name = "s3", .module = z3_dep.module("s3") },
+            },
+        }),
+    });
+    s3_bench.root_module.link_libc = true;
+    s3_bench.root_module.linkSystemLibrary("hs", .{});
+    const run_s3_bench = b.addRunArtifact(s3_bench);
+    const s3_bench_step = b.step("bench-s3", "Run s3-dump scale benchmarks against a real S3-compatible server");
+    s3_bench_step.dependOn(&run_s3_bench.step);
+
     // Benchmarks
     const zbench_dep = b.dependency("zbench", .{ .target = target, .optimize = .ReleaseFast });
     const zbench_mod = zbench_dep.module("zbench");

@@ -16,8 +16,16 @@ Deviations from the text below, made during implementation:
   `(signal, record ctx)` across the module seam).
 - Credentials are consumer-provided at `S3Dump.init` (no built-in env
   discovery — z3 has none either, and the edge binary owns its env).
-- `provider_http` gains `setExtensionSyncHooks` (a two-fn seam like
-  StatsCollector) for capability advertisement + config broadcast routing.
+- Extension sync hooks (a two-fn seam like `StatsCollector`) live in the
+  generic provider layer (`provider.zig`); `Provider.setExtensionSyncHooks`
+  dispatches per variant (`.http` wires, `.file`/`.testing` no-op), and
+  `registry.subscribe` pushes them to every provider automatically — the
+  consumer wires them once via `registry.setExtensionSyncHooks` (or
+  `Extensions.register`), not per provider.
+- `Extensions.enableS3Dump(alloc, opts, creds) *S3Dump` constructs the
+  handler in place and returns its pointer, so targets are configured on the
+  handler directly (no move, no `s3Dump().?` reach-back).
+- `Extensions.register(&registry)` wires resolver + sync hooks in one call.
 - All batching knobs live in `S3Dump.Options`, a plain-data struct with
   defaults, deserializable from a config file.
 
@@ -433,18 +441,65 @@ One object per batch:
   available (z3's no-chunked-signing limitation doesn't bite us).
 - z3 does not do credential discovery — fine, because our design already
   sources credentials from the consumer callback / env (see above) and passes
-  them at client init. One z3 client per target, created lazily at first
-  flush.
-- Failure handling v1: non-2xx or transport error → count it, drop the batch,
-  log via event bus. No retry queue (the data is by definition the waste
-  stream; better to lose a batch than to grow unbounded state).
-  <!-- ponytail: no retry/backoff in v1 — add a single re-flush attempt if drops show up in practice -->
+  them at client init. One z3 client per target per flush (lazily created),
+  so std.http.Client's connection pool is reused across that flush's uploads.
+- Target configs are snapshotted into a flush-local arena under the mutex;
+  uploads never read live target state (a concurrent broadcast `configure`
+  can therefore never invalidate memory mid-upload).
+- Failure handling: z3's `max_attempts` only retries connection
+  establishment — send/receive failures and 5xx responses are not retried by
+  the client. So a failed upload is **requeued** onto the sealed backlog and
+  retried on subsequent flushes, bounded by the same `max_sealed_bytes` cap
+  (overflow drops, counted). The object key is fixed at seal time, so
+  retries are idempotent same-key PUTs — a request that succeeded
+  server-side before the failure surfaced overwrites itself instead of
+  duplicating. Records are lost only when the backlog cap overflows; there
+  is still no unbounded queue and no disk spill.
+  <!-- ponytail: in-memory retry only; add disk spill if cap-overflow drops show up in practice -->
 
 ### Capability advertisement
 
 `capabilities()` returns one serialized `ExtensionTargetRef{kind: "s3", name}`
 per configured target, so the provider only sends policies whose extensions
 this client can satisfy.
+
+## Scale characteristics (measured)
+
+`task bench:s3` runs scale benchmarks against a local MinIO container
+(ReleaseFast, 191-byte records, Apple Silicon dev machine — treat as shape,
+not absolutes):
+
+| scenario | result |
+| --- | --- |
+| deliver, 1 thread | ~16M records/s (~2.9 GiB/s) — ~62ns/record |
+| deliver, 4 threads | ~11.5M records/s aggregate — **slower than 1 thread** |
+| flush, 64KiB objects | ~250–320 objects/s, ~16–20 MiB/s |
+| flush, 1MiB objects | ~100 objects/s, ~100 MiB/s |
+| flush, 4MiB objects | ~76–80 objects/s, ~135–142 MiB/s |
+| fan-out, 64 policies × 128KiB | ~260 objects/s (one flush ≈ 0.25s) |
+| outage flush, max_attempts=1 | ~1ms (connect-refused + requeue is free) |
+| outage flush, max_attempts=3 | ~2.3–2.8s for 8 objects (~290ms/object of retry sleeps) |
+
+What this says about scale:
+
+1. **The hot path is not the bottleneck.** Deliver costs ~62ns/record —
+   comparable to a whole engine evaluation (~40–60ns) and paid only by
+   records a mode selects.
+2. **The single dump-wide mutex is a real ceiling under concurrent
+   delivery**: 4 threads are ~30% *slower* in aggregate than 1. Irrelevant at
+   realistic waste rates (1M records/s is ~6% of the ceiling), but per-batch
+   mutexes are the upgrade path if a many-threaded consumer attaches
+   `mode: all` extensions to high-volume signals.
+3. **Object size dominates upload throughput** (~3–4ms fixed cost per PUT:
+   SigV4 + HTTP round trip). 64KiB objects move ~16 MiB/s; 4MiB objects move
+   ~140 MiB/s. Keep `max_batch_bytes` ≥ 1MiB and avoid fragmenting batches
+   across very many (policy × signal × target) combinations. Uploads within
+   a flush are serial; hundreds of batches per flush cycle means seconds of
+   flush latency.
+4. **z3's in-request connect retries are redundant with our requeue** and
+   serialize ~100ms sleeps per object into the flush during outages —
+   hence `max_attempts` defaults to 1: a failed batch just waits for the
+   next flush instead of stalling the current one.
 
 ## Conformance note
 
@@ -466,10 +521,22 @@ README gains a "Supported extensions" table — required by conformance item 9:
   semantics).
 - **Validation**: unknown type / bad version / unknown target → policy still
   active, extension skipped, error string in `PolicySyncStatus.errors`.
-- **Upload**: flush against a local HTTP stub asserting method, path, auth
-  header presence, and ndjson body (signing correctness itself is z3's tested
-  responsibility); sealed-backlog drop counting; missing-credentials no-op.
-- **End-to-end (manual)**: MinIO via the `verify` flow.
+- **Upload (hermetic)**: `src/extensions/s3_stub_test.zig` runs flush against
+  an in-process `std.http.Server` stub over a real socket — asserts method,
+  path-style URL/key layout, the SigV4 auth header, the payload-sha256 header
+  S3 uses for integrity verification, and exact ndjson body bytes; a second
+  test scripts a 500 response and asserts the batch is requeued under the
+  identical object key and the retry succeeds. Runs in every
+  `zig build test`, no docker or network required.
+- **Upload (real backend)**: `src/extensions/s3_minio_test.zig`, built as the
+  separate `zig build test-s3-e2e` step (excluded from `test` — needs a live
+  server) and driven end-to-end by `task test:s3-e2e`, which starts a MinIO
+  container via docker, waits for its health check, runs the test, and tears
+  the container down (`trap ... EXIT`). Skips itself (`error.SkipZigTest`) if
+  the AWS_* / S3_ENDPOINT env vars aren't set, so it's inert when built
+  without the task. Verifies against the real backend's own APIs — lists the
+  uploaded prefix, fetches the object, and diffs its body byte-for-byte —
+  rather than trusting our own response parsing.
 
 ## Rollout
 

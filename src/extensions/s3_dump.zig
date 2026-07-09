@@ -7,8 +7,11 @@
 //! Invariants:
 //! - `deliver` copies (encodes) synchronously and holds no reference to the
 //!   record after it returns; the hot path never performs network I/O.
-//! - A destination outage costs waste records (counted drops), never pipeline
-//!   latency: the sealed-backlog cap is checked before encoding.
+//! - A destination outage costs pipeline latency never: the sealed-backlog
+//!   cap bounds all buffered memory, and past it records drop (counted).
+//! - Failed uploads are requeued (within the same cap) and retried on later
+//!   flushes under the SAME object key, so retries are idempotent. Records
+//!   are lost only when the backlog cap overflows, never silently.
 //! - I/O happens only in consumer-driven `flush(io)`, per this repo's rule
 //!   that `std.Io` is passed per call and never stored.
 
@@ -33,8 +36,14 @@ pub const S3Dump = struct {
         max_batch_age_ms: u64 = 30_000,
         /// Cap on sealed-but-not-uploaded bytes; past it new records drop.
         max_sealed_bytes: usize = 32 << 20,
-        /// Per-request attempts passed to the S3 client (its built-in retry).
-        max_attempts: usize = 3,
+        /// Per-request attempts passed to the S3 client. The client only
+        /// retries connection establishment, sleeping ~100ms between tries
+        /// serialized per object — measured at ~290ms/object of added flush
+        /// latency during an outage (`task bench:s3`). Since failed batches
+        /// are requeued and retried on the next flush anyway, the default
+        /// keeps flush fast; raise it only if the next-flush wait is too
+        /// coarse for transient connect blips.
+        max_attempts: usize = 1,
         content_type: []const u8 = "application/x-ndjson",
     };
 
@@ -80,23 +89,63 @@ pub const S3Dump = struct {
         signal: policy.TelemetryType,
         /// Borrowed from the owning Batch (batches live until deinit).
         policy_id: []const u8,
+        /// Object key, fixed at seal time so retried uploads are idempotent
+        /// (same key, identical content). Owned.
+        key: []u8,
         buf: []u8,
         records: u32,
     };
+
+    /// Flush-local copy of a target's connection config, duped into the
+    /// flush arena under the mutex. Uploads read only snapshots, so a
+    /// concurrent addTarget/configure (provider sync thread) can never
+    /// invalidate memory mid-upload.
+    const TargetSnapshot = struct {
+        bucket: []const u8,
+        region: []const u8,
+        endpoint: ?[]const u8,
+        virtual_host_style: bool,
+    };
+
+    /// PUT responses are tiny (empty or an XML error); never buffer more.
+    const max_response_body: usize = 64 * 1024;
 
     pub const FlushOptions = struct {
         /// Seal and upload all open batches regardless of age (shutdown).
         force: bool = false,
     };
 
+    /// Everything a consumer needs to turn one `flush()` call into metrics:
+    /// counters (deltas since the previous flush) plus one gauge
+    /// (`backlog_bytes`, a point-in-time snapshot, not a delta) for
+    /// early-warning before the `max_sealed_bytes` cap starts dropping data.
+    /// The library emits no metrics itself — this struct is the seam; the
+    /// edge decides where counts and gauge go (OTel, Prometheus, statsd, ...).
     pub const FlushResult = struct {
         objects_uploaded: u32 = 0,
+        /// Objects that failed to upload this flush. Unless the backlog cap
+        /// forced a drop they are requeued and retried on the next flush.
         objects_failed: u32 = 0,
+        /// Of the failed objects, how many were requeued for retry.
+        objects_requeued: u32 = 0,
         records_uploaded: u64 = 0,
         records_failed: u64 = 0,
-        /// Records dropped at delivery time (backlog full, encode failure,
-        /// null io) since the previous flush.
+        /// Records dropped since the previous flush: at delivery time
+        /// (backlog full, encode failure, null io) or because a failed batch
+        /// could not be requeued within the backlog cap.
         records_dropped: u64 = 0,
+        /// Object body bytes successfully PUT this flush. Feeds a
+        /// throughput/cost counter (S3 PUT + egress pricing scales with this).
+        bytes_uploaded: u64 = 0,
+        /// Object body bytes in batches that failed to upload this flush
+        /// (whether requeued or dropped).
+        bytes_failed: u64 = 0,
+        /// GAUGE, not a delta: sealed-but-not-yet-uploaded bytes remaining
+        /// after this flush (open batches are excluded — they aren't at risk
+        /// of the drop cliff yet). Alert on this approaching
+        /// `Options.max_sealed_bytes`: that's the leading indicator of the
+        /// destination falling behind, before `records_dropped` climbs.
+        backlog_bytes: usize = 0,
     };
 
     allocator: std.mem.Allocator,
@@ -107,8 +156,6 @@ pub const S3Dump = struct {
     batches: std.ArrayList(*Batch) = .empty,
     sealed: std.ArrayList(Sealed) = .empty,
     sealed_bytes: usize = 0,
-    /// Reusable encode buffer, guarded by `mutex`.
-    scratch: std.ArrayList(u8) = .empty,
     records_dropped: std.atomic.Value(u64) = .init(0),
     object_seq: std.atomic.Value(u64) = .init(0),
 
@@ -128,14 +175,16 @@ pub const S3Dump = struct {
             self.allocator.destroy(batch);
         }
         self.batches.deinit(self.allocator);
-        for (self.sealed.items) |s| self.allocator.free(s.buf);
+        for (self.sealed.items) |s| {
+            self.allocator.free(s.buf);
+            self.allocator.free(s.key);
+        }
         self.sealed.deinit(self.allocator);
         for (self.targets.items) |*t| {
             self.allocator.free(t.name);
             t.parsed.deinit();
         }
         self.targets.deinit(self.allocator);
-        self.scratch.deinit(self.allocator);
     }
 
     // =========================================================================
@@ -284,23 +333,34 @@ pub const S3Dump = struct {
             if (self.sealed_bytes + batch.buf.items.len > self.options.max_sealed_bytes) {
                 return self.drop();
             }
-            self.sealLocked(batch) catch return self.drop();
+            self.sealLocked(io, batch) catch return self.drop();
         }
 
-        // Encode into the reusable scratch buffer so a failed encode never
-        // corrupts the batch.
-        self.scratch.clearRetainingCapacity();
-        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.scratch);
-        const encode_err = encode(record, &aw.writer);
-        self.scratch = aw.toArrayList();
-        encode_err catch return self.drop();
-
-        const line = self.scratch.items;
-        if (line.len + 1 > self.options.max_batch_bytes) return self.drop();
-
-        batch.buf.ensureUnusedCapacity(self.allocator, line.len + 1) catch return self.drop();
-        batch.buf.appendSliceAssumeCapacity(line);
-        batch.buf.appendAssumeCapacity('\n');
+        // Encode directly into the batch buffer — one write, no intermediate
+        // copy. A failed or oversized encode is rolled back by truncating to
+        // the pre-record length, so the batch is never corrupted.
+        const len_before = batch.buf.items.len;
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &batch.buf);
+        var write_failed = false;
+        encode(record, &aw.writer) catch {
+            write_failed = true;
+        };
+        if (!write_failed) aw.writer.writeByte('\n') catch {
+            write_failed = true;
+        };
+        batch.buf = aw.toArrayList();
+        if (write_failed or batch.buf.items.len - len_before > self.options.max_batch_bytes) {
+            // A rogue oversized record may have grown the buffer far past
+            // anything a legal batch needs; release that memory rather than
+            // pinning it on this slot forever. Legal batches never need more
+            // than ~2x max_batch_bytes (seal-before-encode + one record).
+            if (batch.buf.capacity > self.options.max_batch_bytes * 2) {
+                batch.buf.shrinkAndFree(self.allocator, len_before);
+            } else {
+                batch.buf.shrinkRetainingCapacity(len_before);
+            }
+            return self.drop();
+        }
         batch.records += 1;
         if (batch.first_ns == 0) {
             batch.first_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
@@ -311,15 +371,23 @@ pub const S3Dump = struct {
         _ = self.records_dropped.fetchAdd(1, .monotonic);
     }
 
-    /// Move the open batch's buffer onto the sealed list and reset the batch.
-    fn sealLocked(self: *S3Dump, batch: *Batch) !void {
+    /// Move the open batch's buffer onto the sealed list and reset the
+    /// batch. The object key is fixed here, at seal time: a batch that fails
+    /// to upload retries under the SAME key, so a PUT that actually
+    /// succeeded server-side before the failure surfaced is overwritten with
+    /// identical content instead of duplicated under a second key.
+    fn sealLocked(self: *S3Dump, io: std.Io, batch: *Batch) !void {
         if (batch.buf.items.len == 0) return;
+        const prefix = self.targets.items[batch.target].parsed.value.prefix;
+        const key = try self.buildKey(io, prefix, batch.signal, batch.policy_id);
+        errdefer self.allocator.free(key);
         const buf = try batch.buf.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(buf);
         try self.sealed.append(self.allocator, .{
             .target = batch.target,
             .signal = batch.signal,
             .policy_id = batch.policy_id,
+            .key = key,
             .buf = buf,
             .records = batch.records,
         });
@@ -328,26 +396,58 @@ pub const S3Dump = struct {
         batch.first_ns = 0;
     }
 
+    /// Requeue a failed batch for the next flush, bounded by the same
+    /// backlog cap as delivery-time sealing. Returns false when the cap (or
+    /// OOM) forced a drop instead.
+    fn requeue(self: *S3Dump, io: std.Io, sealed_batch: Sealed) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const fits = self.sealed_bytes + sealed_batch.buf.len <= self.options.max_sealed_bytes;
+        if (fits) {
+            if (self.sealed.append(self.allocator, sealed_batch)) |_| {
+                self.sealed_bytes += sealed_batch.buf.len;
+                return true;
+            } else |_| {}
+        }
+        _ = self.records_dropped.fetchAdd(sealed_batch.records, .monotonic);
+        self.allocator.free(sealed_batch.buf);
+        self.allocator.free(sealed_batch.key);
+        return false;
+    }
+
     // =========================================================================
     // Flush (consumer-driven I/O)
     // =========================================================================
 
     /// Seal over-age (or, with `force`, all) open batches and upload every
-    /// sealed batch as one object. Failed uploads are counted and their
-    /// batches dropped — no retry queue by design (design/extensions.md).
+    /// sealed batch as one object. A failed upload is requeued for the next
+    /// flush (bounded by max_sealed_bytes) rather than dropped — z3 only
+    /// retries connection establishment, not send/receive failures or 5xx
+    /// responses, so handler-level retry is what makes a transient
+    /// destination outage lossless.
     pub fn flush(self: *S3Dump, io: std.Io, opts: FlushOptions) FlushResult {
         var result: FlushResult = .{};
 
         const now: i128 = std.Io.Timestamp.now(io, .awake).nanoseconds;
         const max_age_ns: i128 = @as(i128, self.options.max_batch_age_ms) * std.time.ns_per_ms;
 
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var no_snapshots = [0]?TargetSnapshot{};
+        var no_clients = [0]?s3.S3Client{};
+
+        // Phase 1 (locked): seal due batches, steal the sealed list, and
+        // snapshot target configs into the flush arena. Uploads read only
+        // the snapshots, never `self.targets`.
         self.mutex.lockUncancelable(io);
         for (self.batches.items) |batch| {
             if (batch.buf.items.len == 0) continue;
             const expired = batch.first_ns != 0 and now - batch.first_ns >= max_age_ns;
             if (opts.force or expired) {
-                // OOM here just leaves the batch for the next flush.
-                self.sealLocked(batch) catch {};
+                // OOM here just leaves the batch open for the next flush.
+                self.sealLocked(io, batch) catch {};
             }
         }
         const to_upload = self.sealed.toOwnedSlice(self.allocator) catch {
@@ -356,54 +456,130 @@ pub const S3Dump = struct {
             return result;
         };
         self.sealed_bytes = 0;
+        const snapshots: []?TargetSnapshot =
+            arena.alloc(?TargetSnapshot, self.targets.items.len) catch no_snapshots[0..];
+        for (self.targets.items, 0..) |t, i| {
+            if (i >= snapshots.len) break;
+            snapshots[i] = snapshotTarget(arena, t.parsed.value) catch null;
+        }
         self.mutex.unlock(io);
         defer self.allocator.free(to_upload);
 
-        for (to_upload) |*sealed_batch| {
-            defer self.allocator.free(sealed_batch.buf);
-            if (self.uploadOne(io, sealed_batch)) {
+        // Phase 2 (unlocked): create one client per target used this flush,
+        // then upload. Client setup is a distinct step from the PUT — one
+        // client per target so the std.http.Client connection pool is reused
+        // across all of this flush's uploads to that target.
+        const clients = self.makeClients(io, arena, snapshots, to_upload, no_clients[0..]);
+        defer for (clients) |*c| {
+            if (c.*) |*client| client.deinit();
+        };
+
+        for (to_upload) |sealed_batch| {
+            const uploaded = ok: {
+                const client = clientFor(clients, sealed_batch.target) orelse break :ok false;
+                break :ok self.uploadOne(client, snapshots[sealed_batch.target].?, &sealed_batch);
+            };
+            if (uploaded) {
                 result.objects_uploaded += 1;
                 result.records_uploaded += sealed_batch.records;
+                result.bytes_uploaded += sealed_batch.buf.len;
+                self.allocator.free(sealed_batch.buf);
+                self.allocator.free(sealed_batch.key);
             } else {
                 result.objects_failed += 1;
                 result.records_failed += sealed_batch.records;
+                result.bytes_failed += sealed_batch.buf.len;
+                if (self.requeue(io, sealed_batch)) result.objects_requeued += 1;
             }
         }
 
         result.records_dropped = self.records_dropped.swap(0, .monotonic);
+        // Gauge read AFTER requeue has put failed-but-kept batches back onto
+        // the backlog, so it reflects what's actually still queued.
+        // `sealed_bytes` is plain state guarded by `mutex` (like the rest of
+        // this struct), not an atomic — take the lock rather than tear it.
+        self.mutex.lockUncancelable(io);
+        result.backlog_bytes = self.sealed_bytes;
+        self.mutex.unlock(io);
         return result;
     }
 
-    fn uploadOne(self: *S3Dump, io: std.Io, sealed_batch: *const Sealed) bool {
-        const creds = self.credentials orelse return false;
-        // Target config is index-stable: targets are only appended or
-        // replaced in place, never removed.
-        const cfg = self.targets.items[sealed_batch.target].parsed.value;
-
-        // ponytail: one client (connection) per object; reuse a per-target
-        // client within a flush if profiles show connection setup mattering.
-        var client = s3.S3Client.init(self.allocator, .{
-            .access_key_id = creds.access_key_id,
-            .secret_access_key = creds.secret_access_key,
-            .region = cfg.region,
-            .endpoint = cfg.endpoint,
+    fn snapshotTarget(arena: std.mem.Allocator, cfg: TargetConfig) !TargetSnapshot {
+        return .{
+            .bucket = try arena.dupe(u8, cfg.bucket),
+            .region = try arena.dupe(u8, cfg.region),
+            .endpoint = if (cfg.endpoint) |e| try arena.dupe(u8, e) else null,
             .virtual_host_style = !cfg.force_path_style,
-        }, .{ .io = io }) catch return false;
-        defer client.deinit();
+        };
+    }
 
-        const key = self.buildKey(io, cfg.prefix, sealed_batch) catch return false;
-        defer self.allocator.free(key);
+    /// Create one S3 client per target that has a batch to upload this flush
+    /// (deduped — several batches for one target share a client, hence one
+    /// connection pool). Indexed by target, parallel to `snapshots`. A target
+    /// with no credentials, no snapshot, or a failed client init is left null;
+    /// its batches then fail the upload and requeue. Clients are owned by the
+    /// caller (freed via the flush's `defer`), allocated in the flush arena.
+    fn makeClients(
+        self: *S3Dump,
+        io: std.Io,
+        arena: std.mem.Allocator,
+        snapshots: []const ?TargetSnapshot,
+        to_upload: []const Sealed,
+        fallback: []?s3.S3Client,
+    ) []?s3.S3Client {
+        const clients = arena.alloc(?s3.S3Client, snapshots.len) catch return fallback;
+        for (clients) |*c| c.* = null;
 
-        var response = client.putObject(cfg.bucket, key, sealed_batch.buf, .{
+        const creds = self.credentials orelse return clients; // no creds → no clients
+        for (to_upload) |sealed_batch| {
+            const target = sealed_batch.target;
+            if (target >= clients.len or clients[target] != null) continue;
+            const snap = snapshots[target] orelse continue;
+            clients[target] = s3.S3Client.init(self.allocator, .{
+                .access_key_id = creds.access_key_id,
+                .secret_access_key = creds.secret_access_key,
+                .region = snap.region,
+                .endpoint = snap.endpoint,
+                .virtual_host_style = snap.virtual_host_style,
+            }, .{ .io = io }) catch continue;
+        }
+        return clients;
+    }
+
+    /// The client for a target, or null if none was created for it (out of
+    /// range, or setup skipped it — see `makeClients`).
+    fn clientFor(clients: []?s3.S3Client, target: u16) ?*s3.S3Client {
+        if (target >= clients.len) return null;
+        return if (clients[target]) |*c| c else null;
+    }
+
+    /// PUT one sealed batch as a single object. No client lifecycle here — the
+    /// client is created up front by `makeClients`.
+    fn uploadOne(
+        self: *S3Dump,
+        client: *s3.S3Client,
+        snap: TargetSnapshot,
+        sealed_batch: *const Sealed,
+    ) bool {
+        var response = client.putObject(snap.bucket, sealed_batch.key, sealed_batch.buf, .{
             .content_type = self.options.content_type,
-            .request = .{ .max_attempts = self.options.max_attempts },
+            .request = .{
+                .max_attempts = self.options.max_attempts,
+                .max_body_size = max_response_body,
+            },
         }) catch return false;
         defer response.deinit();
         return response.http_head.status.class() == .success;
     }
 
     /// `{prefix}{signal}/{yyyy}/{mm}/{dd}/{hh}/{policy_id}-{unix_nanos}-{seq}.ndjson`
-    fn buildKey(self: *S3Dump, io: std.Io, prefix: []const u8, sealed_batch: *const Sealed) ![]u8 {
+    fn buildKey(
+        self: *S3Dump,
+        io: std.Io,
+        prefix: []const u8,
+        signal: policy.TelemetryType,
+        policy_id: []const u8,
+    ) ![]u8 {
         const wall_ns: i128 = std.Io.Timestamp.now(io, .real).nanoseconds;
         const secs: u64 = @intCast(@divTrunc(wall_ns, std.time.ns_per_s));
         const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = secs };
@@ -415,12 +591,12 @@ pub const S3Dump = struct {
             "{s}{s}/{d:0>4}/{d:0>2}/{d:0>2}/{d:0>2}/{s}-{d}-{d}.ndjson",
             .{
                 prefix,
-                @tagName(sealed_batch.signal),
+                @tagName(signal),
                 year_day.year,
                 month_day.month.numeric(),
                 @as(u32, month_day.day_index) + 1,
                 epoch_secs.getDaySeconds().getHoursIntoDay(),
-                sealed_batch.policy_id,
+                policy_id,
                 wall_ns,
                 seq,
             },
@@ -496,6 +672,35 @@ test "S3Dump: deliver batches records as ndjson lines" {
     try testing.expectEqual(@as(u64, 0), dump.records_dropped.load(.monotonic));
 }
 
+test "S3Dump: flush result carries byte counters and a backlog gauge" {
+    var dump = S3Dump.init(testing.allocator, .{}, null); // no credentials → upload fails
+    defer dump.deinit();
+    try dump.addTarget(test_io, "eu-bucket", target_json);
+
+    const cfg = try encodeTargetRef(testing.allocator, "s3", "eu-bucket");
+    defer testing.allocator.free(cfg);
+    const slot = dump.resolve(test_io, .log, "p1", cfg).?;
+
+    const rec: []const u8 = "{\"body\":\"one\"}"; // 14 bytes + '\n' = 15
+    dump.deliver(test_io, slot, @ptrCast(&rec), testEncodeRecord);
+    dump.deliver(test_io, slot, @ptrCast(&rec), testEncodeRecord);
+
+    const result = dump.flush(test_io, .{ .force = true });
+
+    // Failed upload: bytes counted as failed, none as uploaded, and the
+    // gauge reflects the batch sitting in the backlog after requeue.
+    try testing.expectEqual(@as(u64, 30), result.bytes_failed);
+    try testing.expectEqual(@as(u64, 0), result.bytes_uploaded);
+    try testing.expectEqual(@as(usize, 30), result.backlog_bytes);
+    try testing.expectEqual(dump.sealed_bytes, result.backlog_bytes);
+
+    // A flush with nothing to do reports a zero gauge, not the last value.
+    var empty_dump = S3Dump.init(testing.allocator, .{}, null);
+    defer empty_dump.deinit();
+    const empty_result = empty_dump.flush(test_io, .{ .force = true });
+    try testing.expectEqual(@as(usize, 0), empty_result.backlog_bytes);
+}
+
 test "S3Dump: batch seals at record limit; backlog cap drops instead of growing" {
     var dump = S3Dump.init(testing.allocator, .{
         .max_batch_records = 2,
@@ -526,8 +731,47 @@ test "S3Dump: batch seals at record limit; backlog cap drops instead of growing"
     try testing.expectEqual(@as(usize, 1), dump.sealed.items.len);
 }
 
-test "S3Dump: flush without credentials fails the batch, counts it, and resets state" {
+test "S3Dump: failed upload is requeued under a stable key, not dropped" {
     var dump = S3Dump.init(testing.allocator, .{}, null);
+    defer dump.deinit();
+    try dump.addTarget(test_io, "eu-bucket", target_json);
+
+    const cfg = try encodeTargetRef(testing.allocator, "s3", "eu-bucket");
+    defer testing.allocator.free(cfg);
+    const slot = dump.resolve(test_io, .log, "p1", cfg).?;
+
+    const rec: []const u8 = "{\"body\":\"one\"}";
+    dump.deliver(test_io, slot, @ptrCast(&rec), testEncodeRecord);
+    const batch_len = dump.batches.items[slot].buf.items.len;
+
+    // No credentials → upload fails → the batch stays queued for retry.
+    const r1 = dump.flush(test_io, .{ .force = true });
+    try testing.expectEqual(@as(u32, 0), r1.objects_uploaded);
+    try testing.expectEqual(@as(u32, 1), r1.objects_failed);
+    try testing.expectEqual(@as(u32, 1), r1.objects_requeued);
+    try testing.expectEqual(@as(u64, 1), r1.records_failed);
+    try testing.expectEqual(@as(u64, 0), r1.records_dropped);
+    try testing.expectEqual(@as(usize, 1), dump.sealed.items.len);
+    try testing.expectEqual(batch_len, dump.sealed_bytes);
+    try testing.expectEqual(@as(usize, 0), dump.batches.items[slot].buf.items.len);
+
+    // The key was fixed at seal time and survives across retries, so a
+    // retried PUT is idempotent. Snapshot it, retry, compare.
+    const key_copy = try testing.allocator.dupe(u8, dump.sealed.items[0].key);
+    defer testing.allocator.free(key_copy);
+    try testing.expect(std.mem.startsWith(u8, key_copy, "dumps/log/"));
+    try testing.expect(std.mem.endsWith(u8, key_copy, ".ndjson"));
+
+    const r2 = dump.flush(test_io, .{ .force = true });
+    try testing.expectEqual(@as(u32, 1), r2.objects_failed);
+    try testing.expectEqual(@as(u32, 1), r2.objects_requeued);
+    try testing.expectEqual(@as(usize, 1), dump.sealed.items.len);
+    try testing.expectEqualStrings(key_copy, dump.sealed.items[0].key);
+}
+
+test "S3Dump: requeue drops when the backlog cap would be exceeded" {
+    // Cap smaller than one batch: the failed upload cannot be requeued.
+    var dump = S3Dump.init(testing.allocator, .{ .max_sealed_bytes = 4 }, null);
     defer dump.deinit();
     try dump.addTarget(test_io, "eu-bucket", target_json);
 
@@ -539,12 +783,37 @@ test "S3Dump: flush without credentials fails the batch, counts it, and resets s
     dump.deliver(test_io, slot, @ptrCast(&rec), testEncodeRecord);
 
     const result = dump.flush(test_io, .{ .force = true });
-    try testing.expectEqual(@as(u32, 0), result.objects_uploaded);
     try testing.expectEqual(@as(u32, 1), result.objects_failed);
-    try testing.expectEqual(@as(u64, 1), result.records_failed);
+    try testing.expectEqual(@as(u32, 0), result.objects_requeued);
+    try testing.expectEqual(@as(u64, 1), result.records_dropped);
     try testing.expectEqual(@as(usize, 0), dump.sealed.items.len);
     try testing.expectEqual(@as(usize, 0), dump.sealed_bytes);
-    try testing.expectEqual(@as(usize, 0), dump.batches.items[slot].buf.items.len);
+}
+
+fn testEncodePartialFail(record: *const anyopaque, writer: *std.Io.Writer) anyerror!void {
+    _ = record;
+    try writer.writeAll("partial garbage");
+    return error.EncodeFailed;
+}
+
+test "S3Dump: failed encode rolls the batch back to its previous contents" {
+    var dump = S3Dump.init(testing.allocator, .{}, null);
+    defer dump.deinit();
+    try dump.addTarget(test_io, "eu-bucket", target_json);
+
+    const cfg = try encodeTargetRef(testing.allocator, "s3", "eu-bucket");
+    defer testing.allocator.free(cfg);
+    const slot = dump.resolve(test_io, .log, "p1", cfg).?;
+
+    const rec: []const u8 = "{\"body\":\"one\"}";
+    dump.deliver(test_io, slot, @ptrCast(&rec), testEncodeRecord);
+    // Partial write, then failure: everything it wrote must be truncated.
+    dump.deliver(test_io, slot, @ptrCast(&rec), testEncodePartialFail);
+
+    const batch = dump.batches.items[slot];
+    try testing.expectEqual(@as(u32, 1), batch.records);
+    try testing.expectEqualStrings("{\"body\":\"one\"}\n", batch.buf.items);
+    try testing.expectEqual(@as(u64, 1), dump.records_dropped.load(.monotonic));
 }
 
 test "S3Dump: non-forced flush leaves young batches open" {

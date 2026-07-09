@@ -13,13 +13,14 @@ const proto = @import("proto");
 const s3_dump_mod = @import("./s3_dump.zig");
 pub const S3Dump = s3_dump_mod.S3Dump;
 pub const EncodeFn = s3_dump_mod.EncodeFn;
+pub const TeroS3DumpTag = "com.usetero/s3-dump";
 
 pub const ExtensionTag = enum(u8) {
     s3_dump,
 
     pub fn typeId(tag: ExtensionTag) []const u8 {
         return switch (tag) {
-            .s3_dump => "com.usetero/s3-dump",
+            .s3_dump => TeroS3DumpTag,
         };
     }
 
@@ -57,9 +58,10 @@ pub const ExtensionHandler = union(ExtensionTag) {
 /// Usage:
 ///   var exts = Extensions.init(allocator, .{ .log = encodeLog });
 ///   defer exts.deinit();
-///   exts.enable(.{ .s3_dump = S3Dump.init(allocator, .{}, creds) });
-///   try exts.s3Dump().?.addTarget(io, "eu-bucket", target_json);
-///   registry.setExtensionResolver(exts.resolver());
+///   const s3 = exts.enableS3Dump(allocator, .{}, creds);
+///   try s3.addTarget(io, "eu-bucket", target_json);
+///   exts.register(&registry);              // resolver + sync hooks, once
+///   try registry.subscribe(.{ .http = http_provider }); // hooks auto-pushed
 ///   // per evaluate call: .{ .io = io, .extension_sink = exts.sink() }
 ///   // periodically: exts.flush(io, .{});
 pub const Extensions = struct {
@@ -97,9 +99,34 @@ pub const Extensions = struct {
         self.handlers.set(tag, handler);
     }
 
+    /// Enable the s3-dump handler, constructing it directly in place, and
+    /// return a stable pointer so targets are configured on the handler
+    /// itself — no move, no `s3Dump().?` reach-back:
+    ///   const s3 = exts.enableS3Dump(allocator, .{}, creds);
+    ///   try s3.addTarget(io, "eu-bucket", target_json);
+    /// The pointer is valid for the life of this `Extensions` (don't move it).
+    pub fn enableS3Dump(
+        self: *Extensions,
+        allocator: std.mem.Allocator,
+        options: S3Dump.Options,
+        credentials: ?S3Dump.Credentials,
+    ) *S3Dump {
+        self.enable(.{ .s3_dump = S3Dump.init(allocator, options, credentials) });
+        return self.s3Dump().?;
+    }
+
     pub fn s3Dump(self: *Extensions) ?*S3Dump {
         if (self.handlers.getPtr(.s3_dump).*) |*handler| return &handler.s3_dump;
         return null;
+    }
+
+    /// Wire this Extensions into a registry in one call: the resolver (used
+    /// at snapshot compile) and the sync hooks (pushed to providers on
+    /// subscribe). Call before `registry.subscribe(...)`. The per-evaluate
+    /// `sink()` and the background `flush()` are still the consumer's to wire.
+    pub fn register(self: *Extensions, reg: *policy.Registry) void {
+        reg.setExtensionResolver(self.resolver());
+        reg.setExtensionSyncHooks(self.syncHooks());
     }
 
     // =========================================================================
@@ -165,7 +192,7 @@ pub const Extensions = struct {
     /// Adapter for HttpProvider.setExtensionSyncHooks: advertises
     /// capabilities in sync requests and routes broadcast extension configs
     /// from sync responses.
-    pub fn syncHooks(self: *Extensions) policy.HttpProvider.ExtensionSyncHooks {
+    pub fn syncHooks(self: *Extensions) policy.ExtensionSyncHooks {
         return .{
             .ctx = self,
             .capabilities = capabilitiesHook,
@@ -235,6 +262,7 @@ pub const Extensions = struct {
 
 test {
     _ = @import("./s3_dump.zig");
+    _ = @import("./s3_stub_test.zig");
 }
 
 // =============================================================================
@@ -278,8 +306,9 @@ test "end to end: dropped records land in the s3-dump batch as ndjson" {
 
     var exts = Extensions.init(allocator, .{ .log = TestLogRecord.encode });
     defer exts.deinit();
-    exts.enable(.{ .s3_dump = S3Dump.init(allocator, .{}, null) });
-    try exts.s3Dump().?.addTarget(
+    // Configure the target directly on the handler pointer — no reach-back.
+    const s3 = exts.enableS3Dump(allocator, .{}, null);
+    try s3.addTarget(
         test_io,
         "eu-bucket",
         \\{"bucket": "waste", "region": "eu-west-1"}
@@ -311,7 +340,7 @@ test "end to end: dropped records land in the s3-dump batch as ndjson" {
     noop_bus.init(test_io);
     var registry = policy.Registry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    registry.setExtensionResolver(exts.resolver());
+    exts.register(&registry); // resolver + sync hooks in one call
     try registry.updatePolicies(&.{pol}, "test", .file);
 
     const engine = policy.PolicyEngine.init(noop_bus.eventBus(), &registry);
@@ -343,7 +372,7 @@ test "end to end: dropped records land in the s3-dump batch as ndjson" {
     defer arena.deinit();
     const caps = try exts.supportedExtensions(test_io, arena.allocator());
     try testing.expectEqual(@as(usize, 1), caps.len);
-    try testing.expectEqualStrings("com.usetero/s3-dump", caps[0].type);
+    try testing.expectEqualStrings(TeroS3DumpTag, caps[0].type);
     try testing.expectEqual(@as(usize, 1), caps[0].config.items.len);
 }
 
@@ -372,10 +401,50 @@ test "Extensions: applyExtensionConfigs routes broadcast targets by type" {
     // A config for an unknown type is ignored; the s3-dump one lands.
     const configs = [_]proto.policy.ExtensionConfig{
         .{ .type = "vendor/unknown", .config = entries },
-        .{ .type = "com.usetero/s3-dump", .config = entries },
+        .{ .type = TeroS3DumpTag, .config = entries },
     };
     exts.applyExtensionConfigs(test_io, &configs);
 
     try testing.expectEqual(@as(usize, 1), exts.s3Dump().?.targets.items.len);
     try testing.expectEqualStrings("bcast-bucket", exts.s3Dump().?.targets.items[0].name);
+}
+
+test "Extensions.register wires resolver + sync hooks; subscribe pushes hooks per provider" {
+    const allocator = testing.allocator;
+    const o11y = policy.observability;
+
+    var exts = Extensions.init(allocator, .{ .log = TestLogRecord.encode });
+    defer exts.deinit();
+    _ = exts.enableS3Dump(allocator, .{}, null);
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(test_io);
+    var registry = policy.Registry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // One call wires both seams onto the registry.
+    exts.register(&registry);
+    try testing.expect(registry.extension_resolver != null);
+    try testing.expect(registry.extension_sync_hooks != null);
+
+    // A file provider accepts the hooks and ignores them (no control plane):
+    // the union dispatch must not crash and leaves nothing to observe.
+    const file_provider = try policy.FileProvider.init(allocator, test_io, noop_bus.eventBus(), .{
+        .id = "local",
+        .path = "does-not-exist.json",
+    });
+    defer file_provider.deinit();
+    const file_prov: policy.Provider = .{ .file = file_provider };
+    file_prov.setExtensionSyncHooks(registry.extension_sync_hooks.?);
+
+    // An HTTP provider actually stores them — this is what `subscribe` pushes.
+    const http_provider = try policy.HttpProvider.init(allocator, test_io, noop_bus.eventBus(), .{
+        .id = "control-plane",
+        .url = "http://127.0.0.1:1/policies",
+    });
+    defer http_provider.deinit();
+    try testing.expect(http_provider.extension_hooks == null);
+    const http_prov: policy.Provider = .{ .http = http_provider };
+    http_prov.setExtensionSyncHooks(registry.extension_sync_hooks.?);
+    try testing.expect(http_provider.extension_hooks != null);
 }

@@ -42,27 +42,11 @@ const HttpSyncStatusReported = struct { id: []const u8, match_hits: i64, match_m
 const HttpFetchStarted = struct {};
 const HttpFetchCompleted = struct {};
 
-/// Extension sync plumbing (spec v1.6.0), implemented outside policy_zig by
-/// the extensions module: capability advertisement for sync requests and
-/// routing of broadcast extension configs from responses. A fn-pointer seam
-/// like StatsCollector — not a vtable of behaviors, just the two crossings.
-pub const ExtensionSyncHooks = struct {
-    ctx: *anyopaque,
-    /// Build ClientMetadata.supported_extensions. Allocate from `arena`.
-    capabilities: *const fn (
-        io: std.Io,
-        ctx: *anyopaque,
-        arena: std.mem.Allocator,
-    ) anyerror![]proto.policy.ExtensionCapability,
-    /// Receive SyncResponse.extension_configs. Called before policies are
-    /// handed to the registry, so broadcast targets exist by the time the
-    /// snapshot compiles extension bindings against them.
-    apply_configs: *const fn (
-        io: std.Io,
-        ctx: *anyopaque,
-        configs: []const proto.policy.ExtensionConfig,
-    ) void,
-};
+/// Extension sync plumbing lives in the generic provider layer now (it's
+/// handed to every provider variant by the registry, like `StatsCollector`).
+/// Re-exported here so existing `HttpProvider.ExtensionSyncHooks` references
+/// keep resolving.
+pub const ExtensionSyncHooks = policy_provider.ExtensionSyncHooks;
 
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {

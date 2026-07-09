@@ -58,6 +58,7 @@ pub const PolicyMetadata = source.PolicyMetadata;
 pub const provider = @import("./provider.zig");
 pub const PolicyCallback = provider.PolicyCallback;
 pub const PolicyUpdate = provider.PolicyUpdate;
+pub const ExtensionSyncHooks = provider.ExtensionSyncHooks;
 
 /// Re-export registry
 pub const registry = @import("./registry.zig");

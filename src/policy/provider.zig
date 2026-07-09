@@ -34,6 +34,33 @@ pub const StatsCollector = struct {
     }
 };
 
+/// Extension sync plumbing (spec v1.6.0), implemented outside policy_zig by
+/// the extensions module: capability advertisement for sync requests and
+/// routing of broadcast extension configs from responses. A fn-pointer seam
+/// like `StatsCollector` — not a vtable of behaviors, just the two crossings.
+///
+/// Handed to a provider by the registry at subscribe time, the same way
+/// `StatsCollector` is. Providers with no control plane (file, testing) accept
+/// the call and ignore it: there is nobody to advertise capabilities to and no
+/// broadcast channel to receive from.
+pub const ExtensionSyncHooks = struct {
+    ctx: *anyopaque,
+    /// Build ClientMetadata.supported_extensions. Allocate from `arena`.
+    capabilities: *const fn (
+        io: std.Io,
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+    ) anyerror![]proto.policy.ExtensionCapability,
+    /// Receive SyncResponse.extension_configs. Called before policies are
+    /// handed to the registry, so broadcast targets exist by the time the
+    /// snapshot compiles extension bindings against them.
+    apply_configs: *const fn (
+        io: std.Io,
+        ctx: *anyopaque,
+        configs: []const proto.policy.ExtensionConfig,
+    ) void,
+};
+
 /// Update notification sent by providers to subscribers
 pub const PolicyUpdate = struct {
     policies: []const Policy,

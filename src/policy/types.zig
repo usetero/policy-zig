@@ -675,6 +675,18 @@ pub const Provider = union(enum) {
         }
     }
 
+    /// Hand the provider extension sync hooks (v1.6.0): capability
+    /// advertisement in sync requests and routing of broadcast extension
+    /// configs from responses. Only the HTTP provider has a control plane;
+    /// file/testing accept the call and ignore it (nowhere to advertise to, no
+    /// broadcast to receive). Wired uniformly by `registry.subscribe`.
+    pub fn setExtensionSyncHooks(self: Provider, hooks: policy_provider.ExtensionSyncHooks) void {
+        switch (self) {
+            .http => |p| p.setExtensionSyncHooks(hooks),
+            .file, .testing => {},
+        }
+    }
+
     pub fn sourceType(self: Provider) SourceType {
         return switch (self) {
             .file => .file,
