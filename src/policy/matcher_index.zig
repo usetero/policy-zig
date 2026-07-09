@@ -1760,7 +1760,8 @@ pub const LogMatcherIndex = struct {
     }
 
     pub fn isEmpty(self: *const LogMatcherIndex) bool {
-        return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
+        return self.matcher_keys.len == 0 and self.typed_checks.len == 0 and
+            self.extension_bindings.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const LogMatcherIndex) usize {
@@ -1921,7 +1922,8 @@ pub const MetricMatcherIndex = struct {
     }
 
     pub fn isEmpty(self: *const MetricMatcherIndex) bool {
-        return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
+        return self.matcher_keys.len == 0 and self.typed_checks.len == 0 and
+            self.extension_bindings.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const MetricMatcherIndex) usize {
@@ -2077,7 +2079,8 @@ pub const TraceMatcherIndex = struct {
     }
 
     pub fn isEmpty(self: *const TraceMatcherIndex) bool {
-        return self.matcher_keys.len == 0 and self.typed_checks.len == 0;
+        return self.matcher_keys.len == 0 and self.typed_checks.len == 0 and
+            self.extension_bindings.len == 0;
     }
 
     pub fn getDatabaseCount(self: *const TraceMatcherIndex) usize {
