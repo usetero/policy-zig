@@ -1114,10 +1114,13 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     return null;
                 },
                 // equals.string_value compiles to a Hyperscan pattern like
-                // `exact`; other equals variants are typed checks.
+                // `exact`, but as an escaped literal so it matches the raw
+                // string rather than being interpreted as regex syntax;
+                // other equals variants are typed checks.
                 .equals => |v| if (v.value != null and v.value.? == .string_value) {
                     const p = v.value.?.string_value;
-                    if (!self.patternCompiles(p, .exact, matcher.case_insensitive)) {
+                    const escaped = try escapeRegexLiteral(self.temp_allocator, p);
+                    if (!self.patternCompiles(escaped, .exact, matcher.case_insensitive)) {
                         try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                         return null;
                     }
@@ -1337,7 +1340,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => {},
             }
 
-            const pattern, const pattern_match_type, const negate = switch (m) {
+            const raw_pattern, const pattern_match_type, const negate = switch (m) {
                 .regex => |r| .{ r, match_type.regex, matcher.negate },
                 .exact => |e| .{ e, match_type.exact, matcher.negate },
                 .equals => |v| .{ v.value.?.string_value, match_type.exact, matcher.negate },
@@ -1348,7 +1351,20 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .gt, .gte, .lt, .lte => unreachable,
             };
 
-            if (pattern.len == 0) {
+            // equals.string_value is typed literal equality (documented as
+            // such, unlike the regex-flavored `exact`), so escape regex
+            // metacharacters before it's compiled as a Hyperscan pattern.
+            // temp_allocator is fine here: the pattern text is only read
+            // while compiling the Hyperscan database in finish(), which
+            // runs before the builder's arena is torn down.
+            const pattern = if (m == .equals) try escapeRegexLiteral(self.temp_allocator, raw_pattern) else raw_pattern;
+
+            // Only regex/starts_with/ends_with/contains are trivially
+            // always-true when empty, so only they can be skipped as a
+            // no-op matcher; an empty `exact`/`equals` pattern is a
+            // meaningful "field is the empty string" check and must still
+            // be compiled (as `^$`).
+            if (pattern.len == 0 and pattern_match_type != .exact) {
                 self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
                 return;
             }
@@ -2230,6 +2246,24 @@ fn compilePatterns(
 
     const db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
     return .{ .db = db, .meta = meta };
+}
+
+/// Escape regex metacharacters so `literal` can be embedded in a Hyperscan
+/// pattern (via the `.exact` match type) and matched byte-for-byte, rather
+/// than interpreted as regex syntax. Used for `equals.string_value`, which
+/// is documented as typed string equality, not pattern matching.
+fn escapeRegexLiteral(allocator: std.mem.Allocator, literal: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, literal.len);
+    for (literal) |c| {
+        switch (c) {
+            '\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']', '{', '}' => try out.append(allocator, '\\'),
+            else => {},
+        }
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn formatPattern(buf: *[]u8, pattern: []const u8, pattern_match_type: match_type) []const u8 {
@@ -3235,6 +3269,27 @@ test "formatPattern: contains returns pattern unchanged" {
     var slice: []u8 = &buf;
     const result = formatPattern(&slice, "password", .contains);
     try testing.expectEqualStrings("password", result);
+}
+
+test "escapeRegexLiteral: escapes regex metacharacters" {
+    const allocator = testing.allocator;
+    const escaped = try escapeRegexLiteral(allocator, "a.b(c)[d]$e^f");
+    defer allocator.free(escaped);
+    try testing.expectEqualStrings("a\\.b\\(c\\)\\[d\\]\\$e\\^f", escaped);
+}
+
+test "escapeRegexLiteral: plain string is unchanged" {
+    const allocator = testing.allocator;
+    const escaped = try escapeRegexLiteral(allocator, "checkout-api");
+    defer allocator.free(escaped);
+    try testing.expectEqualStrings("checkout-api", escaped);
+}
+
+test "escapeRegexLiteral: empty string stays empty" {
+    const allocator = testing.allocator;
+    const escaped = try escapeRegexLiteral(allocator, "");
+    defer allocator.free(escaped);
+    try testing.expectEqualStrings("", escaped);
 }
 
 test "Log matcher with starts_with" {

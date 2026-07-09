@@ -390,6 +390,21 @@ pub const TypedValue = union(enum) {
     bytes: []const u8,
 };
 
+/// trace_id is 16 bytes, span_id 8 — 32 covers both with headroom.
+pub const max_hex_id_bytes = 32;
+
+/// Render raw id bytes as lowercase hex into `buf`. Returns the rendered slice,
+/// or the raw bytes unchanged when they don't fit (degrade, never overflow).
+pub fn hexRenderId(bytes: []const u8, buf: []u8) []const u8 {
+    if (bytes.len * 2 > buf.len) return bytes;
+    const hex = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        buf[i * 2] = hex[b >> 4];
+        buf[i * 2 + 1] = hex[b & 0x0f];
+    }
+    return buf[0 .. bytes.len * 2];
+}
+
 // =============================================================================
 // Log Accessor - Capability-tagged interface to consumer log records
 // =============================================================================

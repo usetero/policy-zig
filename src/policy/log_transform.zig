@@ -202,9 +202,12 @@ pub fn applyRemove(
 ///
 /// When `options.compiled` is null, replaces the entire field value with
 /// `rule.replacement`. When non-null, runs the pre-compiled regex over the
-/// `.string` value returned by `accessor.typed_value` and substitutes each
-/// match using the pre-parsed replacement template. If the field is missing
-/// or non-string, or the regex finds no match, the operation is a no-op.
+/// value returned by `accessor.typed_value` and substitutes each match using
+/// the pre-parsed replacement template. `.bytes` values (e.g. trace/span ids)
+/// are hex-rendered first so regex redact can still target them, mirroring
+/// how the engine hex-renders `.bytes` for string matchers. If the field is
+/// missing, non-textual (bool/int/double), or the regex finds no match, the
+/// operation is a no-op.
 ///
 /// Returns true if the field was redacted.
 pub fn applyRedact(
@@ -220,8 +223,12 @@ pub fn applyRedact(
         const allocator = options.scratch orelse return false;
         const io = options.io orelse return false;
         const tv = accessor.typed_value(ctx, field_ref) orelse return false;
-        if (tv != .string) return false; // regex redact no-ops on non-string values
-        const value = tv.string;
+        var hex_buf: [types.max_hex_id_bytes * 2]u8 = undefined;
+        const value = switch (tv) {
+            .string => |s| s,
+            .bytes => |b| types.hexRenderId(b, &hex_buf),
+            .bool, .int, .double => return false, // regex redact no-ops on non-textual values
+        };
 
         var out: std.ArrayList(u8) = .empty;
         // No deinit: `out.items` is handed to the accessor.set by reference
@@ -640,6 +647,107 @@ test "applyRedact: regex on missing field is a no-op" {
     defer compiled.deinit();
 
     const result = applyRedact(&TestContext.accessor, &rule, @ptrCast(&ctx), .{
+        .compiled = &compiled,
+        .scratch = arena.allocator(),
+        .io = std.Options.debug_io,
+    });
+    try testing.expect(!result);
+}
+
+test "applyRedact: regex matches hex-rendered .bytes field (e.g. trace_id)" {
+    // Regression: identifier fields (LOG_FIELD_TRACE_ID/SPAN_ID) surface as
+    // `.bytes` via typed_value. Regex redact must hex-render them (like the
+    // engine does for string matchers) instead of no-oping.
+    const BytesCtx = struct {
+        const Self = @This();
+
+        stored: ?[]const u8 = null,
+
+        fn valueFn(ctx: *const anyopaque, field: FieldRef) ?types.TypedValue {
+            _ = field;
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            return .{ .bytes = self.stored orelse return null };
+        }
+
+        fn setFn(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
+            _ = field;
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.stored = value;
+        }
+
+        fn deleteFn(_: *anyopaque, _: FieldRef) bool {
+            return false;
+        }
+        fn moveFn(_: *anyopaque, _: FieldRef, _: []const u8) void {}
+        const accessor: LogAccessor = .{
+            .typed_value = valueFn,
+            .set = setFn,
+            .delete = deleteFn,
+            .move = moveFn,
+        };
+    };
+
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Raw bytes for trace_id 0xdeadbeef...
+    var ctx: BytesCtx = .{ .stored = &.{ 0xde, 0xad, 0xbe, 0xef } };
+
+    var rule: LogRedact = .{
+        .field = .{ .log_field = .LOG_FIELD_TRACE_ID },
+        .replacement = "$1",
+        .regex = "^(dead)beef$",
+    };
+
+    var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
+    defer compiled.deinit();
+
+    const result = applyRedact(&BytesCtx.accessor, &rule, @ptrCast(&ctx), .{
+        .compiled = &compiled,
+        .scratch = arena.allocator(),
+        .io = std.Options.debug_io,
+    });
+    try testing.expect(result);
+    try testing.expectEqualStrings("dead", ctx.stored.?);
+}
+
+test "applyRedact: regex no-ops on non-textual (bool/int/double) typed value" {
+    const NumCtx = struct {
+        const Self = @This();
+        fn valueFn(ctx: *const anyopaque, field: FieldRef) ?types.TypedValue {
+            _ = ctx;
+            _ = field;
+            return .{ .int = 42 };
+        }
+        fn setFn(_: *anyopaque, _: FieldRef, _: []const u8) void {}
+        fn deleteFn(_: *anyopaque, _: FieldRef) bool {
+            return false;
+        }
+        fn moveFn(_: *anyopaque, _: FieldRef, _: []const u8) void {}
+        const accessor: LogAccessor = .{
+            .typed_value = valueFn,
+            .set = setFn,
+            .delete = deleteFn,
+            .move = moveFn,
+        };
+    };
+
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var ctx: NumCtx = .{};
+
+    var rule: LogRedact = .{
+        .field = .{ .log_attribute = testAttrPath("count") },
+        .replacement = "X",
+        .regex = "\\d+",
+    };
+
+    var compiled = try redact_mod.Compiled.init(allocator, rule.regex.?, rule.replacement);
+    defer compiled.deinit();
+
+    const result = applyRedact(&NumCtx.accessor, &rule, @ptrCast(&ctx), .{
         .compiled = &compiled,
         .scratch = arena.allocator(),
         .io = std.Options.debug_io,
