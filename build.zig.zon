@@ -51,8 +51,8 @@
             .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
         },
         .z3 = .{
-            .url = "git+https://codeberg.org/fellowtraveler/z3#83b1f8d6222188f39c09966b8572bc9168813d04",
-            .hash = "z3-0.4.1-N25-cH-fAQAbj6ABBY0Bq85Kv-d7sdIvANgLCE9NCaEF",
+            .url = "git+https://codeberg.org/fellowtraveler/z3#8fb97954064e24ceaf790cbb2a9ea49dfdd2c79c",
+            .hash = "z3-0.5.0-N25-cFAKAgBndidzn7VaFaXJ6NIE5QH-qbznr9TyqMv7",
         },
     },
     // Specifies the set of files and directories that are included in this package.

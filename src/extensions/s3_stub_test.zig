@@ -260,3 +260,46 @@ test "e2e stub: 5xx requeues; the retry succeeds under the same key with the sam
     try testing.expectEqualStrings(stub.received.items[0].target, stub.received.items[1].target);
     try testing.expectEqualStrings(stub.received.items[0].body, stub.received.items[1].body);
 }
+
+test "e2e stub: session_token creds sign an x-amz-security-token header" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = try StubS3Server.start(allocator, io, &.{.ok});
+    defer stub.deinit(io);
+    var server_future = io.concurrent(StubS3Server.serve, .{ &stub, io }) catch
+        return error.SkipZigTest;
+    defer server_future.cancel(io);
+
+    // Temporary creds (Lambda role): access + secret + session token. z3 signs
+    // the token in as x-amz-security-token; a static keypair carries no such
+    // header (see the first test's head assertions).
+    const sts_creds: S3Dump.Credentials = .{
+        .access_key_id = "test-access-key",
+        .secret_access_key = "test-secret-key",
+        .session_token = "test-token",
+    };
+    var dump = S3Dump.init(allocator, .{ .max_attempts = 1 }, sts_creds);
+    defer dump.deinit();
+    const tj = try targetJson(allocator, stub.port);
+    defer allocator.free(tj);
+    try dump.addTarget(io, "stub", tj);
+
+    const ref = try encodeTargetRef(allocator, "s3", "stub");
+    defer allocator.free(ref);
+    const slot = dump.resolve(io, .log, "dump-policy", ref).?;
+
+    const rec: []const u8 = "{\"body\":\"one\"}";
+    dump.deliver(io, slot, @ptrCast(&rec), encodeRecord);
+
+    const result = dump.flush(io, .{ .force = true });
+    server_future.await(io);
+
+    try testing.expectEqual(@as(u32, 1), result.objects_uploaded);
+    try testing.expectEqual(@as(usize, 1), stub.received.items.len);
+    const req = stub.received.items[0];
+    try testing.expect(StubS3Server.headContains(req.head, "x-amz-security-token"));
+    try testing.expect(StubS3Server.headContains(req.head, "test-token"));
+}
