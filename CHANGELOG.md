@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/usetero/policy-zig/compare/v0.5.0...v0.5.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* use session token ([#82](https://github.com/usetero/policy-zig/issues/82)) ([3d02e3c](https://github.com/usetero/policy-zig/commit/3d02e3c44f7b6c510ffeebe125d17a89aafb5015))
+
 ## [0.5.0](https://github.com/usetero/policy-zig/compare/v0.4.4...v0.5.0) (2026-07-09)
 
 
