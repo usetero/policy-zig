@@ -53,6 +53,11 @@ pub const S3Dump = struct {
     pub const Credentials = struct {
         access_key_id: []const u8,
         secret_access_key: []const u8,
+        /// Optional STS/session token (AWS_SESSION_TOKEN). Set for temporary
+        /// creds (e.g. a Lambda execution role); null for a static IAM-user
+        /// keypair. When present it is signed into the request as
+        /// x-amz-security-token by z3.
+        session_token: ?[]const u8 = null,
     };
 
     /// Kind-defined config carried in `ExtensionTarget.config` for kind
@@ -538,6 +543,7 @@ pub const S3Dump = struct {
             clients[target] = s3.S3Client.init(self.allocator, .{
                 .access_key_id = creds.access_key_id,
                 .secret_access_key = creds.secret_access_key,
+                .session_token = creds.session_token,
                 .region = snap.region,
                 .endpoint = snap.endpoint,
                 .virtual_host_style = snap.virtual_host_style,
