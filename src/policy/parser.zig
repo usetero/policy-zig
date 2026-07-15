@@ -26,6 +26,9 @@ const AttributePath = proto.policy.AttributePath;
 const LogSampleKey = proto.policy.LogSampleKey;
 const Value = proto.policy.Value;
 const NumericValue = proto.policy.NumericValue;
+const Extension = proto.policy.Extension;
+const ExtensionMode = proto.policy.ExtensionMode;
+const ExtensionTargetRef = proto.policy.ExtensionTargetRef;
 
 /// Parse an AttributePath from a JSON value.
 /// Supports three formats:
@@ -330,6 +333,25 @@ const TraceTargetJson = struct {
 ///   "name": "Drop health check logs",
 ///   "log": { ... }
 /// }
+/// JSON schema for a policy extension.
+/// Example:
+///   { "type": "com.usetero/s3-dump", "version": "1.0.0", "mode": "all",
+///     "target": { "kind": "s3", "name": "datadog-forwarder-dump" } }
+/// `target` (optional) is serialized into the proto Extension.config bytes as an
+/// ExtensionTargetRef — the shape the engine decodes when resolving the
+/// extension's destination.
+const ExtensionTargetRefJson = struct {
+    kind: []const u8,
+    name: []const u8,
+};
+
+const ExtensionJson = struct {
+    type: []const u8,
+    version: []const u8 = "1.0.0",
+    mode: []const u8 = "all",
+    target: ?ExtensionTargetRefJson = null,
+};
+
 const PolicyJson = struct {
     id: []const u8,
     name: []const u8,
@@ -340,6 +362,9 @@ const PolicyJson = struct {
     log: ?LogTargetJson = null,
     metric: ?MetricTargetJson = null,
     trace: ?TraceTargetJson = null,
+
+    // Optional policy extensions (e.g. com.usetero/s3-dump). Empty/absent → none.
+    extensions: ?[]ExtensionJson = null,
 };
 
 /// JSON schema for a policies file
@@ -404,12 +429,67 @@ fn parsePolicy(allocator: std.mem.Allocator, json_policy: PolicyJson) !Policy {
         target = .{ .trace = try parseTraceTarget(allocator, trace_json) };
     }
 
+    var extensions: std.ArrayList(Extension) = .empty;
+    if (json_policy.extensions) |json_exts| {
+        try extensions.ensureTotalCapacity(allocator, json_exts.len);
+        for (json_exts) |json_ext| {
+            extensions.appendAssumeCapacity(try parseExtension(allocator, json_ext));
+        }
+    }
+
     return .{
         .id = id,
         .name = name,
         .description = description,
         .enabled = json_policy.enabled,
         .target = target,
+        .extensions = extensions,
+    };
+}
+
+/// Map the extension `mode` string to the proto enum. Accepts both the short
+/// aliases used in policy JSON ("all", "kept", ...) and the full proto names.
+fn parseExtensionMode(name: []const u8) !ExtensionMode {
+    return parseEnumAlias(ExtensionMode, &.{
+        .{ "unspecified", .EXTENSION_MODE_UNSPECIFIED },
+        .{ "EXTENSION_MODE_UNSPECIFIED", .EXTENSION_MODE_UNSPECIFIED },
+        .{ "kept", .EXTENSION_MODE_KEPT },
+        .{ "EXTENSION_MODE_KEPT", .EXTENSION_MODE_KEPT },
+        .{ "dropped", .EXTENSION_MODE_DROPPED },
+        .{ "EXTENSION_MODE_DROPPED", .EXTENSION_MODE_DROPPED },
+        .{ "unmatched", .EXTENSION_MODE_UNMATCHED },
+        .{ "EXTENSION_MODE_UNMATCHED", .EXTENSION_MODE_UNMATCHED },
+        .{ "matched", .EXTENSION_MODE_MATCHED },
+        .{ "EXTENSION_MODE_MATCHED", .EXTENSION_MODE_MATCHED },
+        .{ "all", .EXTENSION_MODE_ALL },
+        .{ "EXTENSION_MODE_ALL", .EXTENSION_MODE_ALL },
+    }, error.InvalidExtensionMode, name);
+}
+
+/// Build a proto Extension from its JSON. `target`, when present, is encoded
+/// into `config` as a serialized ExtensionTargetRef — the same bytes the sync
+/// path carries and the engine decodes to resolve the destination.
+fn parseExtension(allocator: std.mem.Allocator, json: ExtensionJson) !Extension {
+    const type_str = try allocator.dupe(u8, json.type);
+    errdefer allocator.free(type_str);
+    const version = try allocator.dupe(u8, json.version);
+    errdefer allocator.free(version);
+    const mode = try parseExtensionMode(json.mode);
+
+    var config: []const u8 = &.{};
+    if (json.target) |t| {
+        const ref: ExtensionTargetRef = .{ .kind = t.kind, .name = t.name };
+        var w: std.Io.Writer.Allocating = .init(allocator);
+        defer w.deinit();
+        try ref.encode(&w.writer, allocator);
+        config = try allocator.dupe(u8, w.written());
+    }
+
+    return .{
+        .type = type_str,
+        .version = version,
+        .config = config,
+        .mode = mode,
     };
 }
 
@@ -1140,6 +1220,74 @@ test "parsePoliciesBytes: log policy with new format" {
     try std.testing.expect(matcher.match != null);
     try std.testing.expect(matcher.match.? == .regex);
     try std.testing.expectEqualStrings("GET /health", matcher.match.?.regex);
+}
+
+test "parsePoliciesBytes: log policy with s3-dump extension" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "dump-all",
+        \\      "name": "Dump all logs to S3",
+        \\      "log": { "match": [{ "log_field": "body", "regex": ".*" }], "keep": "all" },
+        \\      "extensions": [
+        \\        { "type": "com.usetero/s3-dump", "version": "1.0.0", "mode": "all",
+        \\          "target": { "kind": "s3", "name": "datadog-forwarder-dump" } }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const exts = policies[0].extensions;
+    try std.testing.expectEqual(@as(usize, 1), exts.items.len);
+
+    const ext = exts.items[0];
+    try std.testing.expectEqualStrings("com.usetero/s3-dump", ext.type);
+    try std.testing.expectEqualStrings("1.0.0", ext.version);
+    try std.testing.expectEqual(ExtensionMode.EXTENSION_MODE_ALL, ext.mode);
+
+    // config round-trips to the ExtensionTargetRef the engine resolves against.
+    try std.testing.expect(ext.config.len > 0);
+    var reader = std.Io.Reader.fixed(ext.config);
+    var ref = try ExtensionTargetRef.decode(&reader, allocator);
+    defer ref.deinit(allocator);
+    try std.testing.expectEqualStrings("s3", ref.kind);
+    try std.testing.expectEqualStrings("datadog-forwarder-dump", ref.name);
+}
+
+test "parsePoliciesBytes: policy without extensions has none" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"policies":[{"id":"p","name":"n","log":{"match":[{"log_field":"body","regex":"x"}],"keep":"all"}}]}
+    ;
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+    try std.testing.expectEqual(@as(usize, 0), policies[0].extensions.items.len);
+}
+
+test "parseExtensionMode aliases and error" {
+    try std.testing.expectEqual(ExtensionMode.EXTENSION_MODE_ALL, try parseExtensionMode("all"));
+    try std.testing.expectEqual(ExtensionMode.EXTENSION_MODE_DROPPED, try parseExtensionMode("dropped"));
+    try std.testing.expectEqual(ExtensionMode.EXTENSION_MODE_KEPT, try parseExtensionMode("EXTENSION_MODE_KEPT"));
+    try std.testing.expectError(error.InvalidExtensionMode, parseExtensionMode("bogus"));
 }
 
 test "parsePoliciesBytes: metric policy with new format" {
