@@ -348,7 +348,10 @@ const ExtensionTargetRefJson = struct {
 const ExtensionJson = struct {
     type: []const u8,
     version: []const u8 = "1.0.0",
-    mode: []const u8 = "all",
+    /// Defaults to "unspecified" to match the proto/sync default, which the
+    /// engine resolves as matched-only (kept + dropped). Set "all" explicitly to
+    /// also receive unmatched records (e.g. a dump-everything policy).
+    mode: []const u8 = "unspecified",
     target: ?ExtensionTargetRefJson = null,
 };
 
@@ -430,6 +433,12 @@ fn parsePolicy(allocator: std.mem.Allocator, json_policy: PolicyJson) !Policy {
     }
 
     var extensions: std.ArrayList(Extension) = .empty;
+    // Free already-parsed extensions (each owns duped type/version/config) plus
+    // the list itself if a later entry fails to parse.
+    errdefer {
+        for (extensions.items) |*e| e.deinit(allocator);
+        extensions.deinit(allocator);
+    }
     if (json_policy.extensions) |json_exts| {
         try extensions.ensureTotalCapacity(allocator, json_exts.len);
         for (json_exts) |json_ext| {
@@ -1281,6 +1290,26 @@ test "parsePoliciesBytes: policy without extensions has none" {
         allocator.free(policies);
     }
     try std.testing.expectEqual(@as(usize, 0), policies[0].extensions.items.len);
+}
+
+test "parsePoliciesBytes: extension omitting mode defaults to unspecified (matched-only)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"policies":[{"id":"p","name":"n",
+        \\ "log":{"match":[{"log_field":"body","regex":"x"}],"keep":"all"},
+        \\ "extensions":[{"type":"com.usetero/s3-dump","target":{"kind":"s3","name":"t"}}]}]}
+    ;
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+    const ext = policies[0].extensions.items[0];
+    // Not "all": omitting mode must not route unmatched records to the extension.
+    try std.testing.expectEqual(ExtensionMode.EXTENSION_MODE_UNSPECIFIED, ext.mode);
+    try std.testing.expectEqualStrings("1.0.0", ext.version); // version also defaults
 }
 
 test "parseExtensionMode aliases and error" {
