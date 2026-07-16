@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/usetero/policy-zig/compare/v0.5.1...v0.6.0) (2026-07-15)
+
+
+### Features
+
+* accept policy extensions in the static JSON parser ([#84](https://github.com/usetero/policy-zig/issues/84)) ([11aa28c](https://github.com/usetero/policy-zig/commit/11aa28c8e6b554047becc69fabafa7966676cecf))
+
 ## [0.5.1](https://github.com/usetero/policy-zig/compare/v0.5.0...v0.5.1) (2026-07-14)
 
 
