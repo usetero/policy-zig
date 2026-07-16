@@ -169,6 +169,22 @@ pub const PolicyLoader = struct {
         return count;
     }
 
+    /// Flush every subscribed provider before teardown: each HTTP provider does
+    /// one final synchronous sync so tail stats reach the control plane
+    /// (file/testing are no-ops). Every provider is attempted even if an earlier
+    /// one fails; the first error is returned so a partial-flush shutdown is
+    /// still visible to the caller. Call this before the io is torn down (e.g. a
+    /// Lambda shutdown window), then `deinit`; `deinit` does not flush on its own.
+    pub fn close(self: *PolicyLoader) !void {
+        var first_err: ?anyerror = null;
+        for (self.provider_states) |state| {
+            if (state.provider) |prov| prov.close() catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
     /// Shutdown all providers and clean up resources.
     pub fn deinit(self: *PolicyLoader) void {
         const allocator = self.allocator;

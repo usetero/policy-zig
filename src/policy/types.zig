@@ -710,6 +710,19 @@ pub const Provider = union(enum) {
         };
     }
 
+    /// Flush any final state before teardown. The HTTP provider performs one
+    /// last synchronous sync so tail stats (hits/misses/errors accrued since
+    /// the previous poll) reach the control plane and returns its error if that
+    /// fails; file/testing have no control plane, so this is a no-op. Must run
+    /// before the io is torn down (`deinit` does not flush) — call it in the
+    /// consumer's shutdown window, e.g. a Lambda SHUTDOWN handler.
+    pub fn close(self: Provider) !void {
+        switch (self) {
+            .http => |p| try p.close(),
+            .file, .testing => {},
+        }
+    }
+
     pub fn deinit(self: Provider) void {
         switch (self) {
             inline else => |p| p.deinit(),
