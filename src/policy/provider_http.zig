@@ -611,13 +611,15 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
     // with an empty SyncResponse. Refuses to serve more than one request so a
     // second close() firing a redundant sync would be observable as a hang/fail.
     const Stub = struct {
+        const Self = @This();
+
         allocator: std.mem.Allocator,
         listener: std.Io.net.Server,
         port: u16,
         body: []u8 = &.{},
         served: bool = false,
 
-        fn start(a: std.mem.Allocator, sio: std.Io) !@This() {
+        fn start(a: std.mem.Allocator, sio: std.Io) !Self {
             var attempt: u16 = 0;
             while (attempt < 32) : (attempt += 1) {
                 const port: u16 = 42801 + attempt;
@@ -631,12 +633,13 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
             return error.AddressInUse;
         }
 
-        fn deinit(self: *@This(), sio: std.Io) void {
+        fn deinit(self: *Self, sio: std.Io) void {
+            defer self.* = undefined;
             self.listener.deinit(sio);
             if (self.body.len > 0) self.allocator.free(self.body);
         }
 
-        fn serve(self: *@This(), sio: std.Io) void {
+        fn serve(self: *Self, sio: std.Io) void {
             var stream = self.listener.accept(sio) catch return;
             defer stream.close(sio);
             var recv_buf: [16 * 1024]u8 = undefined;
