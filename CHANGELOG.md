@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/usetero/policy-zig/compare/v0.6.0...v0.6.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* add a close method on the providers ([#86](https://github.com/usetero/policy-zig/issues/86)) ([3572460](https://github.com/usetero/policy-zig/commit/3572460936d9905a1de705ca6503ad985b139da0))
+
 ## [0.6.0](https://github.com/usetero/policy-zig/compare/v0.5.1...v0.6.0) (2026-07-15)
 
 
