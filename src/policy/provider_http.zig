@@ -60,6 +60,9 @@ pub const HttpProvider = struct {
     callback: ?PolicyCallback,
     poll_thread: ?std.Thread,
     shutdown_flag: std.atomic.Value(bool),
+    /// Set once `close` has performed its final flush, so a second `close` (or
+    /// none, if the caller skipped it) never fires a redundant sync.
+    flushed: bool = false,
 
     // Service metadata for sync requests (not owned, references config)
     service: ServiceMetadata,
@@ -198,6 +201,30 @@ pub const HttpProvider = struct {
             thread.join();
             self.poll_thread = null;
         }
+    }
+
+    /// Graceful close: stop the poll loop, then perform one final synchronous
+    /// sync so per-policy stats accumulated since the last poll tick reach the
+    /// control plane before teardown. Stopping the loop first guarantees this
+    /// is the only sync in flight (no concurrent poll-thread fetch).
+    ///
+    /// Returns the final sync's error rather than swallowing it — the caller
+    /// decides whether a lost tail report is worth logging or acting on. The
+    /// flush is attempted at most once: `flushed` is set before the sync (the
+    /// stats collector resets its counters when pulled, so the tail is gone on
+    /// failure and a retry would only report zeros), so a second call is a
+    /// no-op and the loop is stopped either way.
+    ///
+    /// Reuses the io bound at init (the same process-wide io is still live at
+    /// shutdown), so this must run before that io is torn down — i.e. in the
+    /// consumer's shutdown window, before `deinit`. `deinit` does not flush.
+    pub fn close(self: *HttpProvider) !void {
+        if (self.flushed) return;
+        self.flushed = true;
+
+        self.shutdown();
+
+        try self.fetchAndNotify();
     }
 
     pub fn deinit(self: *HttpProvider) void {
@@ -570,6 +597,139 @@ test "HttpProvider: setStatsCollector stores the collector" {
     var ctx: u8 = 0;
     provider.setStatsCollector(.{ .context = &ctx, .collect = Stub.collect });
     try testing.expect(provider.stats_collector != null);
+}
+
+test "HttpProvider.close: flushes final stats once, then is idempotent" {
+    const allocator = testing.allocator;
+    // Own Threaded io so the stub control-plane server gets a real thread,
+    // mirroring the s3 stub test.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Minimal control-plane stub: accept one POST, record its body, answer 200
+    // with an empty SyncResponse. Refuses to serve more than one request so a
+    // second close() firing a redundant sync would be observable as a hang/fail.
+    const Stub = struct {
+        allocator: std.mem.Allocator,
+        listener: std.Io.net.Server,
+        port: u16,
+        body: []u8 = &.{},
+        served: bool = false,
+
+        fn start(a: std.mem.Allocator, sio: std.Io) !@This() {
+            var attempt: u16 = 0;
+            while (attempt < 32) : (attempt += 1) {
+                const port: u16 = 42801 + attempt;
+                const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+                const listener = addr.listen(sio, .{}) catch |err| switch (err) {
+                    error.AddressInUse => continue,
+                    else => return err,
+                };
+                return .{ .allocator = a, .listener = listener, .port = port };
+            }
+            return error.AddressInUse;
+        }
+
+        fn deinit(self: *@This(), sio: std.Io) void {
+            self.listener.deinit(sio);
+            if (self.body.len > 0) self.allocator.free(self.body);
+        }
+
+        fn serve(self: *@This(), sio: std.Io) void {
+            var stream = self.listener.accept(sio) catch return;
+            defer stream.close(sio);
+            var recv_buf: [16 * 1024]u8 = undefined;
+            var send_buf: [4 * 1024]u8 = undefined;
+            var conn_reader = stream.reader(sio, &recv_buf);
+            var conn_writer = stream.writer(sio, &send_buf);
+            var http_server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+            var request = http_server.receiveHead() catch return;
+            var transfer_buf: [8 * 1024]u8 = undefined;
+            const body_reader = request.readerExpectContinue(&transfer_buf) catch return;
+            self.body = body_reader.allocRemaining(self.allocator, .limited(1 << 20)) catch return;
+            self.served = true;
+            request.respond("{}", .{ .status = .ok }) catch return;
+        }
+    };
+
+    var stub = try Stub.start(allocator, io);
+    defer stub.deinit(io);
+    var server_future = io.concurrent(Stub.serve, .{ &stub, io }) catch
+        return error.SkipZigTest;
+    defer server_future.cancel(io);
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/sync", .{stub.port});
+    defer allocator.free(url);
+
+    var provider = try HttpProvider.init(
+        allocator,
+        io,
+        noop_bus.eventBus(),
+        .{ .id = "p", .url = url, .poll_interval_seconds = 3600 },
+    );
+    defer provider.deinit();
+
+    // Collector counts calls and reports one policy with real hits — this is
+    // the tail stat that must reach the control plane before teardown.
+    const Collector = struct {
+        var calls: usize = 0;
+        fn collect(arena: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+            calls += 1;
+            const rows = try arena.alloc(PolicyStatsSnapshot, 1);
+            rows[0] = .{ .id = "hot", .hits = 5, .misses = 1 };
+            return rows;
+        }
+    };
+    Collector.calls = 0;
+    var ctx: u8 = 0;
+    provider.setStatsCollector(.{ .context = &ctx, .collect = Collector.collect });
+
+    try provider.close();
+    server_future.await(io);
+
+    try testing.expect(provider.flushed);
+    try testing.expect(stub.served);
+    try testing.expectEqual(@as(usize, 1), Collector.calls);
+    // The final sync carried the tail stats: the policy id and its hit count.
+    try testing.expect(std.mem.indexOf(u8, stub.body, "hot") != null);
+    try testing.expect(std.mem.indexOf(u8, stub.body, "matchHits") != null);
+
+    // Second close is a no-op: no extra collect, no extra request (the stub
+    // only served one and its port is about to close).
+    try provider.close();
+    try testing.expectEqual(@as(usize, 1), Collector.calls);
+}
+
+test "HttpProvider.close: propagates the final sync error" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    // Port 1 has nothing listening → the final sync's POST fails, and close
+    // hands that error back instead of swallowing it.
+    var provider = try HttpProvider.init(
+        allocator,
+        io,
+        noop_bus.eventBus(),
+        .{ .id = "p", .url = "http://127.0.0.1:1/sync", .poll_interval_seconds = 3600 },
+    );
+    defer provider.deinit();
+
+    if (provider.close()) |_| {
+        try testing.expect(false); // expected the unreachable endpoint to error
+    } else |_| {}
+    // Even on failure the loop is stopped and the attempt is spent, so a
+    // second close is a silent no-op.
+    try testing.expect(provider.flushed);
+    try provider.close();
 }
 
 test "statsToSyncStatuses: maps hits/misses/errors and reports every policy" {
