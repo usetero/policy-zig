@@ -339,6 +339,22 @@ pub const HttpProvider = struct {
         self.bus.info(loaded_event);
     }
 
+    /// Refresh the HTTP client's cached wall-clock time before each request.
+    ///
+    /// std.http.Client sets `now` once on the first HTTPS request and reuses
+    /// that frozen timestamp for all later certificate validity checks. Over a
+    /// long-lived poll loop this means a rotated upstream cert (whose Not Before
+    /// is newer than the frozen `now`) fails verification with
+    /// CertificateNotYetValid, surfaced as error.TlsInitializationFailed, until
+    /// the process restarts. Refreshing before each poll keeps the validity
+    /// check honest. `now` is left null on the first request so the initial
+    /// CA-bundle rescan (which only runs while `now == null`) still happens.
+    fn refreshClientClock(self: *HttpProvider) void {
+        if (self.http_client.now != null) {
+            self.http_client.now = std.Io.Clock.real.now(self.io);
+        }
+    }
+
     fn fetchPolicies(self: *HttpProvider) !FetchResult {
         // Use arena allocator for all temporary structures during fetch.
         // This reduces fragmentation by freeing all temporary memory at once.
@@ -466,6 +482,8 @@ pub const HttpProvider = struct {
 
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
+
+        self.refreshClientClock();
 
         // Create request
         const result = try self.http_client.fetch(.{
@@ -597,6 +615,38 @@ test "HttpProvider: setStatsCollector stores the collector" {
     var ctx: u8 = 0;
     provider.setStatsCollector(.{ .context = &ctx, .collect = Stub.collect });
     try testing.expect(provider.stats_collector != null);
+}
+
+test "HttpProvider: refreshClientClock advances stale now but leaves first request null" {
+    const allocator = testing.allocator;
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+
+    var provider = try HttpProvider.init(
+        allocator,
+        std.Options.debug_io,
+        noop_bus.eventBus(),
+        .{ .id = "test-provider", .url = "https://test.local/policies", .poll_interval_seconds = 60 },
+    );
+    defer provider.deinit();
+
+    // First request: `now` must stay null so std.http.Client runs its initial
+    // CA-bundle rescan (it only rescans while `now == null`).
+    provider.http_client.now = null;
+    provider.refreshClientClock();
+    try testing.expect(provider.http_client.now == null);
+
+    // Subsequent request: a stale cached timestamp (here ~1970) must be bumped
+    // to roughly-current wall-clock time so cert validity checks stay honest
+    // after an upstream cert rotation. Without the refresh `now` stays stale and
+    // a freshly-issued cert fails as CertificateNotYetValid ->
+    // TlsInitializationFailed.
+    const stale: std.Io.Timestamp = .{ .nanoseconds = 1 };
+    provider.http_client.now = stale;
+    provider.refreshClientClock();
+    try testing.expect(provider.http_client.now != null);
+    try testing.expect(provider.http_client.now.?.nanoseconds > stale.nanoseconds);
 }
 
 test "HttpProvider.close: flushes final stats once, then is idempotent" {
