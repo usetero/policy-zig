@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/usetero/policy-zig/compare/v0.6.1...v0.6.2) (2026-07-28)
+
+
+### Bug Fixes
+
+* add close http client ([#88](https://github.com/usetero/policy-zig/issues/88)) ([0773882](https://github.com/usetero/policy-zig/commit/0773882622626a9a07396641967b60acd29affe3))
+* bump zig zon on release ([#91](https://github.com/usetero/policy-zig/issues/91)) ([e28defb](https://github.com/usetero/policy-zig/commit/e28defb92155a475595ad4a95af1d568574575b0))
+
 ## [0.6.1](https://github.com/usetero/policy-zig/compare/v0.6.0...v0.6.1) (2026-07-16)
 
 
