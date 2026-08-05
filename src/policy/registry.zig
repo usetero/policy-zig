@@ -54,7 +54,7 @@ pub const PolicyAtomicStats = struct {
 };
 
 // =============================================================================
-// Volume Counters (spec v1.7.0)
+// Volume Counters (spec v1.7.1)
 // =============================================================================
 
 /// Total telemetry entering policy evaluation, regardless of match. Lives on
@@ -102,22 +102,15 @@ pub const VolumeCounters = struct {
         _ = counter.fetchAdd(bytes, .monotonic);
     }
 
-    /// Read and zero every counter, for reporting on a sync request.
+    /// Read and zero every counter, for reporting on a sync request. Reading is
+    /// the reset: a sync that then fails drops its interval rather than
+    /// replaying it, matching the per-policy counters above.
     pub fn readAndReset(self: *VolumeCounters) policy_provider.VolumeSnapshot {
         var out: policy_provider.VolumeSnapshot = .{};
         inline for (@typeInfo(policy_provider.VolumeSnapshot).@"struct".fields) |f| {
             @field(out, f.name) = @field(self, f.name).swap(0, .monotonic);
         }
         return out;
-    }
-
-    /// Add a drained reading back after a failed sync, so its records are
-    /// included in the next attempt instead of being lost.
-    pub fn add(self: *VolumeCounters, snapshot: policy_provider.VolumeSnapshot) void {
-        inline for (@typeInfo(policy_provider.VolumeSnapshot).@"struct".fields) |f| {
-            const v = @field(snapshot, f.name);
-            if (v != 0) _ = @field(self, f.name).fetchAdd(v, .monotonic);
-        }
     }
 };
 
@@ -327,7 +320,7 @@ pub const PolicyRegistry = struct {
     extension_sync_hooks: ?policy_provider.ExtensionSyncHooks,
 
     // Total telemetry seen by the engine since the last successful sync
-    // (v1.7.0), independent of any policy or snapshot.
+    // (v1.7.1), independent of any policy or snapshot.
     volume: VolumeCounters,
 
     /// Subscription context for provider callbacks.
@@ -403,7 +396,6 @@ pub const PolicyRegistry = struct {
             .context = self,
             .collect = collectStatsThunk,
             .collect_volume = drainVolumeThunk,
-            .restore_volume = restoreVolumeThunk,
         });
 
         if (self.extension_sync_hooks) |hooks| {
@@ -424,11 +416,6 @@ pub const PolicyRegistry = struct {
     fn drainVolumeThunk(context: *anyopaque) policy_provider.VolumeSnapshot {
         const self: *PolicyRegistry = @ptrCast(@alignCast(context));
         return self.volume.readAndReset();
-    }
-
-    fn restoreVolumeThunk(context: *anyopaque, snapshot: policy_provider.VolumeSnapshot) void {
-        const self: *PolicyRegistry = @ptrCast(@alignCast(context));
-        self.volume.add(snapshot);
     }
 
     /// Collect a stats row for every policy in the current snapshot, resetting
@@ -1857,48 +1844,14 @@ test "PolicyRegistry: volume counters survive recompiles and accept add-back" {
     try testing.expectEqual(@as(i64, 40), drained.span_bytes);
     try testing.expect(registry.volume.readAndReset().isZero());
 
-    // A failed sync hands the reading back; records seen in the meantime are
-    // preserved, so the next attempt reports the sum.
+    // Reading is the reset: a drained interval is reported at most once, so
+    // only telemetry seen since the drain shows up next time.
     registry.volume.record(.log);
     registry.volume.addBytes(.log, 7);
-    registry.volume.add(drained);
-    const retried = registry.volume.readAndReset();
-    try testing.expectEqual(@as(i64, 2), retried.log_records);
-    try testing.expectEqual(@as(i64, 107), retried.log_bytes);
-    try testing.expectEqual(@as(i64, 1), retried.spans);
-}
-
-test "VolumeCounters: add folds every field back into its own counter" {
-    var counters: VolumeCounters = .{};
-
-    // All six distinct and non-zero, so a field dropped or crossed over in
-    // `add` shows up instead of being masked by a zero.
-    counters.add(.{
-        .log_records = 1,
-        .log_bytes = 2,
-        .metric_data_points = 3,
-        .metric_bytes = 4,
-        .spans = 5,
-        .span_bytes = 6,
-    });
-    // Folding is additive, not assignment: a second add sums.
-    counters.add(.{
-        .log_records = 10,
-        .log_bytes = 20,
-        .metric_data_points = 30,
-        .metric_bytes = 40,
-        .spans = 50,
-        .span_bytes = 60,
-    });
-
-    const out = counters.readAndReset();
-    try testing.expectEqual(@as(i64, 11), out.log_records);
-    try testing.expectEqual(@as(i64, 22), out.log_bytes);
-    try testing.expectEqual(@as(i64, 33), out.metric_data_points);
-    try testing.expectEqual(@as(i64, 44), out.metric_bytes);
-    try testing.expectEqual(@as(i64, 55), out.spans);
-    try testing.expectEqual(@as(i64, 66), out.span_bytes);
-    try testing.expect(counters.readAndReset().isZero());
+    const next = registry.volume.readAndReset();
+    try testing.expectEqual(@as(i64, 1), next.log_records);
+    try testing.expectEqual(@as(i64, 7), next.log_bytes);
+    try testing.expectEqual(@as(i64, 0), next.spans);
 }
 
 test "PolicyRegistry: subscribe wires the volume seam to this registry" {
@@ -1927,24 +1880,19 @@ test "PolicyRegistry: subscribe wires the volume seam to this registry" {
     // Stop the poll thread before the registry it drains goes away.
     provider.shutdown();
 
-    // Nothing else in the suite proves subscribe passed the volume fns (the
+    // Nothing else in the suite proves subscribe passed the volume fn (the
     // provider tests install collectors by hand), so assert the seam exists and
-    // that both directions land on *this* registry's counters.
+    // that draining through it lands on *this* registry's counters.
     const collector = provider.stats_collector orelse return error.NoCollector;
     try testing.expect(collector.collect_volume != null);
-    try testing.expect(collector.restore_volume != null);
 
     registry.volume.record(.log);
     registry.volume.addBytes(.log, 64);
     const drained = collector.drainVolume();
     try testing.expectEqual(@as(i64, 1), drained.log_records);
     try testing.expectEqual(@as(i64, 64), drained.log_bytes);
+    // Draining through the seam reset the registry's counters.
     try testing.expect(registry.volume.readAndReset().isZero());
-
-    collector.returnVolume(drained);
-    const restored = registry.volume.readAndReset();
-    try testing.expectEqual(@as(i64, 1), restored.log_records);
-    try testing.expectEqual(@as(i64, 64), restored.log_bytes);
 }
 
 test "PolicyRegistry: collectStats reports exactly the current policy set across updates" {

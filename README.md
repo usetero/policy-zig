@@ -116,9 +116,11 @@ const result = engine.evaluate(.log, &my_log_accessor, &my_log_ctx, &policy_id_b
     .io = io,
 });
 
-// Volume (spec v1.7.0): every evaluate call is counted regardless of match and
-// reported on the next sync. Byte volume is opt-in — pass the batch's
-// uncompressed OTLP protobuf size, which only the caller can measure.
+// Volume (spec v1.7.1): every evaluate call is counted regardless of match and
+// reported on the next sync, which resets the counters whether or not that sync
+// succeeds — reported volume is a lower bound, never replayed. Byte volume is
+// opt-in: pass the batch's uncompressed OTLP protobuf size, which only the
+// caller can measure.
 registry.volume.addBytes(.log, @intCast(request_size_bytes));
 
 // Transforms whose required primitive (set/delete/move) is unwired on the

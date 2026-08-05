@@ -46,8 +46,6 @@ const HttpSyncStatusReported = struct { id: []const u8, match_hits: i64, match_m
 // Emitted when a sync carries volume, for the same reason: confirming at
 // runtime what was reported. Omitted volume (all-zero) emits nothing.
 const HttpSyncVolumeReported = struct { volume: VolumeSnapshot };
-// A failed sync hands its drained volume back for the next attempt.
-const HttpSyncVolumeRetained = struct { volume: VolumeSnapshot };
 const HttpFetchStarted = struct {};
 const HttpFetchCompleted = struct {};
 
@@ -190,16 +188,6 @@ pub const HttpProvider = struct {
         self.stats_collector = collector;
     }
 
-    /// Hand a drained volume reading back to the registry after a failed sync,
-    /// so the next attempt includes it (spec v1.7.0).
-    fn retainVolume(self: *HttpProvider, volume: VolumeSnapshot) void {
-        if (volume.isZero()) return;
-        const collector = self.stats_collector orelse return;
-        collector.returnVolume(volume);
-        const event: HttpSyncVolumeRetained = .{ .volume = volume };
-        self.bus.warn(event);
-    }
-
     pub fn subscribe(self: *HttpProvider, callback: PolicyCallback) !void {
         self.callback = callback;
 
@@ -230,11 +218,9 @@ pub const HttpProvider = struct {
     /// Returns the final sync's error rather than swallowing it — the caller
     /// decides whether a lost tail report is worth logging or acting on. The
     /// flush is attempted at most once: `flushed` is set before the sync (the
-    /// stats collector resets its per-policy counters when pulled, so the tail
-    /// is gone on failure and a retry would only report zeros), so a second
-    /// call is a no-op and the loop is stopped either way. Volume counters are
-    /// the exception — a failed sync hands them back — but with the loop
-    /// stopped there is no further sync to carry them.
+    /// stats collector resets its counters when pulled, so the tail is gone on
+    /// failure and a retry would only report zeros), so a second call is a
+    /// no-op and the loop is stopped either way.
     ///
     /// Reuses the io bound at init (the same process-wide io is still live at
     /// shutdown), so this must run before that io is torn down — i.e. in the
@@ -419,15 +405,11 @@ pub const HttpProvider = struct {
 
         const policy_statuses_list = try statsToSyncStatuses(temp_allocator, stats);
 
-        // Drain total observed volume (v1.7.0). Unlike per-policy stats, this
-        // is handed back if the sync fails: it is the denominator for every
-        // policy's match rate, so a dropped interval skews usage rather than
-        // just losing a tail. `volume_sent` gates the add-back so a completed
-        // sync is never counted twice. The reading lives on this call's stack
-        // until then, so overlapping syncs each drain a disjoint delta.
+        // Drain total observed volume (v1.7.1). Draining is the reset, exactly
+        // like the per-policy counters above: if this sync fails its interval is
+        // gone rather than replayed, since the server cannot tell a replay from
+        // new telemetry. Reported volume is a lower bound, not an exact total.
         const volume: VolumeSnapshot = if (self.stats_collector) |c| c.drainVolume() else .{};
-        var volume_sent = false;
-        errdefer if (!volume_sent) self.retainVolume(volume);
 
         // Log exactly what we're about to report, so runtime expectations can be
         // verified against the live snapshot.
@@ -565,11 +547,10 @@ pub const HttpProvider = struct {
             return err;
         };
 
-        // A 200 carrying `error_message` is an in-band rejection: the server
-        // did not accept this sync, so it must not advance the hash, deliver
-        // policies, or close the volume interval. Checked before `volume_sent`
-        // for the same reason policy-go and policy-rs check it before touching
-        // sync state.
+        // A 200 carrying `error_message` is an in-band rejection: the server did
+        // not accept this sync, so it must not advance the hash or deliver
+        // policies. Checked before touching sync state, as policy-go and
+        // policy-rs do.
         if (parsed.value.error_message.len > 0) {
             var mut = parsed;
             defer mut.deinit();
@@ -580,12 +561,6 @@ pub const HttpProvider = struct {
             self.bus.err(event);
             return error.SyncRejected;
         }
-
-        // Only a fully accepted response closes the reported interval. A 200
-        // with an unparseable or rejected body is still a failed sync from our
-        // side, so its volume goes back for the next attempt (matching
-        // policy-go and policy-rs).
-        volume_sent = true;
 
         return .{
             .parsed = parsed,
@@ -804,7 +779,6 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
     // the tail stat that must reach the control plane before teardown.
     const Collector = struct {
         var calls: usize = 0;
-        var restores: usize = 0;
         fn collect(arena: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
             calls += 1;
             const rows = try arena.alloc(PolicyStatsSnapshot, 1);
@@ -814,18 +788,13 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
         fn drain(_: *anyopaque) VolumeSnapshot {
             return .{ .log_records = 9, .log_bytes = 512 };
         }
-        fn restore(_: *anyopaque, _: VolumeSnapshot) void {
-            restores += 1;
-        }
     };
     Collector.calls = 0;
-    Collector.restores = 0;
     var ctx: u8 = 0;
     provider.setStatsCollector(.{
         .context = &ctx,
         .collect = Collector.collect,
         .collect_volume = Collector.drain,
-        .restore_volume = Collector.restore,
     });
 
     try provider.close();
@@ -837,10 +806,9 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
     // The final sync carried the tail stats: the policy id and its hit count.
     try testing.expect(std.mem.indexOf(u8, stub.body, "hot") != null);
     try testing.expect(std.mem.indexOf(u8, stub.body, "matchHits") != null);
-    // …and the observed volume, which the accepted sync does not hand back.
+    // …and the observed volume.
     try testing.expect(std.mem.indexOf(u8, stub.body, "\"logRecords\":\"9\"") != null);
     try testing.expect(std.mem.indexOf(u8, stub.body, "\"logBytes\":\"512\"") != null);
-    try testing.expectEqual(@as(usize, 0), Collector.restores);
 
     // Second close is a no-op: no extra collect, no extra request (the stub
     // only served one and its port is about to close).
@@ -959,63 +927,7 @@ test "HttpProvider: a provider with no volume seam wired syncs without volume" {
     try testing.expect(std.mem.indexOf(u8, stub.body, "volume") == null);
 }
 
-test "HttpProvider: volume is retained when a 200 response cannot be decoded" {
-    const allocator = testing.allocator;
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var stub = try SyncStub.start(allocator, io);
-    defer stub.deinit(io);
-    // 200, but the body is not a SyncResponse: the sync failed from our side,
-    // so the interval stays open (matching policy-go).
-    stub.response = "not json at all";
-    var server_future = io.concurrent(SyncStub.serve, .{ &stub, io }) catch
-        return error.SkipZigTest;
-    defer server_future.cancel(io);
-
-    var noop_bus: o11y.NoopEventBus = undefined;
-    noop_bus.init(io);
-
-    var provider = try stub.provider(allocator, io, noop_bus.eventBus());
-    defer provider.deinit();
-
-    const Counters = struct {
-        var pending: VolumeSnapshot = .{};
-        fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
-            return &.{};
-        }
-        fn drain(_: *anyopaque) VolumeSnapshot {
-            defer pending = .{};
-            return pending;
-        }
-        fn restore(_: *anyopaque, snapshot: VolumeSnapshot) void {
-            pending.metric_data_points += snapshot.metric_data_points;
-            pending.metric_bytes += snapshot.metric_bytes;
-        }
-    };
-    Counters.pending = .{ .metric_data_points = 4, .metric_bytes = 256 };
-
-    var ctx: u8 = 0;
-    provider.setStatsCollector(.{
-        .context = &ctx,
-        .collect = Counters.collect,
-        .collect_volume = Counters.drain,
-        .restore_volume = Counters.restore,
-    });
-
-    if (provider.close()) |_| {
-        try testing.expect(false); // expected the undecodable body to error
-    } else |_| {}
-    server_future.await(io);
-
-    // The request did carry the volume, but we can't confirm the server took it.
-    try testing.expect(std.mem.indexOf(u8, stub.body, "\"metricDataPoints\":\"4\"") != null);
-    try testing.expectEqual(@as(i64, 4), Counters.pending.metric_data_points);
-    try testing.expectEqual(@as(i64, 256), Counters.pending.metric_bytes);
-}
-
-test "HttpProvider: a 200 carrying error_message is a failed sync and retains volume" {
+test "HttpProvider: a 200 carrying error_message is a failed sync" {
     const allocator = testing.allocator;
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -1041,29 +953,7 @@ test "HttpProvider: a 200 carrying error_message is a failed sync and retains vo
     var provider = try stub.provider(allocator, io, noop_bus.eventBus());
     defer provider.deinit();
 
-    const Counters = struct {
-        var pending: VolumeSnapshot = .{};
-        fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
-            return &.{};
-        }
-        fn drain(_: *anyopaque) VolumeSnapshot {
-            defer pending = .{};
-            return pending;
-        }
-        fn restore(_: *anyopaque, snapshot: VolumeSnapshot) void {
-            pending.spans += snapshot.spans;
-            pending.span_bytes += snapshot.span_bytes;
-        }
-    };
-    Counters.pending = .{ .spans = 3, .span_bytes = 96 };
-
     var ctx: u8 = 0;
-    provider.setStatsCollector(.{
-        .context = &ctx,
-        .collect = Counters.collect,
-        .collect_volume = Counters.drain,
-        .restore_volume = Counters.restore,
-    });
 
     // Wired directly rather than via subscribe(), which would fire its own
     // initial fetch and consume the stub's single response.
@@ -1084,10 +974,7 @@ test "HttpProvider: a 200 carrying error_message is a failed sync and retains vo
     }
     server_future.await(io);
 
-    // Volume survives for the next attempt…
-    try testing.expectEqual(@as(i64, 3), Counters.pending.spans);
-    try testing.expectEqual(@as(i64, 96), Counters.pending.span_bytes);
-    // …the rejected response's hash was not adopted as last-successful…
+    // The rejected response's hash was not adopted as last-successful…
     try testing.expect(provider.last_successful_hash == null);
     // …its timestamp did not advance, so the next attempt is still a full sync…
     try testing.expectEqual(@as(u64, 0), provider.last_sync_timestamp);
@@ -1095,7 +982,7 @@ test "HttpProvider: a 200 carrying error_message is a failed sync and retains vo
     try testing.expect(!Sink.notified);
 }
 
-test "HttpProvider: a failed sync hands its volume back for the next attempt" {
+test "HttpProvider: a failed sync drops its volume instead of replaying it" {
     const allocator = testing.allocator;
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -1104,24 +991,24 @@ test "HttpProvider: a failed sync hands its volume back for the next attempt" {
     var noop_bus: o11y.NoopEventBus = undefined;
     noop_bus.init(io);
 
-    // Stand-in for the registry's counters: drained on pull, summed on
-    // add-back. (The real VolumeCounters round-trip is covered in registry.zig.)
+    // Stand-in for the registry's counters, draining on pull exactly as
+    // VolumeCounters.readAndReset does. There is deliberately no way to put a
+    // reading back: the server cannot tell a replay from new telemetry, so a
+    // failed sync's interval is lost rather than double counted.
     const Counters = struct {
         var pending: VolumeSnapshot = .{};
+        var drains: usize = 0;
         fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
             return &.{};
         }
         fn drain(_: *anyopaque) VolumeSnapshot {
+            drains += 1;
             defer pending = .{};
             return pending;
         }
-        fn restore(_: *anyopaque, snapshot: VolumeSnapshot) void {
-            pending.log_records += snapshot.log_records;
-            pending.log_bytes += snapshot.log_bytes;
-            pending.spans += snapshot.spans;
-        }
     };
     Counters.pending = .{ .log_records = 1, .log_bytes = 64, .spans = 1 };
+    Counters.drains = 0;
 
     // Port 1 has nothing listening → the POST fails after the drain.
     var provider = try HttpProvider.init(
@@ -1136,17 +1023,16 @@ test "HttpProvider: a failed sync hands its volume back for the next attempt" {
         .context = &ctx,
         .collect = Counters.collect,
         .collect_volume = Counters.drain,
-        .restore_volume = Counters.restore,
     });
 
     if (provider.close()) |_| {
         try testing.expect(false); // expected the unreachable endpoint to error
     } else |_| {}
 
-    // Nothing reached the control plane, so the interval is still open.
-    try testing.expectEqual(@as(i64, 1), Counters.pending.log_records);
-    try testing.expectEqual(@as(i64, 64), Counters.pending.log_bytes);
-    try testing.expectEqual(@as(i64, 1), Counters.pending.spans);
+    // The interval was read into the failed request and is gone: reported volume
+    // is a lower bound on what was observed, never a replay.
+    try testing.expectEqual(@as(usize, 1), Counters.drains);
+    try testing.expect(Counters.pending.isZero());
 }
 
 test "statsToSyncStatuses: maps hits/misses/errors and reports every policy" {

@@ -19,10 +19,17 @@ pub const PolicyStatsSnapshot = struct {
     errors: []const []const u8 = &.{},
 };
 
-/// Total telemetry that entered policy evaluation since the last successful
-/// sync, regardless of match (spec v1.7.0 `VolumeStats`). Counted before the
+/// Total telemetry that entered policy evaluation since the counters were last
+/// read, regardless of match (spec v1.7.1 `VolumeStats`). Counted before the
 /// keep and transform stages, so dropped/sampled/redacted records are included
 /// at their pre-policy size.
+///
+/// Reported at most once: draining resets, whether or not the sync then
+/// succeeds, so a failed sync loses its interval rather than replaying it. That
+/// keeps volume on the same footing as `hits`/`misses` above — retaining one
+/// side of `(hits + misses) / <signal count>` without the other would skew the
+/// ratio — and a replay would double count, since the server has no interval
+/// identifier to dedupe on. Volume is a lower bound, not an exact total.
 ///
 /// Every field is independently optional: `0` means "not tracked" as much as
 /// "none seen". Byte counts are only populated when the consumer calls
@@ -64,14 +71,10 @@ pub const VolumeSnapshot = struct {
 pub const StatsCollector = struct {
     context: *anyopaque,
     collect: *const fn (arena: std.mem.Allocator, context: *anyopaque) anyerror![]PolicyStatsSnapshot,
-    /// Drain the registry's volume counters (spec v1.7.0). Optional: a
-    /// collector that leaves it null reports no volume, which is conformant.
+    /// Drain the registry's volume counters (spec v1.7.1), resetting them.
+    /// Optional: a collector that leaves it null reports no volume, which is
+    /// conformant.
     collect_volume: ?*const fn (context: *anyopaque) VolumeSnapshot = null,
-    /// Add a previously drained reading back, so a failed sync retains its
-    /// counters for the next attempt as the spec requires. Concurrent
-    /// evaluation keeps incrementing across the drain, hence add-back rather
-    /// than restore-by-assignment.
-    restore_volume: ?*const fn (context: *anyopaque, snapshot: VolumeSnapshot) void = null,
 
     pub fn call(self: StatsCollector, arena: std.mem.Allocator) anyerror![]PolicyStatsSnapshot {
         return self.collect(arena, self.context);
@@ -80,11 +83,6 @@ pub const StatsCollector = struct {
     pub fn drainVolume(self: StatsCollector) VolumeSnapshot {
         const f = self.collect_volume orelse return .{};
         return f(self.context);
-    }
-
-    pub fn returnVolume(self: StatsCollector, snapshot: VolumeSnapshot) void {
-        const f = self.restore_volume orelse return;
-        f(self.context, snapshot);
     }
 };
 
@@ -173,7 +171,7 @@ test "VolumeSnapshot.isZero: any single tracked field defeats omission" {
 }
 
 test "StatsCollector: volume seam is optional and no-ops when unwired" {
-    // A collector from a provider the registry never gave volume fns to (or an
+    // A collector from a provider the registry never gave a volume fn to (or an
     // older consumer building one by hand) must not crash and must report no
     // volume.
     var ctx: u8 = 0;
@@ -187,6 +185,5 @@ test "StatsCollector: volume seam is optional and no-ops when unwired" {
     };
 
     try testing.expect(collector.drainVolume().isZero());
-    collector.returnVolume(.{ .log_records = 5 }); // discarded, not a crash
     try testing.expect(collector.drainVolume().isZero());
 }

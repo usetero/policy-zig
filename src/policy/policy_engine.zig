@@ -336,7 +336,7 @@ pub const PolicyEngine = struct {
         policy_id_buf: [][]const u8,
         options: EvaluateOptions,
     ) PolicyResult {
-        // Volume tracking (v1.7.0): every record entering evaluation counts,
+        // Volume tracking (v1.7.1): every record entering evaluation counts,
         // regardless of match — including records with no policies loaded for
         // their signal, so this must precede both early returns below. Byte
         // volume is opt-in via `registry.volume.addBytes`.
