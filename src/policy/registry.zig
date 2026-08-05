@@ -73,17 +73,33 @@ pub const VolumeCounters = struct {
     spans: std.atomic.Value(i64) = .init(0),
     span_bytes: std.atomic.Value(i64) = .init(0),
 
-    /// Count one record of signal `T`. `bytes` is the caller's estimate of the
-    /// record's uncompressed OTLP protobuf size; 0 means "not tracked" and
-    /// leaves the byte counter alone.
-    pub inline fn record(self: *VolumeCounters, comptime T: policy_types.TelemetryType, bytes: usize) void {
-        const counters = switch (T) {
-            .log => .{ &self.log_records, &self.log_bytes },
-            .metric => .{ &self.metric_data_points, &self.metric_bytes },
-            .trace => .{ &self.spans, &self.span_bytes },
+    /// Count one record of signal `T`. Called by the engine for every record
+    /// entering evaluation; consumers never call this directly.
+    pub inline fn record(self: *VolumeCounters, comptime T: policy_types.TelemetryType) void {
+        const counter = switch (T) {
+            .log => &self.log_records,
+            .metric => &self.metric_data_points,
+            .trace => &self.spans,
         };
-        _ = counters[0].fetchAdd(1, .monotonic);
-        if (bytes != 0) _ = counters[1].fetchAdd(@intCast(bytes), .monotonic);
+        _ = counter.fetchAdd(1, .monotonic);
+    }
+
+    /// Add to the reported byte volume for signal `T`. Records are counted
+    /// automatically by `evaluate`; bytes are opt-in and must be the
+    /// uncompressed OTLP protobuf serialized size of the records as received
+    /// (an estimate is fine) — the engine reads records through accessors and
+    /// has no serialized form to measure. Leave it unreported rather than
+    /// reporting another encoding's size.
+    ///
+    /// Typically called once per received batch with the batch's serialized
+    /// size, not once per record.
+    pub inline fn addBytes(self: *VolumeCounters, comptime T: policy_types.TelemetryType, bytes: i64) void {
+        const counter = switch (T) {
+            .log => &self.log_bytes,
+            .metric => &self.metric_bytes,
+            .trace => &self.span_bytes,
+        };
+        _ = counter.fetchAdd(bytes, .monotonic);
     }
 
     /// Read and zero every counter, for reporting on a sync request.
@@ -1820,9 +1836,11 @@ test "PolicyRegistry: volume counters survive recompiles and accept add-back" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    registry.volume.record(.log, 100);
-    registry.volume.record(.metric, 0); // bytes untracked for this record
-    registry.volume.record(.trace, 40);
+    registry.volume.record(.log);
+    registry.volume.addBytes(.log, 100);
+    registry.volume.record(.metric); // metric bytes left untracked
+    registry.volume.record(.trace);
+    registry.volume.addBytes(.trace, 40);
 
     // A recompile allocates fresh per-policy stats; volume lives outside the
     // snapshot and must not be zeroed by it.
@@ -1841,12 +1859,92 @@ test "PolicyRegistry: volume counters survive recompiles and accept add-back" {
 
     // A failed sync hands the reading back; records seen in the meantime are
     // preserved, so the next attempt reports the sum.
-    registry.volume.record(.log, 7);
+    registry.volume.record(.log);
+    registry.volume.addBytes(.log, 7);
     registry.volume.add(drained);
     const retried = registry.volume.readAndReset();
     try testing.expectEqual(@as(i64, 2), retried.log_records);
     try testing.expectEqual(@as(i64, 107), retried.log_bytes);
     try testing.expectEqual(@as(i64, 1), retried.spans);
+}
+
+test "VolumeCounters: add folds every field back into its own counter" {
+    var counters: VolumeCounters = .{};
+
+    // All six distinct and non-zero, so a field dropped or crossed over in
+    // `add` shows up instead of being masked by a zero.
+    counters.add(.{
+        .log_records = 1,
+        .log_bytes = 2,
+        .metric_data_points = 3,
+        .metric_bytes = 4,
+        .spans = 5,
+        .span_bytes = 6,
+    });
+    // Folding is additive, not assignment: a second add sums.
+    counters.add(.{
+        .log_records = 10,
+        .log_bytes = 20,
+        .metric_data_points = 30,
+        .metric_bytes = 40,
+        .spans = 50,
+        .span_bytes = 60,
+    });
+
+    const out = counters.readAndReset();
+    try testing.expectEqual(@as(i64, 11), out.log_records);
+    try testing.expectEqual(@as(i64, 22), out.log_bytes);
+    try testing.expectEqual(@as(i64, 33), out.metric_data_points);
+    try testing.expectEqual(@as(i64, 44), out.metric_bytes);
+    try testing.expectEqual(@as(i64, 55), out.spans);
+    try testing.expectEqual(@as(i64, 66), out.span_bytes);
+    try testing.expect(counters.readAndReset().isZero());
+}
+
+test "PolicyRegistry: subscribe wires the volume seam to this registry" {
+    const provider_http = @import("./provider_http.zig");
+
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Port 1 has nothing listening: subscribe's initial fetch fails and is
+    // warned about, which is fine — the wiring under test happens before it.
+    var provider = try provider_http.HttpProvider.init(
+        allocator,
+        io,
+        noop_bus.eventBus(),
+        .{ .id = "p", .url = "http://127.0.0.1:1/sync", .poll_interval_seconds = 3600 },
+    );
+    defer provider.deinit();
+    try registry.subscribe(.{ .http = provider });
+    // Stop the poll thread before the registry it drains goes away.
+    provider.shutdown();
+
+    // Nothing else in the suite proves subscribe passed the volume fns (the
+    // provider tests install collectors by hand), so assert the seam exists and
+    // that both directions land on *this* registry's counters.
+    const collector = provider.stats_collector orelse return error.NoCollector;
+    try testing.expect(collector.collect_volume != null);
+    try testing.expect(collector.restore_volume != null);
+
+    registry.volume.record(.log);
+    registry.volume.addBytes(.log, 64);
+    const drained = collector.drainVolume();
+    try testing.expectEqual(@as(i64, 1), drained.log_records);
+    try testing.expectEqual(@as(i64, 64), drained.log_bytes);
+    try testing.expect(registry.volume.readAndReset().isZero());
+
+    collector.returnVolume(drained);
+    const restored = registry.volume.readAndReset();
+    try testing.expectEqual(@as(i64, 1), restored.log_records);
+    try testing.expectEqual(@as(i64, 64), restored.log_bytes);
 }
 
 test "PolicyRegistry: collectStats reports exactly the current policy set across updates" {

@@ -226,12 +226,6 @@ pub const EvaluateOptions = struct {
     /// records are handed to the sink after keep resolution, before
     /// transforms. Null costs a single branch.
     extension_sink: ?policy_types.ExtensionSink = null,
-    /// Uncompressed OTLP protobuf serialized size of this record (v1.7.0
-    /// volume tracking). The engine reads records through accessors and has no
-    /// serialized form to measure, so only the caller — which already holds
-    /// the wire bytes on ingest — can supply this. Leave at 0 to report record
-    /// counts without bytes, which the spec permits.
-    record_bytes: usize = 0,
 };
 
 // =============================================================================
@@ -344,8 +338,9 @@ pub const PolicyEngine = struct {
     ) PolicyResult {
         // Volume tracking (v1.7.0): every record entering evaluation counts,
         // regardless of match — including records with no policies loaded for
-        // their signal, so this must precede both early returns below.
-        self.registry.volume.record(T, options.record_bytes);
+        // their signal, so this must precede both early returns below. Byte
+        // volume is opt-in via `registry.volume.addBytes`.
+        self.registry.volume.record(T);
 
         // Get current snapshot from registry (lock-free)
         const snapshot = self.registry.getSnapshot() orelse {
@@ -997,10 +992,8 @@ test "PolicyEngine: volume counts every record, including with no policies loade
     // No snapshot at all: evaluation returns early, volume still counts.
     var test_log: TestLogContext = .{ .message = "hello" };
     var policy_id_buf: [16][]const u8 = undefined;
-    _ = engine.evaluate(.log, &TestLogContext.accessor, &test_log, &policy_id_buf, .{
-        .io = std.Options.debug_io,
-        .record_bytes = 120,
-    });
+    _ = evalTestLog(&engine, &test_log, &policy_id_buf);
+    registry.volume.addBytes(.log, 120);
 
     // A dropped record counts at its pre-policy size too.
     var policy: Policy = .{
@@ -1016,13 +1009,11 @@ test "PolicyEngine: volume counts every record, including with no policies loade
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     var error_log: TestLogContext = .{ .message = "an error occurred" };
-    const dropped = engine.evaluate(.log, &TestLogContext.accessor, &error_log, &policy_id_buf, .{
-        .io = std.Options.debug_io,
-        .record_bytes = 80,
-    });
+    const dropped = evalTestLog(&engine, &error_log, &policy_id_buf);
     try testing.expectEqual(FilterDecision.drop, dropped.decision);
+    registry.volume.addBytes(.log, 80);
 
-    // Bytes are optional per record: omitting them still counts the record.
+    // Bytes are opt-in and independent of record counting.
     _ = evalTestLog(&engine, &test_log, &policy_id_buf);
 
     const volume = registry.volume.readAndReset();
@@ -1034,6 +1025,57 @@ test "PolicyEngine: volume counts every record, including with no policies loade
 
     // Drained: a second read reports nothing.
     try testing.expect(registry.volume.readAndReset().isZero());
+}
+
+test "PolicyEngine: volume routes each signal to its own counter" {
+    const allocator = testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // A log-only policy set: the metric and trace indices are empty, so those
+    // evaluations take the `index.isEmpty()` early return and must still count.
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "hello") },
+    });
+    defer policy.deinit(allocator);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    var test_log: TestLogContext = .{ .message = "hello" };
+    _ = evalTestLog(&engine, &test_log, &policy_id_buf);
+
+    var test_metric: TestMetricContext = .{ .name = "http_requests_total" };
+    _ = evalMetric(&engine, &test_metric, &policy_id_buf);
+    _ = evalMetric(&engine, &test_metric, &policy_id_buf);
+
+    var test_span: TestTraceContext = .{ .name = "GET /users" };
+    _ = evalTrace(&engine, &test_span, &policy_id_buf);
+    _ = evalTrace(&engine, &test_span, &policy_id_buf);
+    _ = evalTrace(&engine, &test_span, &policy_id_buf);
+
+    // One counter per signal, no cross-talk between them.
+    const volume = registry.volume.readAndReset();
+    try testing.expectEqual(@as(i64, 1), volume.log_records);
+    try testing.expectEqual(@as(i64, 2), volume.metric_data_points);
+    try testing.expectEqual(@as(i64, 3), volume.spans);
+
+    // Bytes stay untracked unless the consumer opts in, per signal.
+    registry.volume.addBytes(.metric, 42);
+    const bytes = registry.volume.readAndReset();
+    try testing.expectEqual(@as(i64, 42), bytes.metric_bytes);
+    try testing.expectEqual(@as(i64, 0), bytes.log_bytes);
+    try testing.expectEqual(@as(i64, 0), bytes.span_bytes);
 }
 
 test "PolicyEngine: single policy drop match" {

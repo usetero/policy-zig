@@ -25,9 +25,9 @@ pub const PolicyStatsSnapshot = struct {
 /// at their pre-policy size.
 ///
 /// Every field is independently optional: `0` means "not tracked" as much as
-/// "none seen". Byte counts are only populated when the caller passes
-/// `EvaluateOptions.record_bytes` — the engine reads records through accessors
-/// and has no serialized form to measure.
+/// "none seen". Byte counts are only populated when the consumer calls
+/// `registry.volume.addBytes` — the engine reads records through accessors and
+/// has no serialized form to measure.
 pub const VolumeSnapshot = struct {
     log_records: i64 = 0,
     log_bytes: i64 = 0,
@@ -132,3 +132,61 @@ pub const PolicyCallback = struct {
         try self.onUpdate(self.context, update);
     }
 };
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "VolumeSnapshot.toProto: every field maps to its own proto field" {
+    // Distinct values so a transposed pair (e.g. metric_bytes ↔ span_bytes)
+    // fails instead of silently reporting the wrong signal's volume.
+    const snap: VolumeSnapshot = .{
+        .log_records = 11,
+        .log_bytes = 22,
+        .metric_data_points = 33,
+        .metric_bytes = 44,
+        .spans = 55,
+        .span_bytes = 66,
+    };
+
+    const out = snap.toProto();
+    try testing.expectEqual(@as(i64, 11), out.log_records);
+    try testing.expectEqual(@as(i64, 22), out.log_bytes);
+    try testing.expectEqual(@as(i64, 33), out.metric_data_points);
+    try testing.expectEqual(@as(i64, 44), out.metric_bytes);
+    try testing.expectEqual(@as(i64, 55), out.spans);
+    try testing.expectEqual(@as(i64, 66), out.span_bytes);
+}
+
+test "VolumeSnapshot.isZero: any single tracked field defeats omission" {
+    try testing.expect((VolumeSnapshot{}).isZero());
+
+    // A consumer tracking only one signal, or only bytes, must still be
+    // reported — omission is reserved for "nothing observed at all".
+    inline for (@typeInfo(VolumeSnapshot).@"struct".fields) |f| {
+        var snap: VolumeSnapshot = .{};
+        @field(snap, f.name) = 1;
+        try testing.expect(!snap.isZero());
+    }
+}
+
+test "StatsCollector: volume seam is optional and no-ops when unwired" {
+    // A collector from a provider the registry never gave volume fns to (or an
+    // older consumer building one by hand) must not crash and must report no
+    // volume.
+    var ctx: u8 = 0;
+    const collector: StatsCollector = .{
+        .context = &ctx,
+        .collect = struct {
+            fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+                return &.{};
+            }
+        }.collect,
+    };
+
+    try testing.expect(collector.drainVolume().isZero());
+    collector.returnVolume(.{ .log_records = 5 }); // discarded, not a crash
+    try testing.expect(collector.drainVolume().isZero());
+}
