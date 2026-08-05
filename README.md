@@ -114,6 +114,11 @@ var policy_id_buf: [16][]const u8 = undefined;
 const result = engine.evaluate(.log, &my_log_accessor, &my_log_ctx, &policy_id_buf, .{
     .scratch = arena.allocator(),
     .io = io,
+    // Optional (spec v1.7.0 volume tracking): the record's uncompressed OTLP
+    // protobuf size. Every evaluate call is counted regardless of match and
+    // reported on the next sync; passing this adds the byte totals, which only
+    // the caller can measure. Omit it to report record counts alone.
+    .record_bytes = my_log_size,
 });
 
 // Transforms whose required primitive (set/delete/move) is unwired on the

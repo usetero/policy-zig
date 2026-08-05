@@ -54,6 +54,58 @@ pub const PolicyAtomicStats = struct {
 };
 
 // =============================================================================
+// Volume Counters (spec v1.7.0)
+// =============================================================================
+
+/// Total telemetry entering policy evaluation, regardless of match. Lives on
+/// the registry rather than the snapshot: a recompile allocates fresh
+/// per-policy stats, and volume must survive that to stay a valid denominator
+/// for hits/misses across a sync interval.
+///
+/// ponytail: one shared cache line of atomics, same shape as the per-policy
+/// hit/miss counters. If per-record contention ever shows up in a profile,
+/// shard per thread and sum on drain.
+pub const VolumeCounters = struct {
+    log_records: std.atomic.Value(i64) = .init(0),
+    log_bytes: std.atomic.Value(i64) = .init(0),
+    metric_data_points: std.atomic.Value(i64) = .init(0),
+    metric_bytes: std.atomic.Value(i64) = .init(0),
+    spans: std.atomic.Value(i64) = .init(0),
+    span_bytes: std.atomic.Value(i64) = .init(0),
+
+    /// Count one record of signal `T`. `bytes` is the caller's estimate of the
+    /// record's uncompressed OTLP protobuf size; 0 means "not tracked" and
+    /// leaves the byte counter alone.
+    pub inline fn record(self: *VolumeCounters, comptime T: policy_types.TelemetryType, bytes: usize) void {
+        const counters = switch (T) {
+            .log => .{ &self.log_records, &self.log_bytes },
+            .metric => .{ &self.metric_data_points, &self.metric_bytes },
+            .trace => .{ &self.spans, &self.span_bytes },
+        };
+        _ = counters[0].fetchAdd(1, .monotonic);
+        if (bytes != 0) _ = counters[1].fetchAdd(@intCast(bytes), .monotonic);
+    }
+
+    /// Read and zero every counter, for reporting on a sync request.
+    pub fn readAndReset(self: *VolumeCounters) policy_provider.VolumeSnapshot {
+        var out: policy_provider.VolumeSnapshot = .{};
+        inline for (@typeInfo(policy_provider.VolumeSnapshot).@"struct".fields) |f| {
+            @field(out, f.name) = @field(self, f.name).swap(0, .monotonic);
+        }
+        return out;
+    }
+
+    /// Add a drained reading back after a failed sync, so its records are
+    /// included in the next attempt instead of being lost.
+    pub fn add(self: *VolumeCounters, snapshot: policy_provider.VolumeSnapshot) void {
+        inline for (@typeInfo(policy_provider.VolumeSnapshot).@"struct".fields) |f| {
+            const v = @field(snapshot, f.name);
+            if (v != 0) _ = @field(self, f.name).fetchAdd(v, .monotonic);
+        }
+    }
+};
+
+// =============================================================================
 // Observability Events
 // =============================================================================
 
@@ -258,6 +310,10 @@ pub const PolicyRegistry = struct {
     // subscribe for capability advertisement + broadcast-config routing.
     extension_sync_hooks: ?policy_provider.ExtensionSyncHooks,
 
+    // Total telemetry seen by the engine since the last successful sync
+    // (v1.7.0), independent of any policy or snapshot.
+    volume: VolumeCounters,
+
     /// Subscription context for provider callbacks.
     /// Allocated with stable address so the callback pointer remains valid.
     const Subscription = struct {
@@ -294,6 +350,7 @@ pub const PolicyRegistry = struct {
             .bus = bus,
             .extension_resolver = null,
             .extension_sync_hooks = null,
+            .volume = .{},
         };
     }
 
@@ -329,6 +386,8 @@ pub const PolicyRegistry = struct {
         prov.setStatsCollector(.{
             .context = self,
             .collect = collectStatsThunk,
+            .collect_volume = drainVolumeThunk,
+            .restore_volume = restoreVolumeThunk,
         });
 
         if (self.extension_sync_hooks) |hooks| {
@@ -344,6 +403,16 @@ pub const PolicyRegistry = struct {
     fn collectStatsThunk(arena: std.mem.Allocator, context: *anyopaque) anyerror![]policy_provider.PolicyStatsSnapshot {
         const self: *PolicyRegistry = @ptrCast(@alignCast(context));
         return self.collectStats(arena);
+    }
+
+    fn drainVolumeThunk(context: *anyopaque) policy_provider.VolumeSnapshot {
+        const self: *PolicyRegistry = @ptrCast(@alignCast(context));
+        return self.volume.readAndReset();
+    }
+
+    fn restoreVolumeThunk(context: *anyopaque, snapshot: policy_provider.VolumeSnapshot) void {
+        const self: *PolicyRegistry = @ptrCast(@alignCast(context));
+        self.volume.add(snapshot);
     }
 
     /// Collect a stats row for every policy in the current snapshot, resetting
@@ -1742,6 +1811,42 @@ test "PolicyRegistry: collectStats drains hit/miss counters and reports every po
     const hot_row2 = findStats(stats2, "hot-policy") orelse return error.MissingHot;
     try testing.expectEqual(@as(i64, 0), hot_row2.hits);
     try testing.expectEqual(@as(i64, 0), hot_row2.misses);
+}
+
+test "PolicyRegistry: volume counters survive recompiles and accept add-back" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    registry.volume.record(.log, 100);
+    registry.volume.record(.metric, 0); // bytes untracked for this record
+    registry.volume.record(.trace, 40);
+
+    // A recompile allocates fresh per-policy stats; volume lives outside the
+    // snapshot and must not be zeroed by it.
+    var p = try createTestPolicy(allocator, "p");
+    defer freeTestPolicy(allocator, &p);
+    try registry.updatePolicies(&.{p}, "http-provider", .http);
+
+    const drained = registry.volume.readAndReset();
+    try testing.expectEqual(@as(i64, 1), drained.log_records);
+    try testing.expectEqual(@as(i64, 100), drained.log_bytes);
+    try testing.expectEqual(@as(i64, 1), drained.metric_data_points);
+    try testing.expectEqual(@as(i64, 0), drained.metric_bytes);
+    try testing.expectEqual(@as(i64, 1), drained.spans);
+    try testing.expectEqual(@as(i64, 40), drained.span_bytes);
+    try testing.expect(registry.volume.readAndReset().isZero());
+
+    // A failed sync hands the reading back; records seen in the meantime are
+    // preserved, so the next attempt reports the sum.
+    registry.volume.record(.log, 7);
+    registry.volume.add(drained);
+    const retried = registry.volume.readAndReset();
+    try testing.expectEqual(@as(i64, 2), retried.log_records);
+    try testing.expectEqual(@as(i64, 107), retried.log_bytes);
+    try testing.expectEqual(@as(i64, 1), retried.spans);
 }
 
 test "PolicyRegistry: collectStats reports exactly the current policy set across updates" {

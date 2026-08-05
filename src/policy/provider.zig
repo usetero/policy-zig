@@ -19,6 +19,42 @@ pub const PolicyStatsSnapshot = struct {
     errors: []const []const u8 = &.{},
 };
 
+/// Total telemetry that entered policy evaluation since the last successful
+/// sync, regardless of match (spec v1.7.0 `VolumeStats`). Counted before the
+/// keep and transform stages, so dropped/sampled/redacted records are included
+/// at their pre-policy size.
+///
+/// Every field is independently optional: `0` means "not tracked" as much as
+/// "none seen". Byte counts are only populated when the caller passes
+/// `EvaluateOptions.record_bytes` — the engine reads records through accessors
+/// and has no serialized form to measure.
+pub const VolumeSnapshot = struct {
+    log_records: i64 = 0,
+    log_bytes: i64 = 0,
+    metric_data_points: i64 = 0,
+    metric_bytes: i64 = 0,
+    spans: i64 = 0,
+    span_bytes: i64 = 0,
+
+    pub fn isZero(self: VolumeSnapshot) bool {
+        inline for (@typeInfo(VolumeSnapshot).@"struct".fields) |f| {
+            if (@field(self, f.name) != 0) return false;
+        }
+        return true;
+    }
+
+    pub fn toProto(self: VolumeSnapshot) proto.policy.VolumeStats {
+        return .{
+            .log_records = self.log_records,
+            .log_bytes = self.log_bytes,
+            .metric_data_points = self.metric_data_points,
+            .metric_bytes = self.metric_bytes,
+            .spans = self.spans,
+            .span_bytes = self.span_bytes,
+        };
+    }
+};
+
 /// Pull-based stats source handed to a provider by the registry at subscribe
 /// time. The provider invokes `collect` immediately before each sync, passing a
 /// per-sync arena; the registry returns one snapshot per policy — including
@@ -28,9 +64,27 @@ pub const PolicyStatsSnapshot = struct {
 pub const StatsCollector = struct {
     context: *anyopaque,
     collect: *const fn (arena: std.mem.Allocator, context: *anyopaque) anyerror![]PolicyStatsSnapshot,
+    /// Drain the registry's volume counters (spec v1.7.0). Optional: a
+    /// collector that leaves it null reports no volume, which is conformant.
+    collect_volume: ?*const fn (context: *anyopaque) VolumeSnapshot = null,
+    /// Add a previously drained reading back, so a failed sync retains its
+    /// counters for the next attempt as the spec requires. Concurrent
+    /// evaluation keeps incrementing across the drain, hence add-back rather
+    /// than restore-by-assignment.
+    restore_volume: ?*const fn (context: *anyopaque, snapshot: VolumeSnapshot) void = null,
 
     pub fn call(self: StatsCollector, arena: std.mem.Allocator) anyerror![]PolicyStatsSnapshot {
         return self.collect(arena, self.context);
+    }
+
+    pub fn drainVolume(self: StatsCollector) VolumeSnapshot {
+        const f = self.collect_volume orelse return .{};
+        return f(self.context);
+    }
+
+    pub fn returnVolume(self: StatsCollector, snapshot: VolumeSnapshot) void {
+        const f = self.restore_volume orelse return;
+        f(self.context, snapshot);
     }
 };
 
