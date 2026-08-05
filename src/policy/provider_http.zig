@@ -36,6 +36,9 @@ const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
 const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
+// A 200 whose SyncResponse carries `error_message`: the control plane rejected
+// the sync in-band, which is a failure even though the transport succeeded.
+const HttpSyncRejected = struct { url: []const u8, err: []const u8 };
 const HttpSyncRequestSucceeded = struct { url: []const u8, policy_statuses_sent: usize };
 // Emitted once per policy status about to be sent, so we can confirm at runtime
 // exactly which policies (and counts) are reported each sync.
@@ -562,9 +565,26 @@ pub const HttpProvider = struct {
             return err;
         };
 
-        // Only a fully decoded response closes the reported interval. A 200 with
-        // an unparseable body is still a failed sync from our side, so its
-        // volume goes back for the next attempt (matching policy-go).
+        // A 200 carrying `error_message` is an in-band rejection: the server
+        // did not accept this sync, so it must not advance the hash, deliver
+        // policies, or close the volume interval. Checked before `volume_sent`
+        // for the same reason policy-go and policy-rs check it before touching
+        // sync state.
+        if (parsed.value.error_message.len > 0) {
+            var mut = parsed;
+            defer mut.deinit();
+            const event: HttpSyncRejected = .{
+                .url = self.config_url,
+                .err = parsed.value.error_message,
+            };
+            self.bus.err(event);
+            return error.SyncRejected;
+        }
+
+        // Only a fully accepted response closes the reported interval. A 200
+        // with an unparseable or rejected body is still a failed sync from our
+        // side, so its volume goes back for the next attempt (matching
+        // policy-go and policy-rs).
         volume_sent = true;
 
         return .{
@@ -993,6 +1013,86 @@ test "HttpProvider: volume is retained when a 200 response cannot be decoded" {
     try testing.expect(std.mem.indexOf(u8, stub.body, "\"metricDataPoints\":\"4\"") != null);
     try testing.expectEqual(@as(i64, 4), Counters.pending.metric_data_points);
     try testing.expectEqual(@as(i64, 256), Counters.pending.metric_bytes);
+}
+
+test "HttpProvider: a 200 carrying error_message is a failed sync and retains volume" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = try SyncStub.start(allocator, io);
+    defer stub.deinit(io);
+    // Well-formed SyncResponse carrying policies, a hash and a timestamp, but
+    // the control plane rejected the sync in-band. None of it may be adopted.
+    stub.response =
+        \\{"policies":[{"id":"p1","enabled":true}],
+        \\ "hash":"should-not-be-adopted",
+        \\ "syncTimestampUnixNano":"1234",
+        \\ "errorMessage":"client not provisioned"}
+    ;
+    var server_future = io.concurrent(SyncStub.serve, .{ &stub, io }) catch
+        return error.SkipZigTest;
+    defer server_future.cancel(io);
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    var provider = try stub.provider(allocator, io, noop_bus.eventBus());
+    defer provider.deinit();
+
+    const Counters = struct {
+        var pending: VolumeSnapshot = .{};
+        fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+            return &.{};
+        }
+        fn drain(_: *anyopaque) VolumeSnapshot {
+            defer pending = .{};
+            return pending;
+        }
+        fn restore(_: *anyopaque, snapshot: VolumeSnapshot) void {
+            pending.spans += snapshot.spans;
+            pending.span_bytes += snapshot.span_bytes;
+        }
+    };
+    Counters.pending = .{ .spans = 3, .span_bytes = 96 };
+
+    var ctx: u8 = 0;
+    provider.setStatsCollector(.{
+        .context = &ctx,
+        .collect = Counters.collect,
+        .collect_volume = Counters.drain,
+        .restore_volume = Counters.restore,
+    });
+
+    // Wired directly rather than via subscribe(), which would fire its own
+    // initial fetch and consume the stub's single response.
+    const Sink = struct {
+        var notified: bool = false;
+        fn onUpdate(_: *anyopaque, _: policy_provider.PolicyUpdate) anyerror!void {
+            notified = true;
+            return;
+        }
+    };
+    Sink.notified = false;
+    provider.callback = .{ .context = &ctx, .onUpdate = Sink.onUpdate };
+
+    if (provider.close()) |_| {
+        try testing.expect(false); // an in-band rejection is not a success
+    } else |err| {
+        try testing.expectEqual(error.SyncRejected, err);
+    }
+    server_future.await(io);
+
+    // Volume survives for the next attempt…
+    try testing.expectEqual(@as(i64, 3), Counters.pending.spans);
+    try testing.expectEqual(@as(i64, 96), Counters.pending.span_bytes);
+    // …the rejected response's hash was not adopted as last-successful…
+    try testing.expect(provider.last_successful_hash == null);
+    // …its timestamp did not advance, so the next attempt is still a full sync…
+    try testing.expectEqual(@as(u64, 0), provider.last_sync_timestamp);
+    // …and its policies were never delivered to the registry.
+    try testing.expect(!Sink.notified);
 }
 
 test "HttpProvider: a failed sync hands its volume back for the next attempt" {
