@@ -2501,6 +2501,113 @@ pub const PolicySyncStatus = struct {
     }
 };
 
+/// VolumeStats reports the total telemetry a client observed since the last
+/// sync, regardless of whether any policy matched it. Counts are of records
+/// entering policy evaluation, before any keep or transform stage runs.
+///
+/// Counters are reset when they are read into a sync request, whether or not
+/// that sync then succeeds — the same rule PolicySyncStatus.match_hits and
+/// match_misses follow. A failed sync loses its interval from the numerator and
+/// the denominator alike, so match rates stay meaningful; counters from a failed
+/// sync must never be replayed, since the server cannot tell a replay from new
+/// telemetry. Reported volume is a lower bound, not an exact total.
+///
+/// Reporting volume is optional, and every field is individually optional: an
+/// implementation may report record counts without byte counts, or a subset of
+/// signals. Any field left at 0 means "not tracked" as much as it means "none
+/// seen", so consumers must not read 0 as an observation.
+///
+/// Byte counts, when reported, are the uncompressed OTLP protobuf serialized
+/// size of the records as received, and are an estimate; implementations that
+/// cannot measure this cheaply may approximate it. A size in any other encoding
+/// must not be reported here — leave the field at 0 instead.
+pub const VolumeStats = struct {
+    log_records: i64 = 0,
+    log_bytes: i64 = 0,
+    metric_data_points: i64 = 0,
+    metric_bytes: i64 = 0,
+    spans: i64 = 0,
+    span_bytes: i64 = 0,
+
+    pub const _desc_table = .{
+        .log_records = fd(1, .{ .scalar = .int64 }),
+        .log_bytes = fd(2, .{ .scalar = .int64 }),
+        .metric_data_points = fd(3, .{ .scalar = .int64 }),
+        .metric_bytes = fd(4, .{ .scalar = .int64 }),
+        .spans = fd(5, .{ .scalar = .int64 }),
+        .span_bytes = fd(6, .{ .scalar = .int64 }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Decodes the message from the JSON string, honoring pb options
+    /// (e.g. hex_bytes_fields for OTLP trace_id/span_id).
+    pub fn jsonDecodeOpts(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decodeOpts(@This(), input, options, pb_options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
 /// SyncRequest is sent by clients to request policy updates.
 pub const SyncRequest = struct {
     client_metadata: ?ClientMetadata = null,
@@ -2508,6 +2615,7 @@ pub const SyncRequest = struct {
     last_sync_timestamp_unix_nano: u64 = 0,
     last_successful_hash: []const u8 = &.{},
     policy_statuses: std.ArrayList(PolicySyncStatus) = .empty,
+    volume: ?VolumeStats = null,
 
     pub const _desc_table = .{
         .client_metadata = fd(1, .submessage),
@@ -2515,6 +2623,7 @@ pub const SyncRequest = struct {
         .last_sync_timestamp_unix_nano = fd(3, .{ .scalar = .fixed64 }),
         .last_successful_hash = fd(4, .{ .scalar = .string }),
         .policy_statuses = fd(5, .{ .repeated = .submessage }),
+        .volume = fd(6, .submessage),
     };
 
     /// Encodes the message to the writer

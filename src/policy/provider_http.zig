@@ -7,6 +7,7 @@ const o11y = @import("observability");
 const PolicyCallback = policy_provider.PolicyCallback;
 const StatsCollector = policy_provider.StatsCollector;
 const PolicyStatsSnapshot = policy_provider.PolicyStatsSnapshot;
+const VolumeSnapshot = policy_provider.VolumeSnapshot;
 const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
@@ -35,10 +36,16 @@ const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
 const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
+// A 200 whose SyncResponse carries `error_message`: the control plane rejected
+// the sync in-band, which is a failure even though the transport succeeded.
+const HttpSyncRejected = struct { url: []const u8, err: []const u8 };
 const HttpSyncRequestSucceeded = struct { url: []const u8, policy_statuses_sent: usize };
 // Emitted once per policy status about to be sent, so we can confirm at runtime
 // exactly which policies (and counts) are reported each sync.
 const HttpSyncStatusReported = struct { id: []const u8, match_hits: i64, match_misses: i64, errors: usize };
+// Emitted when a sync carries volume, for the same reason: confirming at
+// runtime what was reported. Omitted volume (all-zero) emits nothing.
+const HttpSyncVolumeReported = struct { volume: VolumeSnapshot };
 const HttpFetchStarted = struct {};
 const HttpFetchCompleted = struct {};
 
@@ -398,6 +405,12 @@ pub const HttpProvider = struct {
 
         const policy_statuses_list = try statsToSyncStatuses(temp_allocator, stats);
 
+        // Drain total observed volume (v1.7.1). Draining is the reset, exactly
+        // like the per-policy counters above: if this sync fails its interval is
+        // gone rather than replayed, since the server cannot tell a replay from
+        // new telemetry. Reported volume is a lower bound, not an exact total.
+        const volume: VolumeSnapshot = if (self.stats_collector) |c| c.drainVolume() else .{};
+
         // Log exactly what we're about to report, so runtime expectations can be
         // verified against the live snapshot.
         for (policy_statuses_list.items) |status| {
@@ -449,7 +462,15 @@ pub const HttpProvider = struct {
             .last_sync_timestamp_unix_nano = self.last_sync_timestamp,
             .last_successful_hash = last_hash,
             .policy_statuses = policy_statuses_list,
+            // Omitted rather than sent zero-valued when nothing was seen, per
+            // the spec's guidance for implementations that track no volume.
+            .volume = if (volume.isZero()) null else volume.toProto(),
         };
+
+        if (!volume.isZero()) {
+            const volume_event: HttpSyncVolumeReported = .{ .volume = volume };
+            self.bus.debug(volume_event);
+        }
 
         // Encode SyncRequest to JSON
         const request_body = try sync_request.jsonEncode(.{}, .{ .emit_oneof_field_name = false }, temp_allocator);
@@ -525,6 +546,21 @@ pub const HttpProvider = struct {
             self.bus.err(event);
             return err;
         };
+
+        // A 200 carrying `error_message` is an in-band rejection: the server did
+        // not accept this sync, so it must not advance the hash or deliver
+        // policies. Checked before touching sync state, as policy-go and
+        // policy-rs do.
+        if (parsed.value.error_message.len > 0) {
+            var mut = parsed;
+            defer mut.deinit();
+            const event: HttpSyncRejected = .{
+                .url = self.config_url,
+                .err = parsed.value.error_message,
+            };
+            self.bus.err(event);
+            return error.SyncRejected;
+        }
 
         return .{
             .parsed = parsed,
@@ -649,6 +685,68 @@ test "HttpProvider: refreshClientClock advances stale now but leaves first reque
     try testing.expect(provider.http_client.now.?.nanoseconds > stale.nanoseconds);
 }
 
+/// Minimal control-plane stub: accept one POST, record its body, answer with
+/// `response` (200 and an empty SyncResponse by default). Serves exactly one
+/// request, so an unexpected extra sync is observable as a hang/failure.
+const SyncStub = struct {
+    allocator: std.mem.Allocator,
+    listener: std.Io.net.Server,
+    port: u16,
+    body: []u8 = &.{},
+    served: bool = false,
+    /// Response body. Set to something unparseable to exercise the decode
+    /// failure path.
+    response: []const u8 = "{}",
+
+    fn start(a: std.mem.Allocator, sio: std.Io) !SyncStub {
+        var attempt: u16 = 0;
+        while (attempt < 32) : (attempt += 1) {
+            const port: u16 = 42801 + attempt;
+            const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+            const listener = addr.listen(sio, .{}) catch |err| switch (err) {
+                error.AddressInUse => continue,
+                else => return err,
+            };
+            return .{ .allocator = a, .listener = listener, .port = port };
+        }
+        return error.AddressInUse;
+    }
+
+    fn deinit(self: *SyncStub, sio: std.Io) void {
+        defer self.* = undefined;
+        self.listener.deinit(sio);
+        if (self.body.len > 0) self.allocator.free(self.body);
+    }
+
+    fn serve(self: *SyncStub, sio: std.Io) void {
+        var stream = self.listener.accept(sio) catch return;
+        defer stream.close(sio);
+        var recv_buf: [16 * 1024]u8 = undefined;
+        var send_buf: [4 * 1024]u8 = undefined;
+        var conn_reader = stream.reader(sio, &recv_buf);
+        var conn_writer = stream.writer(sio, &send_buf);
+        var http_server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+        var request = http_server.receiveHead() catch return;
+        var transfer_buf: [8 * 1024]u8 = undefined;
+        const body_reader = request.readerExpectContinue(&transfer_buf) catch return;
+        self.body = body_reader.allocRemaining(self.allocator, .limited(1 << 20)) catch return;
+        self.served = true;
+        request.respond(self.response, .{ .status = .ok }) catch return;
+    }
+
+    /// Start a stub plus a provider pointed at it, in the shape every sync test
+    /// needs. Caller owns both (see the deinit pattern in the tests below).
+    fn provider(self: *const SyncStub, a: std.mem.Allocator, sio: std.Io, bus: *EventBus) !*HttpProvider {
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sync", .{self.port});
+        return HttpProvider.init(a, sio, bus, .{
+            .id = "p",
+            .url = url,
+            .poll_interval_seconds = 3600,
+        });
+    }
+};
+
 test "HttpProvider.close: flushes final stats once, then is idempotent" {
     const allocator = testing.allocator;
     // Own Threaded io so the stub control-plane server gets a real thread,
@@ -657,58 +755,9 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Minimal control-plane stub: accept one POST, record its body, answer 200
-    // with an empty SyncResponse. Refuses to serve more than one request so a
-    // second close() firing a redundant sync would be observable as a hang/fail.
-    const Stub = struct {
-        const Self = @This();
-
-        allocator: std.mem.Allocator,
-        listener: std.Io.net.Server,
-        port: u16,
-        body: []u8 = &.{},
-        served: bool = false,
-
-        fn start(a: std.mem.Allocator, sio: std.Io) !Self {
-            var attempt: u16 = 0;
-            while (attempt < 32) : (attempt += 1) {
-                const port: u16 = 42801 + attempt;
-                const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-                const listener = addr.listen(sio, .{}) catch |err| switch (err) {
-                    error.AddressInUse => continue,
-                    else => return err,
-                };
-                return .{ .allocator = a, .listener = listener, .port = port };
-            }
-            return error.AddressInUse;
-        }
-
-        fn deinit(self: *Self, sio: std.Io) void {
-            defer self.* = undefined;
-            self.listener.deinit(sio);
-            if (self.body.len > 0) self.allocator.free(self.body);
-        }
-
-        fn serve(self: *Self, sio: std.Io) void {
-            var stream = self.listener.accept(sio) catch return;
-            defer stream.close(sio);
-            var recv_buf: [16 * 1024]u8 = undefined;
-            var send_buf: [4 * 1024]u8 = undefined;
-            var conn_reader = stream.reader(sio, &recv_buf);
-            var conn_writer = stream.writer(sio, &send_buf);
-            var http_server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
-            var request = http_server.receiveHead() catch return;
-            var transfer_buf: [8 * 1024]u8 = undefined;
-            const body_reader = request.readerExpectContinue(&transfer_buf) catch return;
-            self.body = body_reader.allocRemaining(self.allocator, .limited(1 << 20)) catch return;
-            self.served = true;
-            request.respond("{}", .{ .status = .ok }) catch return;
-        }
-    };
-
-    var stub = try Stub.start(allocator, io);
+    var stub = try SyncStub.start(allocator, io);
     defer stub.deinit(io);
-    var server_future = io.concurrent(Stub.serve, .{ &stub, io }) catch
+    var server_future = io.concurrent(SyncStub.serve, .{ &stub, io }) catch
         return error.SkipZigTest;
     defer server_future.cancel(io);
 
@@ -736,10 +785,17 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
             rows[0] = .{ .id = "hot", .hits = 5, .misses = 1 };
             return rows;
         }
+        fn drain(_: *anyopaque) VolumeSnapshot {
+            return .{ .log_records = 9, .log_bytes = 512 };
+        }
     };
     Collector.calls = 0;
     var ctx: u8 = 0;
-    provider.setStatsCollector(.{ .context = &ctx, .collect = Collector.collect });
+    provider.setStatsCollector(.{
+        .context = &ctx,
+        .collect = Collector.collect,
+        .collect_volume = Collector.drain,
+    });
 
     try provider.close();
     server_future.await(io);
@@ -750,6 +806,9 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
     // The final sync carried the tail stats: the policy id and its hit count.
     try testing.expect(std.mem.indexOf(u8, stub.body, "hot") != null);
     try testing.expect(std.mem.indexOf(u8, stub.body, "matchHits") != null);
+    // …and the observed volume.
+    try testing.expect(std.mem.indexOf(u8, stub.body, "\"logRecords\":\"9\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stub.body, "\"logBytes\":\"512\"") != null);
 
     // Second close is a no-op: no extra collect, no extra request (the stub
     // only served one and its port is about to close).
@@ -783,6 +842,197 @@ test "HttpProvider.close: propagates the final sync error" {
     // second close is a silent no-op.
     try testing.expect(provider.flushed);
     try provider.close();
+}
+
+test "HttpProvider: an all-zero volume is omitted from the sync request" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = try SyncStub.start(allocator, io);
+    defer stub.deinit(io);
+    var server_future = io.concurrent(SyncStub.serve, .{ &stub, io }) catch
+        return error.SkipZigTest;
+    defer server_future.cancel(io);
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    var provider = try stub.provider(allocator, io, noop_bus.eventBus());
+    defer provider.deinit();
+
+    // Collector wired, but nothing observed yet: the spec says omit the message
+    // rather than send a zero-valued one.
+    var ctx: u8 = 0;
+    provider.setStatsCollector(.{
+        .context = &ctx,
+        .collect = struct {
+            fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+                return &.{};
+            }
+        }.collect,
+        .collect_volume = struct {
+            fn drain(_: *anyopaque) VolumeSnapshot {
+                return .{};
+            }
+        }.drain,
+    });
+
+    try provider.close();
+    server_future.await(io);
+
+    try testing.expect(stub.served);
+    try testing.expect(std.mem.indexOf(u8, stub.body, "volume") == null);
+}
+
+test "HttpProvider: a provider with no volume seam wired syncs without volume" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = try SyncStub.start(allocator, io);
+    defer stub.deinit(io);
+    var server_future = io.concurrent(SyncStub.serve, .{ &stub, io }) catch
+        return error.SkipZigTest;
+    defer server_future.cancel(io);
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    var provider = try stub.provider(allocator, io, noop_bus.eventBus());
+    defer provider.deinit();
+
+    // A collector built without the volume fns (an older consumer, or a
+    // provider the registry never handed them to) must still sync cleanly.
+    var ctx: u8 = 0;
+    provider.setStatsCollector(.{
+        .context = &ctx,
+        .collect = struct {
+            fn collect(arena: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+                const rows = try arena.alloc(PolicyStatsSnapshot, 1);
+                rows[0] = .{ .id = "p", .hits = 1 };
+                return rows;
+            }
+        }.collect,
+    });
+
+    try provider.close();
+    server_future.await(io);
+
+    try testing.expect(stub.served);
+    // Per-policy stats still reported; volume simply absent.
+    try testing.expect(std.mem.indexOf(u8, stub.body, "matchHits") != null);
+    try testing.expect(std.mem.indexOf(u8, stub.body, "volume") == null);
+}
+
+test "HttpProvider: a 200 carrying error_message is a failed sync" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = try SyncStub.start(allocator, io);
+    defer stub.deinit(io);
+    // Well-formed SyncResponse carrying policies, a hash and a timestamp, but
+    // the control plane rejected the sync in-band. None of it may be adopted.
+    stub.response =
+        \\{"policies":[{"id":"p1","enabled":true}],
+        \\ "hash":"should-not-be-adopted",
+        \\ "syncTimestampUnixNano":"1234",
+        \\ "errorMessage":"client not provisioned"}
+    ;
+    var server_future = io.concurrent(SyncStub.serve, .{ &stub, io }) catch
+        return error.SkipZigTest;
+    defer server_future.cancel(io);
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    var provider = try stub.provider(allocator, io, noop_bus.eventBus());
+    defer provider.deinit();
+
+    var ctx: u8 = 0;
+
+    // Wired directly rather than via subscribe(), which would fire its own
+    // initial fetch and consume the stub's single response.
+    const Sink = struct {
+        var notified: bool = false;
+        fn onUpdate(_: *anyopaque, _: policy_provider.PolicyUpdate) anyerror!void {
+            notified = true;
+            return;
+        }
+    };
+    Sink.notified = false;
+    provider.callback = .{ .context = &ctx, .onUpdate = Sink.onUpdate };
+
+    if (provider.close()) |_| {
+        try testing.expect(false); // an in-band rejection is not a success
+    } else |err| {
+        try testing.expectEqual(error.SyncRejected, err);
+    }
+    server_future.await(io);
+
+    // The rejected response's hash was not adopted as last-successful…
+    try testing.expect(provider.last_successful_hash == null);
+    // …its timestamp did not advance, so the next attempt is still a full sync…
+    try testing.expectEqual(@as(u64, 0), provider.last_sync_timestamp);
+    // …and its policies were never delivered to the registry.
+    try testing.expect(!Sink.notified);
+}
+
+test "HttpProvider: a failed sync drops its volume instead of replaying it" {
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+
+    // Stand-in for the registry's counters, draining on pull exactly as
+    // VolumeCounters.readAndReset does. There is deliberately no way to put a
+    // reading back: the server cannot tell a replay from new telemetry, so a
+    // failed sync's interval is lost rather than double counted.
+    const Counters = struct {
+        var pending: VolumeSnapshot = .{};
+        var drains: usize = 0;
+        fn collect(_: std.mem.Allocator, _: *anyopaque) anyerror![]PolicyStatsSnapshot {
+            return &.{};
+        }
+        fn drain(_: *anyopaque) VolumeSnapshot {
+            drains += 1;
+            defer pending = .{};
+            return pending;
+        }
+    };
+    Counters.pending = .{ .log_records = 1, .log_bytes = 64, .spans = 1 };
+    Counters.drains = 0;
+
+    // Port 1 has nothing listening → the POST fails after the drain.
+    var provider = try HttpProvider.init(
+        allocator,
+        io,
+        noop_bus.eventBus(),
+        .{ .id = "p", .url = "http://127.0.0.1:1/sync", .poll_interval_seconds = 3600 },
+    );
+    defer provider.deinit();
+    var ctx: u8 = 0;
+    provider.setStatsCollector(.{
+        .context = &ctx,
+        .collect = Counters.collect,
+        .collect_volume = Counters.drain,
+    });
+
+    if (provider.close()) |_| {
+        try testing.expect(false); // expected the unreachable endpoint to error
+    } else |_| {}
+
+    // The interval was read into the failed request and is gone: reported volume
+    // is a lower bound on what was observed, never a replay.
+    try testing.expectEqual(@as(usize, 1), Counters.drains);
+    try testing.expect(Counters.pending.isZero());
 }
 
 test "statsToSyncStatuses: maps hits/misses/errors and reports every policy" {
