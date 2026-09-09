@@ -1,271 +1,146 @@
-// Benchmarks for policy-zig evaluation across telemetry types and policy counts.
-// Each policy is a distinct regex that the test record never matches, forcing a
-// full scan — all N patterns checked per call. Mirrors policy-go backendbench.
-//
-// Run: zig build bench
+//! Runtime benchmarks over compiled policy images.
+
 const std = @import("std");
+const policy = @import("policy_zig");
 const zbench = @import("zbench");
-const policy_zig = @import("policy_zig");
-const o11y = @import("observability");
 
-const PolicyEngine = policy_zig.PolicyEngine;
-const PolicyRegistry = policy_zig.Registry;
-const FieldRef = policy_zig.FieldRef;
-const MetricFieldRef = policy_zig.MetricFieldRef;
-const TraceFieldRef = policy_zig.TraceFieldRef;
-const LogAccessor = policy_zig.LogAccessor;
-const MetricAccessor = policy_zig.MetricAccessor;
-const TraceAccessor = policy_zig.TraceAccessor;
-const TypedValue = policy_zig.TypedValue;
-const NoopEventBus = o11y.NoopEventBus;
+const policy_counts = [_]usize{ 1, 10, 100, 256, 1000 };
+const matching_counts = [_]usize{ 1, 100, 1000 };
 
-const COUNTS = [_]usize{ 1, 10, 100, 1000 };
+var benchmark_checksum: u64 = 0;
 
-// --- Minimal accessors ---
+const BenchState = struct {
+    allocator: std.mem.Allocator,
+    image_storage: []u8,
+    worker_storage: []u8,
+    image: policy.PolicyImage,
+    worker: policy.WorkerState,
+    engine: policy.PolicyEngine,
+    values: [1]policy.ValueRef,
+    context: policy.EvalContext,
 
-const BenchLog = struct {
-    body: []const u8,
-    fn access(ctx: *const anyopaque, field: FieldRef) ?TypedValue {
-        const self: *const BenchLog = @ptrCast(@alignCast(ctx));
-        return switch (field) {
-            .log_field => |lf| if (lf == .LOG_FIELD_BODY) .{ .string = self.body } else null,
-            else => null,
+    fn capacity(count: usize) policy.Capacity {
+        return .{
+            .max_connections = 1,
+            .worker_count = 1,
+            .max_policies = @intCast(count),
+            .max_fields = 1,
+            .max_matchers = @intCast(count),
+            .max_actions = 1,
+            .max_image_bytes = @intCast(256 + count * 128),
+            .max_record_bytes = 4096,
+            .max_context_bytes = 4096,
+            .max_group_bytes = 512,
+            .journal_events_per_worker = 1024,
+            .extension_queue_bytes = 4096,
         };
     }
-    const accessor: LogAccessor = .{ .typed_value = access };
-};
 
-const BenchMetric = struct {
-    name: []const u8,
-    fn access(ctx: *const anyopaque, field: MetricFieldRef) ?TypedValue {
-        const self: *const BenchMetric = @ptrCast(@alignCast(ctx));
-        return switch (field) {
-            .metric_field => |mf| if (mf == .METRIC_FIELD_NAME) .{ .string = self.name } else null,
-            else => null,
+    fn init(allocator: std.mem.Allocator, count: usize, matching: bool, sample: bool) !*BenchState {
+        const state = try allocator.create(BenchState);
+        errdefer allocator.destroy(state);
+        const capacity_value = capacity(count);
+        state.allocator = allocator;
+        state.image_storage = try allocator.alloc(u8, capacity_value.max_image_bytes);
+        errdefer allocator.free(state.image_storage);
+        state.worker_storage = try allocator.alloc(u8, policy.WorkerState.requiredBytes(capacity_value));
+        errdefer allocator.free(state.worker_storage);
+
+        const policies = try allocator.alloc(policy.compiler.PolicySpec, count);
+        defer allocator.free(policies);
+        const matchers = try allocator.alloc(policy.compiler.MatcherSpec, count);
+        defer allocator.free(matchers);
+        const identifiers = try allocator.alloc([16]u8, count);
+        defer allocator.free(identifiers);
+        const field: policy.compiler.FieldSpec = .{
+            .signal = .log,
+            .value_kind = .string,
+            .selector_id = 1,
+            .name = "body",
         };
-    }
-    const accessor: MetricAccessor = .{ .typed_value = access };
-};
+        for (0..count) |index| {
+            const identifier = try std.fmt.bufPrint(&identifiers[index], "policy-{d}", .{index});
+            matchers[index] = .{
+                .field = field,
+                .opcode = .exact,
+                .value = .{ .string = "never-matches" },
+            };
+            policies[index] = .{
+                .id = identifier,
+                .verdict = .drop,
+                .priority = @intCast(index),
+                .matchers = matchers[index .. index + 1],
+                .sampling = if (sample) .{ .percentage = 50 } else null,
+            };
+        }
 
-const BenchTrace = struct {
-    name: []const u8,
-    fn access(ctx: *const anyopaque, field: TraceFieldRef) ?TypedValue {
-        const self: *const BenchTrace = @ptrCast(@alignCast(ctx));
-        return switch (field) {
-            .trace_field => |tf| if (tf == .TRACE_FIELD_NAME) .{ .string = self.name } else null,
-            else => null,
+        var workspace: [256]u8 = undefined;
+        var compiler = try policy.PolicyCompiler.init(capacity_value, &workspace, state.image_storage);
+        const bytes = try compiler.compile(.{ .policies = policies, .seed = 0x1234 });
+        state.image = try policy.PolicyImage.open(bytes);
+        state.worker = try policy.WorkerState.init(state.worker_storage, capacity_value);
+        state.engine = policy.PolicyEngine.init(&state.image, &state.worker);
+        state.values = .{.{ .string = if (matching) "never-matches" else "ordinary application record" }};
+        state.context = .{
+            .image_epoch = 1,
+            .worker_id = 0,
+            .signal = .log,
+            .record_key = "stable-benchmark-key",
         };
-    }
-    const accessor: TraceAccessor = .{ .typed_value = access };
-};
-
-// --- JSON builders (allocator passed per-call, Zig 0.16 style) ---
-
-fn appendNum(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: usize) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
-}
-
-fn buildLogJson(allocator: std.mem.Allocator, n: usize) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"policies\":[");
-    for (0..n) |i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"id\":\"log-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "\",\"name\":\"log-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "\",\"log\":{\"match\":[{\"log_field\":\"body\",\"regex\":\"secret-token-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "-[0-9a-f]{16}\"}],\"keep\":\"none\"}}");
-    }
-    try buf.appendSlice(allocator, "]}");
-    return buf.toOwnedSlice(allocator);
-}
-
-fn buildMetricJson(allocator: std.mem.Allocator, n: usize) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"policies\":[");
-    for (0..n) |i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"id\":\"metric-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "\",\"name\":\"metric-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "\",\"metric\":{\"match\":[{\"metric_field\":\"name\",\"regex\":\"secret-token-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "-[0-9a-f]{16}\"}],\"keep\":false}}");
-    }
-    try buf.appendSlice(allocator, "]}");
-    return buf.toOwnedSlice(allocator);
-}
-
-fn buildTraceJson(allocator: std.mem.Allocator, n: usize) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"policies\":[");
-    for (0..n) |i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"id\":\"trace-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "\",\"name\":\"trace-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "\",\"trace\":{\"match\":[{\"trace_field\":\"TRACE_FIELD_NAME\",\"regex\":\"secret-token-");
-        try appendNum(&buf, allocator, i);
-        try buf.appendSlice(allocator, "-[0-9a-f]{16}\"}],\"keep\":{\"percentage\":100.0}}}");
-    }
-    try buf.appendSlice(allocator, "]}");
-    return buf.toOwnedSlice(allocator);
-}
-
-// --- Per-benchmark state structs (heap-allocated so registry doesn't move) ---
-// zBench calls run(self, allocator) in a tight loop; setup happens in init().
-
-const LogState = struct {
-    registry: *PolicyRegistry,
-    engine: PolicyEngine,
-    ctx: BenchLog = .{ .body = "normal application log line, nothing sensitive here" },
-    policy_id_buf: [1024][]const u8 = undefined,
-
-    fn init(allocator: std.mem.Allocator, bus: *o11y.EventBus, n: usize) !*LogState {
-        const json = try buildLogJson(allocator, n);
-        defer allocator.free(json);
-        const policies = try policy_zig.parser.parsePoliciesBytes(allocator, json);
-        defer {
-            for (policies) |*p| p.deinit(allocator);
-            allocator.free(policies);
-        }
-        const self = try allocator.create(LogState);
-        self.registry = try allocator.create(PolicyRegistry);
-        self.registry.* = PolicyRegistry.init(allocator, bus);
-        try self.registry.updatePolicies(policies, "bench", .file);
-        self.engine = PolicyEngine.init(bus, self.registry);
-        self.ctx = .{ .body = "normal application log line, nothing sensitive here" };
-        return self;
+        return state;
     }
 
-    fn deinit(self: *LogState, allocator: std.mem.Allocator) void {
-        self.registry.deinit();
-        allocator.destroy(self.registry);
-        allocator.destroy(self);
+    fn deinit(self: *BenchState) void {
+        const allocator = self.allocator;
+        defer allocator.destroy(self);
+        defer self.* = undefined;
+        allocator.free(self.worker_storage);
+        allocator.free(self.image_storage);
     }
 
-    pub fn run(self: *LogState, alloc: std.mem.Allocator) void {
-        _ = alloc;
-        _ = self.engine.evaluate(.log, &BenchLog.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
-    }
-};
-
-const MetricState = struct {
-    registry: *PolicyRegistry,
-    engine: PolicyEngine,
-    ctx: BenchMetric = .{ .name = "http.server.request.duration" },
-    policy_id_buf: [1024][]const u8 = undefined,
-
-    fn init(allocator: std.mem.Allocator, bus: *o11y.EventBus, n: usize) !*MetricState {
-        const json = try buildMetricJson(allocator, n);
-        defer allocator.free(json);
-        const policies = try policy_zig.parser.parsePoliciesBytes(allocator, json);
-        defer {
-            for (policies) |*p| p.deinit(allocator);
-            allocator.free(policies);
-        }
-        const self = try allocator.create(MetricState);
-        self.registry = try allocator.create(PolicyRegistry);
-        self.registry.* = PolicyRegistry.init(allocator, bus);
-        try self.registry.updatePolicies(policies, "bench", .file);
-        self.engine = PolicyEngine.init(bus, self.registry);
-        self.ctx = .{ .name = "http.server.request.duration" };
-        return self;
-    }
-
-    fn deinit(self: *MetricState, allocator: std.mem.Allocator) void {
-        self.registry.deinit();
-        allocator.destroy(self.registry);
-        allocator.destroy(self);
-    }
-
-    pub fn run(self: *MetricState, alloc: std.mem.Allocator) void {
-        _ = alloc;
-        _ = self.engine.evaluate(.metric, &BenchMetric.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
-    }
-};
-
-const TraceState = struct {
-    registry: *PolicyRegistry,
-    engine: PolicyEngine,
-    ctx: BenchTrace = .{ .name = "GET /api/v1/users" },
-    policy_id_buf: [1024][]const u8 = undefined,
-
-    fn init(allocator: std.mem.Allocator, bus: *o11y.EventBus, n: usize) !*TraceState {
-        const json = try buildTraceJson(allocator, n);
-        defer allocator.free(json);
-        const policies = try policy_zig.parser.parsePoliciesBytes(allocator, json);
-        defer {
-            for (policies) |*p| p.deinit(allocator);
-            allocator.free(policies);
-        }
-        const self = try allocator.create(TraceState);
-        self.registry = try allocator.create(PolicyRegistry);
-        self.registry.* = PolicyRegistry.init(allocator, bus);
-        try self.registry.updatePolicies(policies, "bench", .file);
-        self.engine = PolicyEngine.init(bus, self.registry);
-        self.ctx = .{ .name = "GET /api/v1/users" };
-        return self;
-    }
-
-    fn deinit(self: *TraceState, allocator: std.mem.Allocator) void {
-        self.registry.deinit();
-        allocator.destroy(self.registry);
-        allocator.destroy(self);
-    }
-
-    pub fn run(self: *TraceState, alloc: std.mem.Allocator) void {
-        _ = alloc;
-        _ = self.engine.evaluate(.trace, &BenchTrace.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
+    pub fn run(self: *BenchState, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const result = self.engine.evaluate(&self.values, self.context);
+        const destination: *volatile u64 = &benchmark_checksum;
+        destination.* +%= result.image_hash_prefix ^ result.match_summary ^ result.winning_policy_index;
     }
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_allocator.deinit();
+    const allocator = debug_allocator.allocator();
+    var benchmark = zbench.Benchmark.init(allocator, .{});
+    defer benchmark.deinit();
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    const bus = noop_bus.eventBus();
-
-    var bench = zbench.Benchmark.init(allocator, .{});
-    defer bench.deinit();
-
-    // Build all states upfront (outside the timed loops), register with zBench.
-    // We need bench name buffers to outlive bench.run().
-    var name_bufs: [COUNTS.len * 3][32]u8 = undefined;
-    var states_log: [COUNTS.len]*LogState = undefined;
-    var states_metric: [COUNTS.len]*MetricState = undefined;
-    var states_trace: [COUNTS.len]*TraceState = undefined;
-
-    for (COUNTS, 0..) |n, idx| {
-        states_log[idx] = try LogState.init(allocator, bus, n);
-        const log_name = try std.fmt.bufPrint(&name_bufs[idx], "log/{d}", .{n});
-        try bench.addParam(log_name, @as(*const LogState, states_log[idx]), .{});
-
-        states_metric[idx] = try MetricState.init(allocator, bus, n);
-        const metric_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len + idx], "metric/{d}", .{n});
-        try bench.addParam(metric_name, @as(*const MetricState, states_metric[idx]), .{});
-
-        states_trace[idx] = try TraceState.init(allocator, bus, n);
-        const trace_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len * 2 + idx], "trace/{d}", .{n});
-        try bench.addParam(trace_name, @as(*const TraceState, states_trace[idx]), .{});
+    var names: [policy_counts.len + matching_counts.len + 1][40]u8 = undefined;
+    var misses: [policy_counts.len]*BenchState = undefined;
+    var matches: [matching_counts.len]*BenchState = undefined;
+    for (policy_counts, 0..) |count, index| {
+        misses[index] = try BenchState.init(allocator, count, false, false);
+        const name = try std.fmt.bufPrint(&names[index], "exact-unmatched/{d}", .{count});
+        try benchmark.addParam(name, @as(*const BenchState, misses[index]), .{});
     }
+    for (matching_counts, 0..) |count, index| {
+        matches[index] = try BenchState.init(allocator, count, true, false);
+        const name = try std.fmt.bufPrint(&names[policy_counts.len + index], "exact-matched/{d}", .{count});
+        try benchmark.addParam(name, @as(*const BenchState, matches[index]), .{});
+    }
+    const sampled = try BenchState.init(allocator, 1, true, true);
+    try benchmark.addParam("otel-sampling/1", @as(*const BenchState, sampled), .{});
 
     const io = std.Options.debug_io;
-    try bench.run(io, std.Io.File.stdout());
+    try benchmark.run(io, std.Io.File.stdout());
+    var buffer: [256]u8 = undefined;
+    var output = std.Io.File.stdout().writer(io, &buffer);
+    try output.interface.print("checksum={d} image_bytes/1000={d} worker_bytes/1000={d}\n", .{
+        benchmark_checksum,
+        misses[misses.len - 1].image.bytes.len,
+        policy.WorkerState.requiredBytes(BenchState.capacity(1000)),
+    });
+    try output.interface.flush();
 
-    for (states_log) |s| s.deinit(allocator);
-    for (states_metric) |s| s.deinit(allocator);
-    for (states_trace) |s| s.deinit(allocator);
+    for (misses) |state| state.deinit();
+    for (matches) |state| state.deinit();
+    sampled.deinit();
 }

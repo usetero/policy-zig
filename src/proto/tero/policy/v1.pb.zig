@@ -4,8 +4,6 @@ const std = @import("std");
 
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
-/// import package google.api
-const google_api = @import("../../google/api.pb.zig");
 /// import package opentelemetry.proto.common.v1
 const opentelemetry_proto_common_v1 = @import("../../opentelemetry/proto/common/v1.pb.zig");
 
@@ -2785,17 +2783,6 @@ pub const SyncResponse = struct {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
 };
-
-/// PolicyService defines the gRPC service for policy providers.
-pub fn PolicyService(comptime UserDataType: type, comptime ErrorSet: type) type {
-    return struct {
-        pub const package = "tero.policy.v1";
-        pub const service_name = "PolicyService";
-
-        /// Sync policies with the provider
-        Sync: *const fn (userdata: *UserDataType, request: SyncRequest) ErrorSet!SyncResponse,
-    };
-}
 
 /// ExtensionTarget is a pre-configured, named destination an extension can route
 /// telemetry to (for example, an S3 bucket or a downstream OTLP endpoint).

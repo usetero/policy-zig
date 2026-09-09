@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package tero.policy.v1;
 
-import "google/api/annotations.proto";
 import "opentelemetry/proto/common/v1/common.proto";
 import "tero/policy/v1/extension.proto";
 import "tero/policy/v1/log.proto";
@@ -215,19 +214,4 @@ message SyncResponse {
   // available ExtensionTargets. A client merges these with any locally
   // configured extension state.
   repeated ExtensionConfig extension_configs = 7;
-}
-
-// =============================================================================
-// Policy Provider Service (optional - for gRPC providers)
-// =============================================================================
-
-// PolicyService defines the gRPC service for policy providers.
-service PolicyService {
-  // Sync policies with the provider
-  rpc Sync(SyncRequest) returns (SyncResponse) {
-    option (google.api.http) = {
-      post: "/v1/policy/sync"
-      body: "*"
-    };
-  }
 }

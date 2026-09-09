@@ -1,305 +1,98 @@
-# https://taskfile.dev
-
 version: "3"
-
-vars:
-  PROJECT_NAME: policy-zig
-  BUILD_DIR: zig-out
 
 tasks:
   default:
-    desc: "Build the project in debug mode"
-    aliases: [b]
+    desc: Build the library
     cmds:
       - zig build
 
   build:
-    desc: "Build the project with specified optimization"
-    aliases: [build-opt]
+    desc: Build with the selected optimization mode
     cmds:
       - zig build -Doptimize={{.OPTIMIZE | default "Debug"}}
 
-  build:protos:
-    desc: "Build the project with protos"
-    cmds:
-      - zig build -Dgen-proto=true gen-proto
-
   build:release:
-    desc: "Build the project in release mode (ReleaseFast)"
-    aliases: [br, release]
+    desc: Build in ReleaseFast mode
     cmds:
       - zig build -Doptimize=ReleaseFast
 
-  build:safe:
-    desc: "Build the project in ReleaseSafe mode"
-    aliases: [bs]
+  build:protos:
+    desc: Regenerate provider protobuf declarations
     cmds:
-      - zig build -Doptimize=ReleaseSafe
+      - zig build -Dgen-proto=true gen-proto
 
-  build:small:
-    desc: "Build the project in ReleaseSmall mode"
-    aliases: [bsm]
+  test:
+    desc: Run the complete test suite
     cmds:
-      - zig build -Doptimize=ReleaseSmall
+      - zig build test -Doptimize=ReleaseSafe --summary all
 
   bench:
-    desc: "Run benchmarks (log/metric/trace × policy counts)"
+    desc: Benchmark compiled-image evaluation and OTel sampling
     cmds:
       - zig build bench
 
-  test:
-    desc: "Run all tests"
-    aliases: [t]
+  bench:counters:
+    desc: Capture hardware performance counters
     cmds:
-      - zig build test -Doptimize=ReleaseSafe
+      - scripts/perf-counters.sh
 
-  test:file:
-    desc: "Run tests for a specific file"
-    aliases: [tf]
+  check:kernel:
+    desc: Fail if the linked evaluator spans an instruction page
     cmds:
-      - |
-        if [ -z "{{.FILE}}" ]; then
-          echo "Usage: task test:file FILE=<path>"
-          echo "Example: task test:file FILE=src/parser.zig"
-          exit 1
-        fi
-        zig test {{.FILE}}
+      - zig build check-kernel
 
-  test:summary:
-    desc: "Run tests with summary output"
-    aliases: [ts]
+  report:stack:
+    desc: Capture evaluator stack reports for release modes
     cmds:
-      - zig build test --summary all
-
-  test:s3-e2e:
-    desc: "Real-storage smoke test for the s3-dump extension against a local MinIO container (requires docker)"
-    cmds:
-      - |
-        if ! command -v docker >/dev/null 2>&1; then
-          echo "docker is required for task test:s3-e2e"
-          exit 1
-        fi
-        CONTAINER=policy-zig-minio-e2e
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-        docker run -d --rm --name "$CONTAINER" \
-          -p 9000:9000 \
-          -e MINIO_ROOT_USER=minioadmin \
-          -e MINIO_ROOT_PASSWORD=minioadmin \
-          minio/minio server /data >/dev/null
-        trap 'docker rm -f "$CONTAINER" >/dev/null 2>&1' EXIT
-
-        echo "Waiting for MinIO..."
-        for i in $(seq 1 30); do
-          if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-            break
-          fi
-          if [ "$i" = 30 ]; then
-            echo "MinIO did not become healthy in time"
-            docker logs "$CONTAINER" || true
-            exit 1
-          fi
-          sleep 1
-        done
-
-        AWS_ACCESS_KEY_ID=minioadmin \
-        AWS_SECRET_ACCESS_KEY=minioadmin \
-        S3_ENDPOINT=http://127.0.0.1:9000 \
-        S3_BUCKET=policy-zig-e2e \
-          zig build test-s3-e2e --summary all
-
-  bench:s3:
-    desc: "s3-dump scale benchmarks against a local MinIO container (requires docker)"
-    cmds:
-      - |
-        if ! command -v docker >/dev/null 2>&1; then
-          echo "docker is required for task bench:s3"
-          exit 1
-        fi
-        CONTAINER=policy-zig-minio-bench
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-        docker run -d --rm --name "$CONTAINER" \
-          -p 9000:9000 \
-          -e MINIO_ROOT_USER=minioadmin \
-          -e MINIO_ROOT_PASSWORD=minioadmin \
-          minio/minio server /data >/dev/null
-        trap 'docker rm -f "$CONTAINER" >/dev/null 2>&1' EXIT
-
-        echo "Waiting for MinIO..."
-        for i in $(seq 1 30); do
-          if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-            break
-          fi
-          if [ "$i" = 30 ]; then
-            echo "MinIO did not become healthy in time"
-            docker logs "$CONTAINER" || true
-            exit 1
-          fi
-          sleep 1
-        done
-
-        AWS_ACCESS_KEY_ID=minioadmin \
-        AWS_SECRET_ACCESS_KEY=minioadmin \
-        S3_ENDPOINT=http://127.0.0.1:9000 \
-        S3_BUCKET=policy-zig-bench \
-          zig build bench-s3
+      - scripts/stack-report.sh
 
   format:
-    desc: "Format all Zig source files"
-    aliases: [fmt, f]
-    dir: "{{.TASKFILE_DIR}}"
+    desc: Format handwritten Zig sources
     cmds:
-      - zig fmt src/
-      - zig fmt build.zig
+      - zig fmt src build.zig
 
   format:check:
-    desc: "Check if code is formatted correctly"
-    aliases: [fmt-check, fc]
-    dir: "{{.TASKFILE_DIR}}"
+    desc: Check Zig formatting
     cmds:
-      - zig fmt --check src/
-      - zig fmt --check build.zig
-
-  lint:
-    desc: "Run linting checks"
-    aliases: [l]
-    cmds:
-      - task: format:check
-      - task: lint:zig
+      - zig fmt --check src build.zig
 
   lint:zig:
-    desc: "Run ziglint on handwritten Zig files before merge"
-    aliases: [zl]
-    dir: "{{.TASKFILE_DIR}}"
+    desc: Run ziglint on handwritten Zig sources
     cmds:
       - |
         if ! command -v ziglint >/dev/null 2>&1; then
-          echo "ziglint is required before merge. Install it or add it to PATH."
+          echo "ziglint is required before merge" >&2
           exit 1
         fi
         ziglint
 
-  clean:
-    desc: "Clean build artifacts"
-    aliases: [c]
+  lint:
+    desc: Run all pre-merge lint checks
     cmds:
-      - rm -rf zig-out/
-      - rm -rf zig-cache/
-      - rm -rf .zig-cache/
+      - task: format:check
+      - task: lint:zig
 
   check:
-    desc: "Check the project (build without running)"
+    desc: Build without running tests or benchmarks
     cmds:
       - zig build --summary failures
 
-  deps:
-    desc: "Check dependencies and Zig installation"
+  clean:
+    desc: Remove local Zig build artifacts
+    cmds:
+      - rm -rf zig-out zig-cache .zig-cache
+
+  ci:setup:
+    desc: Verify required development tools
     cmds:
       - zig version
-      - zig env
+      - ziglint --version
 
-  do:
-    desc: "Run all pre-commit checks"
+  signoff:
+    desc: Run formatting, lint, tests, and architecture checks
     cmds:
       - task: format
       - task: lint
       - task: test
-
-  signoff:
-    desc: "Sign off the codebase"
-    aliases: ["sign", "s"]
-    cmds:
-      - task: do
-      - task: build:safe
-      - gh signoff
-
-  info:
-    desc: "Show project information"
-    cmds:
-      - echo "Project {{.PROJECT_NAME}}"
-      - echo "Build directory {{.BUILD_DIR}}"
-      - zig version
-      - echo ""
-      - echo "Available build modes:"
-      - echo "  - Debug (default)"
-      - echo "  - ReleaseFast (task build:release)"
-      - echo "  - ReleaseSafe (task build:safe)"
-      - echo "  - ReleaseSmall (task build:small)"
-
-  update:protos:
-    desc: "Update proto files"
-    cmds:
-      - buf export buf.build/tero/policy -o proto
-      - buf export buf.build/opentelemetry/opentelemetry -o proto
-      - task: build:protos
-
-  # =============================================================================
-  # CI Setup
-  # =============================================================================
-
-  ci:setup:
-    desc: "Install CI/development dependencies (idempotent, safe to run locally)"
-    dir: "{{.TASKFILE_DIR}}"
-    cmds:
-      - |
-        echo "Checking for required dependencies..."
-
-        # Check for hyperscan/vectorscan
-        if ! pkg-config --exists libhs 2>/dev/null; then
-          echo "Installing hyperscan..."
-          if [ "$(uname)" = "Darwin" ]; then
-            if command -v brew >/dev/null 2>&1; then
-              brew install vectorscan pkg-config
-            else
-              echo "Homebrew not found. Install vectorscan manually or use Hermit."
-            fi
-          elif [ "$(uname)" = "Linux" ]; then
-            if command -v apt-get >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y libhyperscan-dev pkg-config
-            elif command -v yum >/dev/null 2>&1; then
-              sudo yum install -y hyperscan-devel pkg-config
-            else
-              echo "Unknown package manager. Install hyperscan manually."
-            fi
-          else
-            echo "Unknown platform: $(uname)"
-          fi
-        else
-          echo "Hyperscan already installed"
-        fi
-
-        # Check for ziglint (required by `task lint:zig`, which `signoff` runs).
-        # Installed from prebuilt release binaries; pinned for reproducibility.
-        if ! command -v ziglint >/dev/null 2>&1; then
-          ZIGLINT_VERSION="v0.5.2"
-          case "$(uname -s)" in
-            Darwin) zl_os="macos" ;;
-            Linux)  zl_os="linux" ;;
-            *) zl_os="" ;;
-          esac
-          case "$(uname -m)" in
-            arm64|aarch64) zl_arch="aarch64" ;;
-            x86_64|amd64)  zl_arch="x86_64" ;;
-            *) zl_arch="" ;;
-          esac
-          if [ -z "$zl_os" ] || [ -z "$zl_arch" ]; then
-            echo "Unknown platform $(uname -s)/$(uname -m). Install ziglint manually from https://github.com/rockorager/ziglint"
-          else
-            echo "Installing ziglint ${ZIGLINT_VERSION} (${zl_arch}-${zl_os})..."
-            zl_asset="ziglint-${zl_arch}-${zl_os}.tar.gz"
-            zl_url="https://github.com/rockorager/ziglint/releases/download/${ZIGLINT_VERSION}/${zl_asset}"
-            zl_tmp="$(mktemp -d)"
-            if curl -fsSL "$zl_url" -o "$zl_tmp/ziglint.tar.gz"; then
-              tar -xzf "$zl_tmp/ziglint.tar.gz" -C "$zl_tmp"
-              if [ -w /usr/local/bin ]; then zl_sudo=""; else zl_sudo="sudo"; fi
-              $zl_sudo install -m 0755 "$zl_tmp/ziglint" /usr/local/bin/ziglint
-              echo "ziglint installed: $(ziglint --version)"
-            else
-              echo "Failed to download ziglint from $zl_url"
-            fi
-            rm -rf "$zl_tmp"
-          fi
-        else
-          echo "ziglint already installed"
-        fi
-
-        echo "CI setup complete"
+      - task: check:kernel
+      - task: report:stack
