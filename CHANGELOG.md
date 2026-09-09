@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/usetero/policy-zig/compare/v0.7.0...v0.7.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* escape regex metacharacters in literal matchers ([#94](https://github.com/usetero/policy-zig/issues/94)) ([a2d6a86](https://github.com/usetero/policy-zig/commit/a2d6a86bf0f2016180b4170ef49b9d3d9f989934))
+
 ## [0.7.0](https://github.com/usetero/policy-zig/compare/v0.6.2...v0.7.0) (2026-08-05)
 
 
