@@ -1114,13 +1114,10 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     return null;
                 },
                 // equals.string_value compiles to a Hyperscan pattern like
-                // `exact`, but as an escaped literal so it matches the raw
-                // string rather than being interpreted as regex syntax;
-                // other equals variants are typed checks.
+                // `exact`; other equals variants are typed checks.
                 .equals => |v| if (v.value != null and v.value.? == .string_value) {
                     const p = v.value.?.string_value;
-                    const escaped = try escapeRegexLiteral(self.temp_allocator, p);
-                    if (!self.patternCompiles(escaped, .exact, matcher.case_insensitive)) {
+                    if (!self.patternCompiles(p, .exact, matcher.case_insensitive)) {
                         try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                         return null;
                     }
@@ -1163,7 +1160,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         /// are skipped by the builder and so are treated as valid.
         fn patternCompiles(self: *Self, pattern: []const u8, mt: match_type, case_insensitive: bool) bool {
             if (pattern.len == 0) return true;
-            const buf = self.temp_allocator.alloc(u8, pattern.len + 2) catch return true;
+            const buf = self.temp_allocator.alloc(u8, formattedPatternLen(pattern, mt)) catch return true;
             var slice: []u8 = buf;
             const formatted = formatPattern(&slice, pattern, mt);
             var db = hyperscan.Database.compile(
@@ -1351,13 +1348,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .gt, .gte, .lt, .lte => unreachable,
             };
 
-            // equals.string_value is typed literal equality (documented as
-            // such, unlike the regex-flavored `exact`), so escape regex
-            // metacharacters before it's compiled as a Hyperscan pattern.
-            // temp_allocator is fine here: the pattern text is only read
-            // while compiling the Hyperscan database in finish(), which
-            // runs before the builder's arena is torn down.
-            const pattern = if (m == .equals) try escapeRegexLiteral(self.temp_allocator, raw_pattern) else raw_pattern;
+            // formatPattern escapes every non-regex match type, so the raw
+            // literal is what gets collected here.
+            const pattern = raw_pattern;
 
             // Only regex/starts_with/ends_with/contains are trivially
             // always-true when empty, so only they can be skipped as a
@@ -2213,18 +2206,12 @@ fn compilePatterns(
     allocator: std.mem.Allocator,
     collectors: []const PatternCollector,
 ) !struct { db: hyperscan.Database, meta: []PatternMeta } {
-    // Calculate buffer size: max len+2 per pattern (for anchors).
+    // Calculate buffer size: worst case is every byte escaped plus anchors.
     // Exists matchers never enter Hyperscan — they are dispatched separately
     // by the engine via accessor.callExists.
     var buf_size: usize = 0;
     for (collectors) |c| {
-        buf_size += switch (c.match_type) {
-            .regex, .contains => 0,
-            .exact => c.pattern.len + 2,
-            .starts_with, .ends_with => c.pattern.len + 1,
-            .exists => unreachable,
-            .equals, .gt, .gte, .lt, .lte => unreachable, // typed matchers never reach Hyperscan
-        };
+        buf_size += formattedPatternLen(c.pattern, c.match_type);
     }
 
     // Single allocation for hs_patterns + pattern buffer
@@ -2251,42 +2238,57 @@ fn compilePatterns(
     return .{ .db = db, .meta = meta };
 }
 
-/// Escape regex metacharacters so `literal` can be embedded in a Hyperscan
-/// pattern (via the `.exact` match type) and matched byte-for-byte, rather
-/// than interpreted as regex syntax. Used for `equals.string_value`, which
-/// is documented as typed string equality, not pattern matching.
-fn escapeRegexLiteral(allocator: std.mem.Allocator, literal: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, literal.len);
-    for (literal) |c| {
-        switch (c) {
-            '\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']', '{', '}' => try out.append(allocator, '\\'),
-            else => {},
-        }
-        try out.append(allocator, c);
-    }
-    return out.toOwnedSlice(allocator);
+/// Worst-case bytes `formatPattern` writes for `pattern`: every byte escaped,
+/// plus both anchors. Callers size their scratch buffer with this.
+fn formattedPatternLen(pattern: []const u8, pattern_match_type: match_type) usize {
+    return switch (pattern_match_type) {
+        .regex => 0, // returned as-is, never copied into the buffer
+        .exact, .starts_with, .ends_with, .contains => pattern.len * 2 + 2,
+        .exists => unreachable, // exists is dispatched outside the Hyperscan path
+        .equals, .gt, .gte, .lt, .lte => unreachable, // typed matchers never reach Hyperscan
+    };
 }
 
+/// Render `pattern` as a Hyperscan expression, consuming the front of `buf`.
+///
+/// `regex` is passed through untouched. Every other match type is a literal
+/// per the policy spec, so its regex metacharacters are escaped and it matches
+/// byte-for-byte instead of being interpreted as regex syntax. Anchors then
+/// pin the literal to the start, the end, both, or neither.
 fn formatPattern(buf: *[]u8, pattern: []const u8, pattern_match_type: match_type) []const u8 {
     const anchor_start, const anchor_end = switch (pattern_match_type) {
         .regex => return pattern,
         .exact => .{ true, true },
         .starts_with => .{ true, false },
         .ends_with => .{ false, true },
-        .contains => return pattern,
+        .contains => .{ false, false },
         .exists => unreachable, // exists is dispatched outside the Hyperscan path
         .equals, .gt, .gte, .lt, .lte => unreachable, // typed matchers never reach Hyperscan
     };
 
-    const out = std.fmt.bufPrint(buf.*, "{s}{s}{s}", .{
-        if (anchor_start) "^" else "",
-        pattern,
-        if (anchor_end) "$" else "",
-    }) catch unreachable;
+    var len: usize = 0;
+    if (anchor_start) {
+        buf.*[len] = '^';
+        len += 1;
+    }
+    for (pattern) |c| {
+        switch (c) {
+            '\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']', '{', '}' => {
+                buf.*[len] = '\\';
+                len += 1;
+            },
+            else => {},
+        }
+        buf.*[len] = c;
+        len += 1;
+    }
+    if (anchor_end) {
+        buf.*[len] = '$';
+        len += 1;
+    }
 
-    buf.* = buf.*[out.len..];
+    const out = buf.*[0..len];
+    buf.* = buf.*[len..];
     return out;
 }
 
@@ -3264,35 +3266,104 @@ test "formatPattern: ends_with adds end anchor" {
     var buf: [64]u8 = undefined;
     var slice: []u8 = &buf;
     const result = formatPattern(&slice, ".json", .ends_with);
-    try testing.expectEqualStrings(".json$", result);
+    try testing.expectEqualStrings("\\.json$", result);
 }
 
-test "formatPattern: contains returns pattern unchanged" {
+test "formatPattern: contains adds no anchor" {
     var buf: [64]u8 = undefined;
     var slice: []u8 = &buf;
     const result = formatPattern(&slice, "password", .contains);
     try testing.expectEqualStrings("password", result);
 }
 
-test "escapeRegexLiteral: escapes regex metacharacters" {
-    const allocator = testing.allocator;
-    const escaped = try escapeRegexLiteral(allocator, "a.b(c)[d]$e^f");
-    defer allocator.free(escaped);
-    try testing.expectEqualStrings("a\\.b\\(c\\)\\[d\\]\\$e\\^f", escaped);
+test "formatPattern: literal kinds escape regex metacharacters" {
+    var buf: [256]u8 = undefined;
+    var slice: []u8 = &buf;
+    // The bracket used to open an unterminated character class, so the
+    // pattern failed to compile and took the whole policy down with it.
+    try testing.expectEqualStrings(
+        "^Batch complete \\[count=",
+        formatPattern(&slice, "Batch complete [count=", .starts_with),
+    );
+    try testing.expectEqualStrings(
+        "^com\\.example\\.Service$",
+        formatPattern(&slice, "com.example.Service", .exact),
+    );
+    try testing.expectEqualStrings(
+        "a\\*b",
+        formatPattern(&slice, "a*b", .contains),
+    );
+    try testing.expectEqualStrings(
+        "1\\+1",
+        formatPattern(&slice, "1+1", .contains),
+    );
 }
 
-test "escapeRegexLiteral: plain string is unchanged" {
-    const allocator = testing.allocator;
-    const escaped = try escapeRegexLiteral(allocator, "checkout-api");
-    defer allocator.free(escaped);
-    try testing.expectEqualStrings("checkout-api", escaped);
+test "formatPattern: regex keeps its metacharacters" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "a.b[cd]+", .regex);
+    try testing.expectEqualStrings("a.b[cd]+", result);
 }
 
-test "escapeRegexLiteral: empty string stays empty" {
+test "formatPattern: empty exact is the empty-string check" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "", .exact);
+    try testing.expectEqualStrings("^$", result);
+}
+
+test "formatPattern: output fits formattedPatternLen" {
+    // Every byte a metacharacter: the worst case the buffer must survive.
+    const pattern = "\\^$.|?*+()[]{}";
+    inline for (.{ .exact, .starts_with, .ends_with, .contains }) |mt| {
+        var buf: [formattedPatternLen(pattern, mt)]u8 = undefined;
+        var slice: []u8 = &buf;
+        const result = formatPattern(&slice, pattern, mt);
+        try testing.expect(result.len <= buf.len);
+    }
+}
+
+test "Log matcher: literal metacharacters match byte-for-byte" {
     const allocator = testing.allocator;
-    const escaped = try escapeRegexLiteral(allocator, "");
-    defer allocator.free(escaped);
-    try testing.expectEqualStrings("", escaped);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "literal-metachar-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    // An unbalanced `[` used to fail Hyperscan compilation and make the whole
+    // policy inert; `.` used to compile but over-match as a regex wildcard.
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .starts_with = try allocator.dupe(u8, "Batch complete [count=") },
+    });
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .exact = try allocator.dupe(u8, "com.example.Service") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy}, null, null);
+    defer index.deinit();
+
+    var result_buf: [8]u32 = undefined;
+
+    const body_db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result = body_db.scanPositive("Batch complete [count=42]", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+    result = body_db.scanPositive("Batch complete count=42", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    const sev_db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT } }).?;
+    result = sev_db.scanPositive("com.example.Service", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+    // `.` is a literal dot, not a wildcard.
+    result = sev_db.scanPositive("comXexampleXService", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
 }
 
 test "Log matcher with starts_with" {
