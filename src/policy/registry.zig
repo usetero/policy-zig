@@ -572,23 +572,23 @@ pub const PolicyRegistry = struct {
         // Process each incoming policy
         for (policies) |policy| {
             const id_copy = try self.allocator.dupe(u8, policy.id);
-            errdefer self.allocator.free(id_copy);
-
-            // Track this id as present in new set
-            try new_policy_ids.put(id_copy, {});
+            const gop = new_policy_ids.getOrPut(id_copy) catch |err| {
+                self.allocator.free(id_copy);
+                return err;
+            };
+            if (gop.found_existing) self.allocator.free(id_copy);
 
             // Check if policy already exists
-            if (self.policy_sources.get(policy.id)) |existing_meta| {
+            if (self.policy_sources.getPtr(policy.id)) |existing_meta| {
                 // Apply priority rules
                 if (existing_meta.shouldReplace(source_type)) {
-                    // Remove old policy and its source tracking
+                    // Copy the replacement before touching the old policy so an
+                    // allocation failure leaves the old one in place. The map
+                    // key for this id already exists, so only the copy can fail.
+                    const policy_copy = try policy.dupe(self.allocator);
                     self.removePolicyById(policy.id);
-                    if (self.policy_sources.fetchRemove(policy.id)) |kv| {
-                        self.allocator.free(kv.key);
-                    }
-
-                    // Add new policy
-                    try self.addPolicyInternal(policy, provider_id, source_type);
+                    self.policies.appendAssumeCapacity(policy_copy);
+                    existing_meta.* = PolicyMetadata.init(self.bus.io, provider_id, source_type);
                     changed = true;
                 }
                 // else: higher priority source has priority, keep existing
@@ -622,17 +622,18 @@ pub const PolicyRegistry = struct {
         provider_id: []const u8,
         source_type: SourceType,
     ) !void {
+        try self.policies.ensureUnusedCapacity(self.allocator, 1);
+
         // Deep copy the policy so we own the memory
         var policy_copy = try policy.dupe(self.allocator);
         errdefer policy_copy.deinit(self.allocator);
-
-        try self.policies.append(self.allocator, policy_copy);
 
         // Track source metadata by policy id
         const id_key = try self.allocator.dupe(u8, policy.id);
         errdefer self.allocator.free(id_key);
 
         try self.policy_sources.put(id_key, PolicyMetadata.init(self.bus.io, provider_id, source_type));
+        self.policies.appendAssumeCapacity(policy_copy);
     }
 
     /// Remove a policy by id and free its memory
@@ -692,6 +693,10 @@ pub const PolicyRegistry = struct {
     /// silently. This keeps the registry capability-agnostic so a single
     /// snapshot can serve any number of consumers with differing accessors.
     fn createSnapshot(self: *PolicyRegistry) !void {
+        // Reserve the retire slot up front: after the swap below the new
+        // snapshot is live and the errdefers must never fire (issue #96).
+        try self.pending_snapshots.ensureUnusedCapacity(self.allocator, 1);
+
         const policies_slice = try self.allocator.alloc(Policy, self.policies.items.len);
         errdefer self.allocator.free(policies_slice);
         @memcpy(policies_slice, self.policies.items);
@@ -718,7 +723,6 @@ pub const PolicyRegistry = struct {
                 .none => {},
             }
         }
-
         // Allocate index arrays
         const log_target_indices = try self.allocator.alloc(u32, log_target_count);
         errdefer self.allocator.free(log_target_indices);
@@ -835,7 +839,7 @@ pub const PolicyRegistry = struct {
             // so use `.awake` (immune to wall-clock/NTP jumps), consistent with
             // the read in cleanupExpiredSnapshots.
             const now: i128 = std.Io.Timestamp.now(self.bus.io, .awake).nanoseconds;
-            try self.pending_snapshots.append(self.allocator, .{
+            self.pending_snapshots.appendAssumeCapacity(.{
                 .snapshot = old,
                 .retire_time = now,
             });
@@ -1025,6 +1029,34 @@ test "PolicyRegistry: update existing policy from same source" {
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
     try testing.expectEqualStrings("updated description", snapshot.?.policies[0].description);
+}
+
+test "PolicyRegistry: updatePolicies survives every allocation failure" {
+    const allocator = testing.allocator;
+
+    var policy = try createTestPolicyWithFilter(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+    var replacement = try createTestPolicyWithFilter(allocator, "test-policy");
+    replacement.description = try allocator.dupe(u8, "updated");
+    defer freeTestPolicy(allocator, &replacement);
+    var duplicate_batch = try createTestPolicyWithFilter(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &duplicate_batch);
+
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator, first: Policy, second: Policy, batch_dup: Policy) !void {
+            var noop_bus: NoopEventBus = undefined;
+            noop_bus.init(std.Options.debug_io);
+            var registry = PolicyRegistry.init(alloc, noop_bus.eventBus());
+            defer registry.deinit();
+
+            // Publish, replace, and a batch with a duplicate id.
+            try registry.updatePolicies(&.{first}, "file-provider", .file);
+            try registry.updatePolicies(&.{second}, "file-provider", .file);
+            try registry.updatePolicies(&.{ second, batch_dup }, "file-provider", .file);
+        }
+    };
+
+    try testing.checkAllAllocationFailures(allocator, Case.run, .{ policy, replacement, duplicate_batch });
 }
 
 // -----------------------------------------------------------------------------
