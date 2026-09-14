@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/usetero/policy-zig/compare/v0.7.1...v0.7.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* potential double free ([#97](https://github.com/usetero/policy-zig/issues/97)) ([a652ae9](https://github.com/usetero/policy-zig/commit/a652ae9573ca9f318fc1bf6c60b1abe8240bc160))
+
 ## [0.7.1](https://github.com/usetero/policy-zig/compare/v0.7.0...v0.7.1) (2026-09-09)
 
 
