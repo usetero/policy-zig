@@ -1766,10 +1766,8 @@ fn IndexBuilder(comptime T: TelemetryType) type {
 /// Shared build lifecycle for every signal type.
 ///
 /// The three public `build` entry points differ only in their index type, so
-/// the builder's error-path teardown lives here once. A failed `processPolicy`
-/// or `finish` leaves durable allocations in the builder; `errdefer` reclaims
-/// them. A successful `finish` moves them into the index and empties the
-/// builder, so the teardown is a no-op either way.
+/// the builder teardown lives here once. `finish` empties the builder on
+/// success, so `deinit` is idempotent and `defer` would work as well.
 fn buildIndex(
     allocator: std.mem.Allocator,
     comptime T: TelemetryType,
