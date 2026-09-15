@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.3](https://github.com/usetero/policy-zig/compare/v0.7.2...v0.7.3) (2026-09-15)
+
+
+### Bug Fixes
+
+* close build and fetch spans on their error paths ([#101](https://github.com/usetero/policy-zig/issues/101)) ([d3d0f4e](https://github.com/usetero/policy-zig/commit/d3d0f4e9b6bf10da170a5b67bc9a65b8ac8487ba))
+* contain allocation failures in matcher-index compilation ([#99](https://github.com/usetero/policy-zig/issues/99)) ([a77808c](https://github.com/usetero/policy-zig/commit/a77808cb0aab307a7c943e8bdf61d0b45f3dcfb7))
+
 ## [0.7.2](https://github.com/usetero/policy-zig/compare/v0.7.1...v0.7.2) (2026-09-14)
 
 
