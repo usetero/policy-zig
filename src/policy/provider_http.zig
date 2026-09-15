@@ -292,7 +292,11 @@ pub const HttpProvider = struct {
         const fetch_started: HttpFetchStarted = .{};
         const fetch_completed: HttpFetchCompleted = .{};
         var span = self.bus.started(.debug, fetch_started);
+        // Registered first, so it runs last: on the error path `failed` has
+        // already terminated the span and this is a no-op. Without it a failed
+        // fetch was reported as an ordinary completion. See issue #100.
         defer span.completed(fetch_completed);
+        errdefer |err| span.failed(err);
         var result = try self.fetchPolicies();
         defer result.parsed.deinit();
         defer self.allocator.free(result.response_body);

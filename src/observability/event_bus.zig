@@ -364,6 +364,10 @@ pub fn SpanGuard(comptime StartedEvent: type) type {
     return struct {
         bus: *EventBus,
         span: Span,
+        /// Set by the first terminator to run. Later terminators no-op, so a
+        /// `defer completed` paired with an `errdefer failed` reports the
+        /// failure and not a second, contradictory completion.
+        terminated: bool = false,
 
         const Self = @This();
 
@@ -375,6 +379,8 @@ pub fn SpanGuard(comptime StartedEvent: type) type {
         /// Complete the span with a completion event
         pub fn completed(self: *Self, event: anytype) void {
             _ = span_name; // Use the comptime span_name
+            if (self.terminated) return;
+            self.terminated = true;
             self.bus.emitInternal(
                 self.span.level,
                 &self.span,
@@ -384,11 +390,29 @@ pub fn SpanGuard(comptime StartedEvent: type) type {
 
         /// Complete the span without an event (just log completion)
         pub fn done(self: *Self) void {
+            if (self.terminated) return;
+            self.terminated = true;
             const CompletedEvent = struct {};
             self.bus.emitInternal(
                 self.span.level,
                 &self.span,
                 CompletedEvent{},
+            );
+        }
+
+        /// Terminate the span as a failure, recording the error name.
+        ///
+        /// Pair with `errdefer |err| span.failed(err)` so a function that
+        /// returns an error still closes its span. Emitted at `.err` so a
+        /// failure stays visible even when the span itself is a debug span.
+        pub fn failed(self: *Self, err: anyerror) void {
+            if (self.terminated) return;
+            self.terminated = true;
+            const FailedEvent = struct { err: []const u8 };
+            self.bus.emitInternal(
+                .err,
+                &self.span,
+                FailedEvent{ .err = @errorName(err) },
             );
         }
     };
@@ -500,6 +524,49 @@ test "EventBus: span with timing" {
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "batch.processing.completed"));
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "items_processed=5"));
     try testing.expect(std.mem.containsAtLeast(u8, output, 1, "elapsed="));
+}
+
+test "EventBus: failed span records the error and closes the span" {
+    var tw = TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
+    bus.setLevel(.debug);
+
+    const BatchProcessingStarted = struct { batch_id: u32 };
+    const started: BatchProcessingStarted = .{ .batch_id = 7 };
+    var span = bus.started(.debug, started);
+    span.failed(error.OutOfMemory);
+
+    const output = tw.getOutput();
+    try testing.expect(std.mem.containsAtLeast(u8, output, 1, "batch.processing.started"));
+    try testing.expect(std.mem.containsAtLeast(u8, output, 1, "err=\"OutOfMemory\""));
+    try testing.expect(std.mem.containsAtLeast(u8, output, 1, "elapsed="));
+}
+
+test "EventBus: the first terminator wins" {
+    var tw = TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var bus = EventBus.init(std.Options.debug_io, tw.writer());
+    bus.setLevel(.debug);
+
+    const BatchProcessingStarted = struct { batch_id: u32 };
+    const BatchProcessingCompleted = struct { items_processed: u32 };
+
+    // This is the `defer completed` plus `errdefer failed` pairing: the
+    // failure runs first and the completion that follows must not contradict
+    // it. See issue #100.
+    const started: BatchProcessingStarted = .{ .batch_id = 7 };
+    var span = bus.started(.debug, started);
+    const completed: BatchProcessingCompleted = .{ .items_processed = 5 };
+    span.failed(error.OutOfMemory);
+    span.completed(completed);
+    span.done();
+
+    const output = tw.getOutput();
+    try testing.expect(std.mem.containsAtLeast(u8, output, 1, "err=\"OutOfMemory\""));
+    try testing.expect(!std.mem.containsAtLeast(u8, output, 1, "items_processed=5"));
 }
 
 test "EventBus: numeric and boolean fields" {
