@@ -1781,6 +1781,9 @@ fn buildIndex(
         .telemetry_type = T,
     };
     var span = bus.started(.info, started_event);
+    // Close the span on every way out. Without this a failed build leaves the
+    // span open in the telemetry. See issue #100.
+    errdefer |err| span.failed(err);
 
     if (policies_slice.len > max_policies) {
         return error.TooManyPolicies;
