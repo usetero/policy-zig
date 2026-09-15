@@ -1771,8 +1771,8 @@ fn IndexBuilder(comptime T: TelemetryType) type {
 /// them. A successful `finish` moves them into the index and empties the
 /// builder, so the teardown is a no-op either way.
 fn buildIndex(
-    comptime T: TelemetryType,
     allocator: std.mem.Allocator,
+    comptime T: TelemetryType,
     bus: *EventBus,
     policies_slice: []const Policy,
     errors: ?*CompilationErrors,
@@ -1844,7 +1844,7 @@ pub const LogMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !LogMatcherIndex {
-        return buildIndex(.log, allocator, bus, policies_slice, errors, extension_resolver);
+        return buildIndex(allocator, .log, bus, policies_slice, errors, extension_resolver);
     }
 
     pub fn getDatabase(self: *const LogMatcherIndex, key: LogMatcherKey) ?*MatcherDatabase {
@@ -1978,7 +1978,7 @@ pub const MetricMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !MetricMatcherIndex {
-        return buildIndex(.metric, allocator, bus, policies_slice, errors, extension_resolver);
+        return buildIndex(allocator, .metric, bus, policies_slice, errors, extension_resolver);
     }
 
     pub fn getDatabase(self: *const MetricMatcherIndex, key: MetricMatcherKey) ?*MatcherDatabase {
@@ -2107,7 +2107,7 @@ pub const TraceMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !TraceMatcherIndex {
-        return buildIndex(.trace, allocator, bus, policies_slice, errors, extension_resolver);
+        return buildIndex(allocator, .trace, bus, policies_slice, errors, extension_resolver);
     }
 
     pub fn getDatabase(self: *const TraceMatcherIndex, key: TraceMatcherKey) ?*MatcherDatabase {
