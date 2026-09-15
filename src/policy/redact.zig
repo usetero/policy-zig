@@ -56,15 +56,21 @@ pub const Template = struct {
 
     pub fn parse(gpa: std.mem.Allocator, template: []const u8) !Template {
         var segs: std.ArrayList(Segment) = .empty;
-        errdefer freeSegments(gpa, segs.items);
+        // Order matters: errdefer runs last-in-first-out, so `freeSegments`
+        // must be registered second to run first. `ArrayList.deinit` sets the
+        // list to undefined, so reading `segs.items` after it traps.
         errdefer segs.deinit(gpa);
+        errdefer freeSegments(gpa, segs.items);
 
         // Accumulator for the in-progress literal segment. Bytes go in here
         // until we hit a non-literal boundary (numbered/named group), at
         // which point we flush as a single owned segment. This avoids the
         // O(n²) cost of concat-merging adjacent literals after every byte.
+        // `defer`, not `errdefer`: the success path below also has to free
+        // this, and a second deinit on the error path would run against
+        // undefined memory because deinit poisons the list.
         var lit_buf: std.ArrayList(u8) = .empty;
-        errdefer lit_buf.deinit(gpa);
+        defer lit_buf.deinit(gpa);
 
         var i: usize = 0;
         while (i < template.len) {
@@ -142,7 +148,6 @@ pub const Template = struct {
         }
 
         try flushLiteral(gpa, &segs, &lit_buf);
-        lit_buf.deinit(gpa);
 
         const owned = try segs.toOwnedSlice(gpa);
         return .{ .segments = owned, .gpa = gpa };
@@ -334,6 +339,22 @@ fn templateExpectSingle(
 
     _ = try compiled.replaceAll(testing.allocator, std.Options.debug_io, haystack, &out);
     try testing.expectEqualStrings(expected, out.items);
+}
+
+test "Template: parse survives every allocation failure" {
+    // Mixes literals, a named group, and a numbered group so parse builds
+    // several owned segments before it hands them to the Template. Guards the
+    // two ownership bugs this path had: the errdefer pair that read the
+    // segment list after deinit poisoned it, and the literal buffer that was
+    // freed on both the success path and the error path (issue #96).
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var tpl = try Template.parse(alloc, "user=${name} id=$1 tail");
+            tpl.deinit();
+        }
+    };
+
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
 }
 
 test "Template: literal-only template" {

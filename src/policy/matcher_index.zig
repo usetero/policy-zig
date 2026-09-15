@@ -570,11 +570,16 @@ fn compileValue(allocator: std.mem.Allocator, v: proto.policy.Value) !?CompiledV
         // (e.g. via raw protobuf), decode it now.
         .hex_value => |h| blk: {
             if (h.len % 2 != 0) return null;
+            // Validate every nibble before allocating. An invalid nibble
+            // returns null, which is a success, so no errdefer would fire to
+            // free a buffer allocated first.
+            for (h) |c| {
+                if (hexNibble(c) == null) return null;
+            }
             const bytes = try allocator.alloc(u8, h.len / 2);
-            errdefer allocator.free(bytes);
             for (0..bytes.len) |i| {
-                const hi = hexNibble(h[i * 2]) orelse return null;
-                const lo = hexNibble(h[i * 2 + 1]) orelse return null;
+                const hi = hexNibble(h[i * 2]).?;
+                const lo = hexNibble(h[i * 2 + 1]).?;
                 bytes[i] = (hi << 4) | lo;
             }
             break :blk .{ .bytes = bytes };
@@ -1034,8 +1039,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 // Config bytes go into the index's owned-string storage so the
                 // binding stays valid for the snapshot's lifetime regardless of
                 // registry-side policy memory churn (same treatment as ids).
+                try self.policy_id_storage.ensureUnusedCapacity(self.allocator, 1);
                 const config_copy = try self.allocator.dupe(u8, ext.config);
-                try self.policy_id_storage.append(self.allocator, config_copy);
+                self.policy_id_storage.appendAssumeCapacity(config_copy);
                 try self.extension_bindings_list.append(self.temp_allocator, .{
                     .policy_index = info.index,
                     .policy_id = info.id,
@@ -1093,23 +1099,23 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             // the only user-facing regex; the literal kinds are anchored
             // internally, so report them as generic patterns.
             switch (m) {
-                .regex => |p| if (!self.patternCompiles(p, .regex, matcher.case_insensitive)) {
+                .regex => |p| if (!(try self.patternCompiles(p, .regex, matcher.case_insensitive))) {
                     try self.recordError(signal ++ ": match[{d}]: invalid regex \"{s}\"", policy_id, .{ idx, p });
                     return null;
                 },
-                .exact => |p| if (!self.patternCompiles(p, .exact, matcher.case_insensitive)) {
+                .exact => |p| if (!(try self.patternCompiles(p, .exact, matcher.case_insensitive))) {
                     try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                     return null;
                 },
-                .starts_with => |p| if (!self.patternCompiles(p, .starts_with, matcher.case_insensitive)) {
+                .starts_with => |p| if (!(try self.patternCompiles(p, .starts_with, matcher.case_insensitive))) {
                     try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                     return null;
                 },
-                .ends_with => |p| if (!self.patternCompiles(p, .ends_with, matcher.case_insensitive)) {
+                .ends_with => |p| if (!(try self.patternCompiles(p, .ends_with, matcher.case_insensitive))) {
                     try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                     return null;
                 },
-                .contains => |p| if (!self.patternCompiles(p, .contains, matcher.case_insensitive)) {
+                .contains => |p| if (!(try self.patternCompiles(p, .contains, matcher.case_insensitive))) {
                     try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                     return null;
                 },
@@ -1117,7 +1123,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 // `exact`; other equals variants are typed checks.
                 .equals => |v| if (v.value != null and v.value.? == .string_value) {
                     const p = v.value.?.string_value;
-                    if (!self.patternCompiles(p, .exact, matcher.case_insensitive)) {
+                    if (!(try self.patternCompiles(p, .exact, matcher.case_insensitive))) {
                         try self.recordError(signal ++ ": match[{d}]: invalid pattern \"{s}\"", policy_id, .{ idx, p });
                         return null;
                     }
@@ -1158,15 +1164,23 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         /// Whether `pattern` compiles, formatted and flagged exactly as the real
         /// matcher build would format it (see `formatPattern`). Empty patterns
         /// are skipped by the builder and so are treated as valid.
-        fn patternCompiles(self: *Self, pattern: []const u8, mt: match_type, case_insensitive: bool) bool {
+        fn patternCompiles(self: *Self, pattern: []const u8, mt: match_type, case_insensitive: bool) !bool {
             if (pattern.len == 0) return true;
-            const buf = self.temp_allocator.alloc(u8, formattedPatternLen(pattern, mt)) catch return true;
+            // Propagate an allocation failure instead of reporting the pattern
+            // as valid: the caller aborts the build, which is honest, and a
+            // swallowed OOM here would hide the real cause.
+            const buf = try self.temp_allocator.alloc(u8, formattedPatternLen(pattern, mt));
             var slice: []u8 = buf;
             const formatted = formatPattern(&slice, pattern, mt);
             var db = hyperscan.Database.compile(
                 formatted,
                 .{ .flags = .{ .caseless = case_insensitive, .single_match = true } },
-            ) catch return false;
+            ) catch |err| switch (err) {
+                // An allocation failure says nothing about the pattern, so let
+                // it abort the build instead of marking the policy invalid.
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false,
+            };
             db.deinit();
             return true;
         }
@@ -1258,6 +1272,10 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     // below, so it gets Hyperscan and case_insensitive support.
                     const is_string = v.value != null and v.value.? == .string_value;
                     if (!is_string) {
+                        // Reserve first: compileValue allocates owned bytes for
+                        // bytes_value and hex_value, and a failed append would
+                        // orphan them where builder teardown cannot see them.
+                        try self.typed_checks_list.ensureUnusedCapacity(self.allocator, 1);
                         const compiled = (try compileValue(self.allocator, v)) orelse {
                             self.bus.debug(TypedMatcherSkipped{ .matcher_idx = matcher_idx });
                             return;
@@ -1269,7 +1287,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                         } else {
                             self.current_positive_count += 1;
                         }
-                        try self.typed_checks_list.append(self.allocator, .{
+                        self.typed_checks_list.appendAssumeCapacity(.{
                             .policy_index = self.policy_index,
                             .field_ref = field_ref,
                             .matcher = .{ .equals = compiled },
@@ -1439,15 +1457,24 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const path = field_ref.getPath();
             if (path.len == 0) return;
 
+            // Reserve the storage slot first so the append below cannot fail
+            // and orphan the copy.
+            try self.path_storage.ensureUnusedCapacity(self.allocator, 1);
+
             // Dupe each segment of the path
             const path_copy = try self.allocator.alloc([]const u8, path.len);
-            errdefer self.allocator.free(path_copy);
+            var duped: usize = 0;
+            errdefer {
+                for (path_copy[0..duped]) |segment| self.allocator.free(segment);
+                self.allocator.free(path_copy);
+            }
 
             for (path, 0..) |segment, i| {
                 path_copy[i] = try self.allocator.dupe(u8, segment);
+                duped = i + 1;
             }
 
-            try self.path_storage.append(self.allocator, path_copy);
+            self.path_storage.appendAssumeCapacity(path_copy);
 
             // Update the key's field to point to the duped path
             key_ptr.field = dupeFieldRef(FieldRefT, field_ref, path_copy);
@@ -1496,8 +1523,12 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             keep: KeepValue,
             global_index: PolicyIndex,
         ) !void {
+            // Reserve both slots before any dupe so every append below is
+            // infallible and no copy is ever orphaned.
+            try self.policy_info_list.ensureUnusedCapacity(self.temp_allocator, 1);
+            try self.policy_id_storage.ensureUnusedCapacity(self.allocator, 1);
             const policy_id_copy = try self.allocator.dupe(u8, policy.id);
-            try self.policy_id_storage.append(self.allocator, policy_id_copy);
+            self.policy_id_storage.appendAssumeCapacity(policy_id_copy);
 
             // Create rate limiter for rate limit policies
             const rate_limiter: ?*RateLimiter = switch (keep) {
@@ -1513,6 +1544,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 },
                 else => null,
             };
+            errdefer if (rate_limiter) |rl| self.allocator.destroy(rl);
 
             // Extract sample_key for log policies
             const sample_key: ?LogSampleKey = if (T == .log) target.sample_key else null;
@@ -1542,7 +1574,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             } else &.{};
             errdefer log_transform.deinitCompiledRedacts(self.allocator, compiled_redacts);
 
-            try self.policy_info_list.append(self.temp_allocator, .{
+            self.policy_info_list.appendAssumeCapacity(.{
                 .id = policy_id_copy,
                 .index = self.policy_index,
                 .stats_index = global_index,
@@ -1566,8 +1598,43 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             self.policy_index += 1;
         }
 
+        /// Free everything the builder still owns from `self.allocator`.
+        /// Background on the ownership rules here: issue #96.
+        /// `build` runs this on the error path only: a successful `finish`
+        /// hands every one of these allocations to the index, which frees them
+        /// in `IndexT.deinit`. Arena-backed state (patterns_by_key and the
+        /// list backings taken from `temp_allocator`) dies with the arena.
+        fn deinit(self: *Self) void {
+            for (self.policy_info_list.items) |info| {
+                if (info.rate_limiter) |rl| self.allocator.destroy(rl);
+                if (info.compiled_redacts.len > 0) {
+                    log_transform.deinitCompiledRedacts(self.allocator, info.compiled_redacts);
+                }
+            }
+            for (self.typed_checks_list.items) |check| {
+                if (check.matcher == .equals and check.matcher.equals == .bytes) {
+                    self.allocator.free(check.matcher.equals.bytes);
+                }
+            }
+            self.typed_checks_list.deinit(self.allocator);
+            for (self.path_storage.items) |path| {
+                for (path) |segment| self.allocator.free(segment);
+                self.allocator.free(path);
+            }
+            self.path_storage.deinit(self.allocator);
+            for (self.policy_id_storage.items) |id| self.allocator.free(id);
+            self.policy_id_storage.deinit(self.allocator);
+        }
+
         fn finish(self: *Self) !IndexT {
+            // Every allocation below is owned by this function until the final
+            // return hands it to the index, so each one carries an errdefer.
+            // Builder-owned state stays untouched on the error path; `build`
+            // tears that down with `builder.deinit`.
             const policies = try self.allocator.dupe(PolicyInfo, self.policy_info_list.items);
+            // Shallow free only: the rate limiters and compiled redacts these
+            // entries point at are still owned by policy_info_list.
+            errdefer self.allocator.free(policies);
 
             var negation_indices = std.ArrayList(PolicyIndex).empty;
             for (policies) |p| {
@@ -1576,6 +1643,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 }
             }
             const policies_with_negation = try self.allocator.dupe(PolicyIndex, negation_indices.items);
+            errdefer self.allocator.free(policies_with_negation);
 
             var databases = std.HashMap(
                 MatcherKeyT,
@@ -1583,7 +1651,19 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 HashContextT,
                 std.hash_map.default_max_load_percentage,
             ).init(self.allocator);
+            errdefer {
+                var db_it = databases.valueIterator();
+                while (db_it.next()) |db| {
+                    db.*.deinit();
+                    self.allocator.destroy(db.*);
+                }
+                databases.deinit();
+            }
+
             var keys_list = std.ArrayList(MatcherKeyT).empty;
+            errdefer for (keys_list.items) |key| {
+                if (key.exists_entries.len > 0) self.allocator.free(key.exists_entries);
+            };
 
             var key_it = self.patterns_by_key.iterator();
             while (key_it.next()) |entry| {
@@ -1600,6 +1680,12 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 // patterns. Exists-only keys live in `matcher_keys` without
                 // a corresponding database entry.
                 const has_value_db = patterns.positive.items.len > 0 or patterns.negated.items.len > 0;
+
+                // Reserve both slots up front so the compiled database and the
+                // exists copy below land in a container that already owns them.
+                try keys_list.ensureUnusedCapacity(self.temp_allocator, 1);
+                if (has_value_db) try databases.ensureUnusedCapacity(1);
+
                 const db: ?*MatcherDatabase = if (has_value_db) blk: {
                     const compiled = try compileDatabase(
                         self.allocator,
@@ -1607,7 +1693,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                         patterns.positive.items,
                         patterns.negated.items,
                     );
-                    try databases.put(matcher_key, compiled);
+                    databases.putAssumeCapacity(matcher_key, compiled);
                     break :blk compiled;
                 } else null;
 
@@ -1618,7 +1704,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else
                     try self.allocator.dupe(ExistsEntry, patterns.exists.items);
 
-                try keys_list.append(self.temp_allocator, .{
+                keys_list.appendAssumeCapacity(.{
                     .field = matcher_key.field,
                     .exists_entries = exists_entries,
                     .has_value_db = has_value_db,
@@ -1626,14 +1712,40 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 });
             }
 
+            // Shallow free only: exists_entries stay covered by the keys_list
+            // errdefer above, which frees each one exactly once.
             const matcher_keys = try self.allocator.dupe(MatcherKeyT, keys_list.items);
+            errdefer self.allocator.free(matcher_keys);
+
             const typed_checks = try self.allocator.dupe(TypedCheckT, self.typed_checks_list.items);
-            // Free the builder's backing storage; the items are now in `typed_checks`.
-            self.typed_checks_list.deinit(self.allocator);
+            errdefer {
+                for (typed_checks) |check| {
+                    if (check.matcher == .equals and check.matcher.equals == .bytes) {
+                        self.allocator.free(check.matcher.equals.bytes);
+                    }
+                }
+                self.allocator.free(typed_checks);
+            }
+            // The items now live in `typed_checks`, so drop the builder's
+            // backing storage. Emptying the list keeps `Self.deinit` from
+            // freeing the same bytes a second time on a later error.
+            self.typed_checks_list.clearAndFree(self.allocator);
+
             const extension_bindings = try self.allocator.dupe(
                 policy_types.ExtensionBinding,
                 self.extension_bindings_list.items,
             );
+            errdefer self.allocator.free(extension_bindings);
+
+            // Hand the storage lists to the index and drop the builder's view
+            // of them. `deinit` is then idempotent, so the correctness of this
+            // function no longer depends on `build` using `errdefer` over
+            // `defer`.
+            const path_storage = self.path_storage;
+            const policy_id_storage = self.policy_id_storage;
+            self.path_storage = .empty;
+            self.policy_id_storage = .empty;
+            self.policy_info_list = .empty;
 
             return IndexT{
                 .allocator = self.allocator,
@@ -1643,12 +1755,57 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .matcher_keys = matcher_keys,
                 .typed_checks = typed_checks,
                 .extension_bindings = extension_bindings,
-                .path_storage = self.path_storage,
-                .policy_id_storage = self.policy_id_storage,
+                .path_storage = path_storage,
+                .policy_id_storage = policy_id_storage,
                 .bus = self.bus,
             };
         }
     };
+}
+
+/// Shared build lifecycle for every signal type.
+///
+/// The three public `build` entry points differ only in their index type, so
+/// the builder teardown lives here once. `finish` empties the builder on
+/// success, so `deinit` is idempotent and `defer` would work as well.
+fn buildIndex(
+    allocator: std.mem.Allocator,
+    comptime T: TelemetryType,
+    bus: *EventBus,
+    policies_slice: []const Policy,
+    errors: ?*CompilationErrors,
+    extension_resolver: ?policy_types.ExtensionResolver,
+) !MatcherIndexType(T) {
+    const started_event: MatcherIndexBuildStarted = .{
+        .policy_count = policies_slice.len,
+        .telemetry_type = T,
+    };
+    var span = bus.started(.info, started_event);
+
+    if (policies_slice.len > max_policies) {
+        return error.TooManyPolicies;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var builder = IndexBuilder(T).init(allocator, arena.allocator(), bus, errors, extension_resolver);
+    errdefer builder.deinit();
+
+    for (policies_slice, 0..) |*policy, i| {
+        try builder.processPolicy(policy, @intCast(i));
+    }
+
+    var index = try builder.finish();
+
+    const completed_event: MatcherIndexBuildCompleted = .{
+        .database_count = index.databases.count(),
+        .matcher_key_count = index.matcher_keys.len,
+        .policy_count = index.policies.len,
+    };
+    span.completed(completed_event);
+
+    return index;
 }
 
 // =============================================================================
@@ -1685,35 +1842,7 @@ pub const LogMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !LogMatcherIndex {
-        const started_event: MatcherIndexBuildStarted = .{
-            .policy_count = policies_slice.len,
-            .telemetry_type = .log,
-        };
-        var span = bus.started(.info, started_event);
-
-        if (policies_slice.len > max_policies) {
-            return error.TooManyPolicies;
-        }
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        var builder = IndexBuilder(.log).init(allocator, arena.allocator(), bus, errors, extension_resolver);
-
-        for (policies_slice, 0..) |*policy, i| {
-            try builder.processPolicy(policy, @intCast(i));
-        }
-
-        var index = try builder.finish();
-
-        const completed_event: MatcherIndexBuildCompleted = .{
-            .database_count = index.databases.count(),
-            .matcher_key_count = index.matcher_keys.len,
-            .policy_count = index.policies.len,
-        };
-        span.completed(completed_event);
-
-        return index;
+        return buildIndex(allocator, .log, bus, policies_slice, errors, extension_resolver);
     }
 
     pub fn getDatabase(self: *const LogMatcherIndex, key: LogMatcherKey) ?*MatcherDatabase {
@@ -1847,35 +1976,7 @@ pub const MetricMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !MetricMatcherIndex {
-        const started_event: MatcherIndexBuildStarted = .{
-            .policy_count = policies_slice.len,
-            .telemetry_type = .metric,
-        };
-        var span = bus.started(.info, started_event);
-
-        if (policies_slice.len > max_policies) {
-            return error.TooManyPolicies;
-        }
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        var builder = IndexBuilder(.metric).init(allocator, arena.allocator(), bus, errors, extension_resolver);
-
-        for (policies_slice, 0..) |*policy, i| {
-            try builder.processPolicy(policy, @intCast(i));
-        }
-
-        var index = try builder.finish();
-
-        const completed_event: MatcherIndexBuildCompleted = .{
-            .database_count = index.databases.count(),
-            .matcher_key_count = index.matcher_keys.len,
-            .policy_count = index.policies.len,
-        };
-        span.completed(completed_event);
-
-        return index;
+        return buildIndex(allocator, .metric, bus, policies_slice, errors, extension_resolver);
     }
 
     pub fn getDatabase(self: *const MetricMatcherIndex, key: MetricMatcherKey) ?*MatcherDatabase {
@@ -2004,35 +2105,7 @@ pub const TraceMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !TraceMatcherIndex {
-        const started_event: MatcherIndexBuildStarted = .{
-            .policy_count = policies_slice.len,
-            .telemetry_type = .trace,
-        };
-        var span = bus.started(.info, started_event);
-
-        if (policies_slice.len > max_policies) {
-            return error.TooManyPolicies;
-        }
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        var builder = IndexBuilder(.trace).init(allocator, arena.allocator(), bus, errors, extension_resolver);
-
-        for (policies_slice, 0..) |*policy, i| {
-            try builder.processPolicy(policy, @intCast(i));
-        }
-
-        var index = try builder.finish();
-
-        const completed_event: MatcherIndexBuildCompleted = .{
-            .database_count = index.databases.count(),
-            .matcher_key_count = index.matcher_keys.len,
-            .policy_count = index.policies.len,
-        };
-        span.completed(completed_event);
-
-        return index;
+        return buildIndex(allocator, .trace, bus, policies_slice, errors, extension_resolver);
     }
 
     pub fn getDatabase(self: *const TraceMatcherIndex, key: TraceMatcherKey) ?*MatcherDatabase {
@@ -2146,35 +2219,50 @@ fn compileDatabase(
     var scratch_pool: [MatcherDatabase.scratch_pool_size]?hyperscan.Scratch =
         .{null} ** MatcherDatabase.scratch_pool_size;
 
+    // Declared before the errdefer so the pattern metadata is torn down too.
+    // MatcherDatabase.deinit owns these once the struct below is built; until
+    // then this function does.
+    var positive_patterns: []PatternMeta = &.{};
+    var negated_patterns: []PatternMeta = &.{};
+
     errdefer {
         for (&scratch_pool) |*s| {
             if (s.*) |*scratch| scratch.deinit();
         }
         if (positive_db) |*db| db.deinit();
         if (negated_db) |*db| db.deinit();
+        if (positive_patterns.len > 0) allocator.free(positive_patterns);
+        if (negated_patterns.len > 0) allocator.free(negated_patterns);
     }
 
-    var positive_patterns: []PatternMeta = &.{};
     if (positive_collectors.len > 0) {
         const result = try compilePatterns(allocator, positive_collectors);
         positive_db = result.db;
         positive_patterns = result.meta;
     }
 
-    var negated_patterns: []PatternMeta = &.{};
     if (negated_collectors.len > 0) {
         const result = try compilePatterns(allocator, negated_collectors);
         negated_db = result.db;
         negated_patterns = result.meta;
     }
 
+    // One scratch sized for every database it will be used with. Calling
+    // Scratch.init twice allocated a second scratch, dropped it, and left
+    // scratch_pool[0] sized for the positive database only, which is invalid
+    // Hyperscan usage when scanning the negated one.
+    var scratch_dbs: [2]*const hyperscan.Database = undefined;
+    var scratch_db_count: usize = 0;
     if (positive_db) |*db| {
-        scratch_pool[0] = try hyperscan.Scratch.init(db);
-        if (negated_db) |*ndb| {
-            _ = try hyperscan.Scratch.init(ndb);
-        }
-    } else if (negated_db) |*db| {
-        scratch_pool[0] = try hyperscan.Scratch.init(db);
+        scratch_dbs[scratch_db_count] = db;
+        scratch_db_count += 1;
+    }
+    if (negated_db) |*db| {
+        scratch_dbs[scratch_db_count] = db;
+        scratch_db_count += 1;
+    }
+    if (scratch_db_count > 0) {
+        scratch_pool[0] = try hyperscan.Scratch.initMulti(scratch_dbs[0..scratch_db_count]);
     }
 
     // Clone scratch into remaining pool slots for concurrent access
@@ -2214,12 +2302,14 @@ fn compilePatterns(
         buf_size += formattedPatternLen(c.pattern, c.match_type);
     }
 
-    // Single allocation for hs_patterns + pattern buffer
+    // Single allocation for hs_patterns + pattern buffer. The Pattern array
+    // sits at the front, so the buffer must carry Pattern's alignment: a plain
+    // u8 alloc may return a 1-aligned pointer (e.g. from an arena) and trap.
     const hs_size = collectors.len * @sizeOf(hyperscan.Pattern);
-    const temp = try allocator.alloc(u8, hs_size + buf_size);
+    const temp = try allocator.alignedAlloc(u8, .of(hyperscan.Pattern), hs_size + buf_size);
     defer allocator.free(temp);
 
-    const hs_patterns: []hyperscan.Pattern = @alignCast(std.mem.bytesAsSlice(hyperscan.Pattern, temp[0..hs_size]));
+    const hs_patterns: []hyperscan.Pattern = std.mem.bytesAsSlice(hyperscan.Pattern, temp[0..hs_size]);
     var buf = temp[hs_size..];
 
     const meta = try allocator.alloc(PatternMeta, collectors.len);
@@ -2519,6 +2609,173 @@ test "LogMatcherIndex: build with single policy" {
     const policy_info_by_id = index.getPolicy("policy-1");
     try testing.expect(policy_info_by_id != null);
     try testing.expectEqualStrings("policy-1", policy_info_by_id.?.id);
+}
+
+test "LogMatcherIndex: build survives every allocation failure" {
+    const allocator = testing.allocator;
+
+    // Exercise every durable allocation the builder makes: an attribute path
+    // (path_storage), a rate-limit keep (rate_limiter), a redact
+    // (compiled_redacts), an exists matcher (exists_entries), a negated
+    // literal, and typed byte and hex equality (owned typed-check bytes).
+    var attr_path: std.ArrayList([]const u8) = .empty;
+    try attr_path.append(allocator, try allocator.dupe(u8, "service"));
+    var redact_path: std.ArrayList([]const u8) = .empty;
+    try redact_path.append(allocator, try allocator.dupe(u8, "password"));
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "test-policy"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "100/s"),
+        } },
+    };
+    defer policy.deinit(allocator);
+
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = .{ .path = attr_path } },
+        .match = .{ .contains = try allocator.dupe(u8, "checkout") },
+    });
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .exists = true },
+    });
+    // Negated literal: exercises the negated pattern list, the second
+    // Hyperscan database, and policies_with_negation.
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .contains = try allocator.dupe(u8, "healthcheck") },
+        .negate = true,
+    });
+    // Typed checks that own heap bytes: the compiled value must be reachable
+    // by builder teardown at every fault point between compile and insert.
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .equals = .{ .value = .{ .bytes_value = try allocator.dupe(u8, "body") } } },
+    });
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .equals = .{ .value = .{ .hex_value = try allocator.dupe(u8, "4142") } } },
+    });
+    policy.target.?.log.transform = .{};
+    // A redact rule with no regex: it still allocates compiled_redacts, but it
+    // stays out of the third-party regex engine, which leaks on its own error
+    // path and would mask our own cleanup. Reported upstream, not our bug.
+    try policy.target.?.log.transform.?.redact.append(allocator, .{
+        .field = .{ .log_attribute = .{ .path = redact_path } },
+        .replacement = try allocator.dupe(u8, "[REDACTED]"),
+    });
+
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator, p: Policy) !void {
+            var noop_bus: NoopEventBus = undefined;
+            noop_bus.init(std.Options.debug_io);
+            var index = try LogMatcherIndex.build(alloc, noop_bus.eventBus(), &.{p}, null, null);
+            index.deinit();
+        }
+    };
+
+    // Not checkAllAllocationFailures: compilation deliberately converts some
+    // failures into "this policy is invalid, keep building the rest" (see the
+    // spec's Error Handling section), so an induced failure does not always
+    // surface as error.OutOfMemory. What must hold at every fault point is
+    // containment: no leak, no double free, no crash. A DebugAllocator checks
+    // all three.
+    //
+    // Scope of the guarantee: the DebugAllocator only sees Zig-side
+    // allocations. Hyperscan and the third-party regex engine allocate through
+    // the C allocator, so failures inside them are neither injected nor
+    // checked here. The fixture also carries no extension, so the extension
+    // config copy is not covered. All three signal types share one build path
+    // (`buildIndex`), so log coverage exercises the same teardown code metric
+    // and trace builds use.
+    const max_fault_points = 4096;
+    var fail_index: usize = 0;
+    while (fail_index < max_fault_points) : (fail_index += 1) {
+        // Name the fault point on failure. A bare leak dump says nothing about
+        // which allocation was made to fail.
+        errdefer std.debug.print("containment failed at fail_index={d}\n", .{fail_index});
+
+        var dbg: std.heap.DebugAllocator(.{}) = .init;
+        var failing: testing.FailingAllocator = .init(dbg.allocator(), .{ .fail_index = fail_index });
+
+        const result = Case.run(failing.allocator(), policy);
+        const induced = failing.has_induced_failure;
+        // Take the leak verdict before propagating anything, so deinit runs on
+        // every path including an unexpected error.
+        const leak_check = dbg.deinit();
+
+        result catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try testing.expectEqual(std.heap.Check.ok, leak_check);
+
+        // No failure was induced, so the sweep has passed every allocation.
+        if (!induced) return;
+    }
+
+    std.debug.print("sweep did not terminate within {d} fault points\n", .{max_fault_points});
+    return error.TestUnexpectedResult;
+}
+
+test "compileValue: invalid hex is skipped and frees nothing" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+
+    // Invalid high nibble, invalid low nibble, and an invalid pair after a
+    // valid prefix. Each returns null, which is a success, so the decode
+    // buffer must never have been allocated. testing.allocator
+    // reports any leak at test end.
+    const cases = [_][]const u8{ "gg", "ag", "41gg" };
+    for (cases) |hex| {
+        var policy: Policy = .{
+            .id = try allocator.dupe(u8, "hex-policy"),
+            .name = try allocator.dupe(u8, "hex-policy"),
+            .enabled = true,
+            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        };
+        defer policy.deinit(allocator);
+        try policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .equals = .{ .value = .{ .hex_value = try allocator.dupe(u8, hex) } } },
+        });
+
+        var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
+        defer index.deinit();
+
+        try testing.expectEqual(@as(usize, 0), index.typed_checks.len);
+    }
+}
+
+test "compileValue: valid hex compiles to bytes" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "hex-policy"),
+        .name = try allocator.dupe(u8, "hex-policy"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    defer policy.deinit(allocator);
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .equals = .{ .value = .{ .hex_value = try allocator.dupe(u8, "4142") } } },
+    });
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy}, null, null);
+    defer index.deinit();
+
+    try testing.expectEqual(@as(usize, 1), index.typed_checks.len);
+    try testing.expectEqualStrings("AB", index.typed_checks[0].matcher.equals.bytes);
 }
 
 test "LogMatcherIndex: invalid regex policy is skipped (inert) and reported" {
