@@ -559,8 +559,9 @@ test "EventBus: the first terminator wins" {
     // it. See issue #100.
     const started: BatchProcessingStarted = .{ .batch_id = 7 };
     var span = bus.started(.debug, started);
+    const completed: BatchProcessingCompleted = .{ .items_processed = 5 };
     span.failed(error.OutOfMemory);
-    span.completed(BatchProcessingCompleted{ .items_processed = 5 });
+    span.completed(completed);
     span.done();
 
     const output = tw.getOutput();
