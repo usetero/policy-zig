@@ -18,6 +18,7 @@
 //! - **Dense policy array**: Cache-friendly iteration over matched policies
 
 const std = @import("std");
+const builtin = @import("builtin");
 const proto = @import("proto");
 const hyperscan = @import("./hyperscan.zig");
 const policy_types = @import("./types.zig");
@@ -97,8 +98,9 @@ pub const CompilationErrors = struct {
 // =============================================================================
 
 const MatcherIndexBuildStarted = struct { policy_count: usize, telemetry_type: TelemetryType };
+const PolicyCeilingExceeded = struct { policy_count: usize, ceiling: usize, telemetry_type: TelemetryType };
 const MatcherIndexBuildCompleted = struct { database_count: usize, matcher_key_count: usize, policy_count: usize };
-const ScanMatched = struct { pattern_count: usize, value_len: usize, value_preview: []const u8, is_negated: bool };
+const ScanMatched = struct { pattern_count: usize, value_len: usize, value_preview: []const u8 };
 const ScanMatchDetail = struct { pattern_id: u32, policy_index: PolicyIndex };
 const ScanError = struct { err: []const u8 };
 const ProcessingPolicy = struct {
@@ -126,6 +128,18 @@ const PolicyStored = struct { id: []const u8, index: PolicyIndex, required_match
 
 /// Numeric policy index for efficient array-based lookups at runtime.
 pub const PolicyIndex = u16;
+
+/// Host-declared knobs for index construction.
+pub const IndexOptions = struct {
+    /// Greatest number of threads that may scan this index at the same time.
+    ///
+    /// Zero means the host has not declared it, and the library falls back to
+    /// `MatcherDatabase.default_scan_slots`. Declare it when the host knows:
+    /// a task-per-connection frontend should pass its connection limit, not
+    /// its core count, because that is what bounds concurrent scanners. Too
+    /// low a value does not fail, it serialises scanning on a spin loop.
+    scan_concurrency: usize = 0,
+};
 
 /// Maximum number of policies supported
 pub const max_policies: usize = 8192;
@@ -622,20 +636,18 @@ pub const ScanResult = struct {
     }
 };
 
-/// Internal context for scanWithCallback that adds O(1) dedup via a seen bitset.
-/// Wraps ScanResult so the public API is unchanged.
+/// Internal context for the buffered scan helpers.
+///
+/// This carried a 256-entry "seen" table to drop repeated ids. That table was
+/// dead weight: every pattern compiles with `single_match`, so Hyperscan
+/// reports each id at most once per scan and a repeat could not arrive. It was
+/// also misleading, since it only covered ids below its own length while a
+/// database may hold thousands.
 const ScanContext = struct {
     result: ScanResult,
-    seen: [max_dedup_ids]bool,
-
-    const max_dedup_ids: usize = 256;
-
-    fn init(buf: []u32) ScanContext {
-        return .{
-            .result = .{ .count = 0, .buf = buf },
-            .seen = @splat(false),
-        };
-    }
+    /// Both pattern sets share one database and one id space, so the buffered
+    /// helper keeps only the ids below this split.
+    positive_count: usize,
 };
 
 // =============================================================================
@@ -643,20 +655,41 @@ const ScanContext = struct {
 // =============================================================================
 
 pub const MatcherDatabase = struct {
-    positive_db: ?hyperscan.Database,
-    negated_db: ?hyperscan.Database,
-    scratch_pool: [scratch_pool_size]?hyperscan.Scratch,
-    scratch_locks: [scratch_pool_size]std.atomic.Value(bool),
-    positive_patterns: []const PatternMeta,
-    negated_patterns: []const PatternMeta,
+    db: ?hyperscan.Database,
+    scratch_pool: []?hyperscan.Scratch,
+    scratch_locks: []std.atomic.Value(bool),
+    /// Positive patterns first, then negated. `positive_count` is the split.
+    patterns: []const PatternMeta,
+    positive_count: usize,
     allocator: std.mem.Allocator,
     bus: *EventBus,
 
-    // note: must be >= the host's scan-thread count so each worker gets its
-    // own slot and never contends a lock. 64 covers typical hosts; if a host has
-    // more scan threads than this, size the pool to std.Thread.getCpuCount() at
-    // build time instead (would require heap-slicing the pool + locks).
-    pub const scratch_pool_size: usize = 64;
+    /// Slots in the scratch pool, taken from the host's CPU count so each
+    /// scan thread gets a slot it effectively owns.
+    ///
+    /// This was a fixed 64. Every database cloned a scratch into all 64 slots,
+    /// so an 8-core host paid eight times the scratch it could ever use, once
+    /// per matcher key. The clamp keeps a tiny host from losing the
+    /// uncontended fast path and a very large one from cloning without bound;
+    /// `acquireScratch` spins on a home slot when threads outnumber slots.
+    pub const min_scratch_slots: usize = 8;
+    pub const max_scratch_slots: usize = 1024;
+
+    /// Slots used when the host does not declare its scanning concurrency.
+    ///
+    /// Deliberately not the CPU count. Concurrency here is the number of
+    /// threads that may scan at once, and a task-per-connection host bounds
+    /// that by its connection limit, not by its cores. Sizing from the CPU
+    /// count starved such a host: scanners past the slot count fell through to
+    /// the spin path and burned cores instead of working. Slots are cheap now
+    /// that each one allocates its scratch on first use, so the default is
+    /// generous and a host that knows better declares it.
+    pub const default_scan_slots: usize = 256;
+
+    fn scratchSlotCount(scan_concurrency: usize) usize {
+        const requested = if (scan_concurrency == 0) default_scan_slots else scan_concurrency;
+        return std.math.clamp(requested, min_scratch_slots, max_scratch_slots);
+    }
 
     /// Stable per-thread slot preference, assigned once per thread the first
     /// time it scans. Replaces a shared atomic cursor that every worker RMW'd on
@@ -682,93 +715,191 @@ pub const MatcherDatabase = struct {
         }
     };
 
+    /// Build this slot's scratch if it has none yet. The caller must hold the
+    /// slot's lock, which makes the write safe: no thread reads a slot it does
+    /// not hold. Built with `initMulti` rather than cloned from another slot,
+    /// because that reads only the databases, which are immutable and safe to
+    /// share, while cloning would read a scratch another thread may be using.
+    fn ensureScratch(self: *MatcherDatabase, slot: usize) ?*hyperscan.Scratch {
+        if (self.scratch_pool[slot]) |*existing| return existing;
+
+        const database = if (self.db) |*d| d else return null;
+
+        self.scratch_pool[slot] = hyperscan.Scratch.init(database) catch |err| {
+            const event: ScanError = .{ .err = @errorName(err) };
+            self.bus.warn(event);
+            return null;
+        };
+        return &self.scratch_pool[slot].?;
+    }
+
     fn acquireScratch(self: *MatcherDatabase) ?ScratchHandle {
-        // Start from this thread's stable slot; with pool_size >= thread count
+        // Start from this thread's stable slot; with slot count >= thread count
         // the first try hits an uncontended slot the thread effectively owns.
         const base = scratchThreadSlot();
         // Try each slot once
-        for (0..scratch_pool_size) |offset| {
-            const slot = (base +% offset) % scratch_pool_size;
-            if (self.scratch_pool[slot] == null) continue;
+        for (0..self.scratch_pool.len) |offset| {
+            const slot = (base +% offset) % self.scratch_pool.len;
             if (self.scratch_locks[slot].cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                return .{
-                    .scratch = &self.scratch_pool[slot].?,
-                    .slot = slot,
-                    .db = self,
-                };
+                if (self.ensureScratch(slot)) |scratch| {
+                    return .{
+                        .scratch = scratch,
+                        .slot = slot,
+                        .db = self,
+                    };
+                }
+                self.scratch_locks[slot].store(false, .release);
+                return null;
             }
         }
         // All slots busy — spin on this thread's home slot (extremely rare:
         // needs more concurrent scanners than scratch_pool_size).
-        const slot = base % scratch_pool_size;
+        const slot = base % self.scratch_pool.len;
         while (self.scratch_locks[slot].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
-        if (self.scratch_pool[slot] != null) {
+        if (self.ensureScratch(slot)) |scratch| {
             return .{
-                .scratch = &self.scratch_pool[slot].?,
+                .scratch = scratch,
                 .slot = slot,
                 .db = self,
             };
         }
+        self.scratch_locks[slot].store(false, .release);
         return null;
     }
 
-    pub fn scanPositive(self: *MatcherDatabase, value: []const u8, result_buf: []u32) ScanResult {
-        return self.scanDb(self.positive_db, self.positive_patterns, value, result_buf, false);
-    }
-
-    pub fn scanNegated(self: *MatcherDatabase, value: []const u8, result_buf: []u32) ScanResult {
-        return self.scanDb(self.negated_db, self.negated_patterns, value, result_buf, true);
-    }
-
-    fn scanDb(
+    /// Deliver every matching pattern's policy index to `callback`.
+    ///
+    /// Preferred over the `scanPositive`/`scanNegated` pair on the hot path,
+    /// for two reasons.
+    ///
+    /// It cannot truncate. The buffered pair collects ids into a fixed slice
+    /// and tells Hyperscan to stop once that slice is full, which silently
+    /// drops every later match. A key holding more matching patterns than the
+    /// buffer has slots therefore loses policies. Here there is no buffer, so
+    /// the scan always runs to completion.
+    ///
+    /// It takes scratch once instead of twice. `Scratch.initMulti` sizes each
+    /// pool slot for both databases, so one handle serves both scans.
+    ///
+    /// `callback` receives the policy index and whether the pattern came from
+    /// the negated database. Every pattern compiles with `single_match`, so
+    /// Hyperscan reports each id at most once per scan and the callback never
+    /// sees a duplicate.
+    pub fn scanInto(
         self: *MatcherDatabase,
-        db: ?hyperscan.Database,
-        patterns: []const PatternMeta,
+        comptime Context: type,
+        comptime callback: fn (Context, PolicyIndex, bool) void,
         value: []const u8,
-        result_buf: []u32,
-        is_negated: bool,
-    ) ScanResult {
-        const database = db orelse return ScanResult{ .count = 0, .buf = result_buf };
-        const handle = self.acquireScratch() orelse return ScanResult{ .count = 0, .buf = result_buf };
+        context: Context,
+    ) void {
+        const database = if (self.db) |*d| d else return;
+
+        const handle = self.acquireScratch() orelse return;
         defer handle.release();
 
-        var ctx = ScanContext.init(result_buf);
+        self.runScan(Context, callback, database, handle.scratch, value, context);
+    }
+
+    fn runScan(
+        self: *MatcherDatabase,
+        comptime Context: type,
+        comptime callback: fn (Context, PolicyIndex, bool) void,
+        db: *const hyperscan.Database,
+        scratch: *hyperscan.Scratch,
+        value: []const u8,
+        context: Context,
+    ) void {
+        const Sink = struct {
+            ctx: Context,
+            patterns: []const PatternMeta,
+            /// Ids below this came from the positive set, ids at or above it
+            /// from the negated set. One database carries both.
+            positive_count: usize,
+            bus: *EventBus,
+            /// Read once before the scan: the level cannot change mid-scan, so
+            /// testing it per match only adds work to the hot loop.
+            debug_enabled: bool,
+            count: usize = 0,
+
+            const Self = @This();
+
+            fn onMatch(sink: *Self, match: hyperscan.Match) bool {
+                if (match.id < sink.patterns.len) {
+                    const policy_index = sink.patterns[match.id].policy_index;
+                    sink.count += 1;
+                    callback(sink.ctx, policy_index, match.id >= sink.positive_count);
+                    if (sink.debug_enabled) {
+                        const detail_event: ScanMatchDetail = .{
+                            .pattern_id = match.id,
+                            .policy_index = policy_index,
+                        };
+                        sink.bus.debug(detail_event);
+                    }
+                }
+                // Never stop early: dropping the rest of the scan would lose
+                // matches for policies that have not reported yet.
+                return true;
+            }
+        };
+
+        var sink: Sink = .{
+            .ctx = context,
+            .patterns = self.patterns,
+            .positive_count = self.positive_count,
+            .bus = self.bus,
+            .debug_enabled = self.bus.isEnabled(.debug),
+        };
+        _ = db.scanWithCallback(*Sink, Sink.onMatch, scratch, value, &sink) catch |err| {
+            const event: ScanError = .{ .err = @errorName(err) };
+            self.bus.warn(event);
+            return;
+        };
+
+        if (sink.count > 0 and sink.debug_enabled) {
+            const matched_event: ScanMatched = .{
+                .pattern_count = sink.count,
+                .value_len = value.len,
+                .value_preview = if (value.len > 100) value[0..100] else value,
+            };
+            self.bus.debug(matched_event);
+        }
+    }
+
+    /// Buffered scan, kept for tests that assert on pattern ids.
+    ///
+    /// Not for the hot path: it stops as soon as `result_buf` is full, so a
+    /// caller with more matching patterns than buffer slots loses the rest
+    /// without a signal. Production scanning goes through `scanInto`, which
+    /// has no buffer and therefore no truncation.
+    pub fn scanPositive(self: *MatcherDatabase, value: []const u8, result_buf: []u32) ScanResult {
+        // Compile-time fence rather than deletion. Rewriting the tests that
+        // assert on pattern ids would weaken what they check, but a truncating
+        // scan must never reach production, so a non-test build that calls
+        // this fails to compile.
+        comptime if (!builtin.is_test) @compileError(
+            "scanPositive truncates at the caller's buffer and is test-only; use scanInto",
+        );
+        const database = if (self.db) |*d| d.* else return .{ .count = 0, .buf = result_buf };
+        const handle = self.acquireScratch() orelse return .{ .count = 0, .buf = result_buf };
+        defer handle.release();
+
+        var ctx: ScanContext = .{
+            .result = .{ .count = 0, .buf = result_buf },
+            .positive_count = self.positive_count,
+        };
         _ = database.scanWithCallback(*ScanContext, scanCallback, handle.scratch, value, &ctx) catch |err| {
             const event: ScanError = .{ .err = @errorName(err) };
             self.bus.warn(event);
             return ctx.result;
         };
-
-        if (ctx.result.count > 0 and self.bus.isEnabled(.debug)) {
-            const matched_event: ScanMatched = .{
-                .pattern_count = ctx.result.count,
-                .value_len = value.len,
-                .value_preview = if (value.len > 100) value[0..100] else value,
-                .is_negated = is_negated,
-            };
-            self.bus.debug(matched_event);
-            for (ctx.result.matches()) |pattern_id| {
-                if (pattern_id < patterns.len) {
-                    const detail_event: ScanMatchDetail = .{
-                        .pattern_id = pattern_id,
-                        .policy_index = patterns[pattern_id].policy_index,
-                    };
-                    self.bus.debug(detail_event);
-                }
-            }
-        }
         return ctx.result;
     }
 
     fn scanCallback(ctx: *ScanContext, match: hyperscan.Match) bool {
+        if (match.id >= ctx.positive_count) return true;
         if (ctx.result.count < ctx.result.buf.len) {
-            // O(1) dedup via seen bitset — Hyperscan calls back per match position
-            if (match.id < ScanContext.max_dedup_ids) {
-                if (ctx.seen[match.id]) return true;
-                ctx.seen[match.id] = true;
-            }
             ctx.result.buf[ctx.result.count] = match.id;
             ctx.result.count += 1;
             return true;
@@ -779,13 +910,13 @@ pub const MatcherDatabase = struct {
     pub fn deinit(self: *MatcherDatabase) void {
         defer self.* = undefined;
 
-        for (&self.scratch_pool) |*s| {
+        for (self.scratch_pool) |*s| {
             if (s.*) |*scratch| scratch.deinit();
         }
-        if (self.positive_db) |*db| db.deinit();
-        if (self.negated_db) |*db| db.deinit();
-        self.allocator.free(self.positive_patterns);
-        self.allocator.free(self.negated_patterns);
+        self.allocator.free(self.scratch_pool);
+        self.allocator.free(self.scratch_locks);
+        if (self.db) |*db| db.deinit();
+        self.allocator.free(self.patterns);
     }
 };
 
@@ -886,6 +1017,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         /// Optional resolver for policy extensions (v1.6.0). When null, any
         /// declared extension is skipped and reported (fail-open).
         extension_resolver: ?policy_types.ExtensionResolver,
+        scan_concurrency: usize,
         patterns_by_key: std.HashMap(
             MatcherKeyT,
             PatternsPerKey,
@@ -913,6 +1045,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             bus: *EventBus,
             errors: ?*CompilationErrors,
             extension_resolver: ?policy_types.ExtensionResolver,
+            scan_concurrency: usize,
         ) Self {
             return .{
                 .allocator = allocator,
@@ -920,6 +1053,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .bus = bus,
                 .errors = errors,
                 .extension_resolver = extension_resolver,
+                .scan_concurrency = scan_concurrency,
                 .patterns_by_key = std.HashMap(
                     MatcherKeyT,
                     PatternsPerKey,
@@ -1692,6 +1826,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                         self.bus,
                         patterns.positive.items,
                         patterns.negated.items,
+                        self.scan_concurrency,
                     );
                     databases.putAssumeCapacity(matcher_key, compiled);
                     break :blk compiled;
@@ -1775,6 +1910,7 @@ fn buildIndex(
     policies_slice: []const Policy,
     errors: ?*CompilationErrors,
     extension_resolver: ?policy_types.ExtensionResolver,
+    options: IndexOptions,
 ) !MatcherIndexType(T) {
     const started_event: MatcherIndexBuildStarted = .{
         .policy_count = policies_slice.len,
@@ -1786,13 +1922,29 @@ fn buildIndex(
     errdefer |err| span.failed(err);
 
     if (policies_slice.len > max_policies) {
+        // The error alone tells a host nothing about how far over it is, and a
+        // host whose own metric counts policies as loaded would read the
+        // failure as success. Name both numbers.
+        const over_event: PolicyCeilingExceeded = .{
+            .policy_count = policies_slice.len,
+            .ceiling = max_policies,
+            .telemetry_type = T,
+        };
+        bus.err(over_event);
         return error.TooManyPolicies;
     }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var builder = IndexBuilder(T).init(allocator, arena.allocator(), bus, errors, extension_resolver);
+    var builder = IndexBuilder(T).init(
+        allocator,
+        arena.allocator(),
+        bus,
+        errors,
+        extension_resolver,
+        options.scan_concurrency,
+    );
     errdefer builder.deinit();
 
     for (policies_slice, 0..) |*policy, i| {
@@ -1845,7 +1997,20 @@ pub const LogMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !LogMatcherIndex {
-        return buildIndex(allocator, .log, bus, policies_slice, errors, extension_resolver);
+        return buildIndex(allocator, .log, bus, policies_slice, errors, extension_resolver, .{});
+    }
+
+    /// `build` with host-declared options. Kept separate so the existing
+    /// signature stays valid for callers that have nothing to declare.
+    pub fn buildWithOptions(
+        allocator: std.mem.Allocator,
+        bus: *EventBus,
+        policies_slice: []const Policy,
+        errors: ?*CompilationErrors,
+        extension_resolver: ?policy_types.ExtensionResolver,
+        options: IndexOptions,
+    ) !LogMatcherIndex {
+        return buildIndex(allocator, .log, bus, policies_slice, errors, extension_resolver, options);
     }
 
     pub fn getDatabase(self: *const LogMatcherIndex, key: LogMatcherKey) ?*MatcherDatabase {
@@ -1979,7 +2144,20 @@ pub const MetricMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !MetricMatcherIndex {
-        return buildIndex(allocator, .metric, bus, policies_slice, errors, extension_resolver);
+        return buildIndex(allocator, .metric, bus, policies_slice, errors, extension_resolver, .{});
+    }
+
+    /// `build` with host-declared options. Kept separate so the existing
+    /// signature stays valid for callers that have nothing to declare.
+    pub fn buildWithOptions(
+        allocator: std.mem.Allocator,
+        bus: *EventBus,
+        policies_slice: []const Policy,
+        errors: ?*CompilationErrors,
+        extension_resolver: ?policy_types.ExtensionResolver,
+        options: IndexOptions,
+    ) !MetricMatcherIndex {
+        return buildIndex(allocator, .metric, bus, policies_slice, errors, extension_resolver, options);
     }
 
     pub fn getDatabase(self: *const MetricMatcherIndex, key: MetricMatcherKey) ?*MatcherDatabase {
@@ -2108,7 +2286,20 @@ pub const TraceMatcherIndex = struct {
         errors: ?*CompilationErrors,
         extension_resolver: ?policy_types.ExtensionResolver,
     ) !TraceMatcherIndex {
-        return buildIndex(allocator, .trace, bus, policies_slice, errors, extension_resolver);
+        return buildIndex(allocator, .trace, bus, policies_slice, errors, extension_resolver, .{});
+    }
+
+    /// `build` with host-declared options. Kept separate so the existing
+    /// signature stays valid for callers that have nothing to declare.
+    pub fn buildWithOptions(
+        allocator: std.mem.Allocator,
+        bus: *EventBus,
+        policies_slice: []const Policy,
+        errors: ?*CompilationErrors,
+        extension_resolver: ?policy_types.ExtensionResolver,
+        options: IndexOptions,
+    ) !TraceMatcherIndex {
+        return buildIndex(allocator, .trace, bus, policies_slice, errors, extension_resolver, options);
     }
 
     pub fn getDatabase(self: *const TraceMatcherIndex, key: TraceMatcherKey) ?*MatcherDatabase {
@@ -2216,76 +2407,53 @@ fn compileDatabase(
     bus: *EventBus,
     positive_collectors: []const PatternCollector,
     negated_collectors: []const PatternCollector,
+    scan_concurrency: usize,
 ) !*MatcherDatabase {
-    var positive_db: ?hyperscan.Database = null;
-    var negated_db: ?hyperscan.Database = null;
-    var scratch_pool: [MatcherDatabase.scratch_pool_size]?hyperscan.Scratch =
-        .{null} ** MatcherDatabase.scratch_pool_size;
+    var db: ?hyperscan.Database = null;
+
+    const slot_count = MatcherDatabase.scratchSlotCount(scan_concurrency);
+    const scratch_pool = try allocator.alloc(?hyperscan.Scratch, slot_count);
+    @memset(scratch_pool, null);
+    errdefer allocator.free(scratch_pool);
+    const scratch_locks = try allocator.alloc(std.atomic.Value(bool), slot_count);
+    errdefer allocator.free(scratch_locks);
+    for (scratch_locks) |*lock| lock.* = std.atomic.Value(bool).init(false);
 
     // Declared before the errdefer so the pattern metadata is torn down too.
     // MatcherDatabase.deinit owns these once the struct below is built; until
     // then this function does.
-    var positive_patterns: []PatternMeta = &.{};
-    var negated_patterns: []PatternMeta = &.{};
+    var patterns: []PatternMeta = &.{};
 
     errdefer {
-        for (&scratch_pool) |*s| {
+        for (scratch_pool) |*s| {
             if (s.*) |*scratch| scratch.deinit();
         }
-        if (positive_db) |*db| db.deinit();
-        if (negated_db) |*db| db.deinit();
-        if (positive_patterns.len > 0) allocator.free(positive_patterns);
-        if (negated_patterns.len > 0) allocator.free(negated_patterns);
+        if (db) |*d| d.deinit();
+        if (patterns.len > 0) allocator.free(patterns);
     }
 
-    if (positive_collectors.len > 0) {
-        const result = try compilePatterns(allocator, positive_collectors);
-        positive_db = result.db;
-        positive_patterns = result.meta;
+    if (positive_collectors.len > 0 or negated_collectors.len > 0) {
+        const result = try compilePatterns(allocator, positive_collectors, negated_collectors);
+        db = result.db;
+        patterns = result.meta;
     }
 
-    if (negated_collectors.len > 0) {
-        const result = try compilePatterns(allocator, negated_collectors);
-        negated_db = result.db;
-        negated_patterns = result.meta;
+    // Build the first slot now so a database that cannot produce scratch at
+    // all fails here rather than silently skipping scans later. Every other
+    // slot stays empty until a thread actually reaches it: scratch costs about
+    // 0.3 MB per slot at 4,000 patterns, so filling a large pool up front
+    // would charge every deployment for concurrency it may never use.
+    if (db) |*d| {
+        scratch_pool[0] = try hyperscan.Scratch.init(d);
     }
-
-    // One scratch sized for every database it will be used with. Calling
-    // Scratch.init twice allocated a second scratch, dropped it, and left
-    // scratch_pool[0] sized for the positive database only, which is invalid
-    // Hyperscan usage when scanning the negated one.
-    var scratch_dbs: [2]*const hyperscan.Database = undefined;
-    var scratch_db_count: usize = 0;
-    if (positive_db) |*db| {
-        scratch_dbs[scratch_db_count] = db;
-        scratch_db_count += 1;
-    }
-    if (negated_db) |*db| {
-        scratch_dbs[scratch_db_count] = db;
-        scratch_db_count += 1;
-    }
-    if (scratch_db_count > 0) {
-        scratch_pool[0] = try hyperscan.Scratch.initMulti(scratch_dbs[0..scratch_db_count]);
-    }
-
-    // Clone scratch into remaining pool slots for concurrent access
-    if (scratch_pool[0]) |*base| {
-        for (1..MatcherDatabase.scratch_pool_size) |i| {
-            scratch_pool[i] = try base.clone();
-        }
-    }
-
-    var scratch_locks: [MatcherDatabase.scratch_pool_size]std.atomic.Value(bool) = undefined;
-    for (&scratch_locks) |*lock| lock.* = std.atomic.Value(bool).init(false);
 
     const matcher_db = try allocator.create(MatcherDatabase);
     matcher_db.* = .{
-        .positive_db = positive_db,
-        .negated_db = negated_db,
+        .db = db,
         .scratch_pool = scratch_pool,
         .scratch_locks = scratch_locks,
-        .positive_patterns = positive_patterns,
-        .negated_patterns = negated_patterns,
+        .patterns = patterns,
+        .positive_count = positive_collectors.len,
         .allocator = allocator,
         .bus = bus,
     };
@@ -2293,38 +2461,50 @@ fn compileDatabase(
     return matcher_db;
 }
 
+/// Compile both pattern sets of one matcher key into a single database.
+///
+/// The positive set takes ids `0..positive.len`, the negated set the ids above
+/// it, so the id alone says which set a match came from and the callback needs
+/// no second lookup. One database instead of two halves the per-scan Rose and
+/// FDR setup, which at 4,000 patterns was several percent of the policy path.
 fn compilePatterns(
     allocator: std.mem.Allocator,
-    collectors: []const PatternCollector,
+    positive: []const PatternCollector,
+    negated: []const PatternCollector,
 ) !struct { db: hyperscan.Database, meta: []PatternMeta } {
     // Calculate buffer size: worst case is every byte escaped plus anchors.
     // Exists matchers never enter Hyperscan — they are dispatched separately
     // by the engine via accessor.callExists.
     var buf_size: usize = 0;
-    for (collectors) |c| {
-        buf_size += formattedPatternLen(c.pattern, c.match_type);
-    }
+    for (positive) |c| buf_size += formattedPatternLen(c.pattern, c.match_type);
+    for (negated) |c| buf_size += formattedPatternLen(c.pattern, c.match_type);
+
+    const total = positive.len + negated.len;
 
     // Single allocation for hs_patterns + pattern buffer. The Pattern array
     // sits at the front, so the buffer must carry Pattern's alignment: a plain
     // u8 alloc may return a 1-aligned pointer (e.g. from an arena) and trap.
-    const hs_size = collectors.len * @sizeOf(hyperscan.Pattern);
+    const hs_size = total * @sizeOf(hyperscan.Pattern);
     const temp = try allocator.alignedAlloc(u8, .of(hyperscan.Pattern), hs_size + buf_size);
     defer allocator.free(temp);
 
     const hs_patterns: []hyperscan.Pattern = std.mem.bytesAsSlice(hyperscan.Pattern, temp[0..hs_size]);
     var buf = temp[hs_size..];
 
-    const meta = try allocator.alloc(PatternMeta, collectors.len);
+    const meta = try allocator.alloc(PatternMeta, total);
     errdefer allocator.free(meta);
 
-    for (collectors, 0..) |c, i| {
-        hs_patterns[i] = .{
-            .expression = formatPattern(&buf, c.pattern, c.match_type),
-            .id = @intCast(i),
-            .flags = .{ .caseless = c.case_insensitive, .single_match = true },
-        };
-        meta[i] = .{ .policy_index = c.policy_index };
+    var next: usize = 0;
+    for ([_][]const PatternCollector{ positive, negated }) |set| {
+        for (set) |c| {
+            hs_patterns[next] = .{
+                .expression = formatPattern(&buf, c.pattern, c.match_type),
+                .id = @intCast(next),
+                .flags = .{ .caseless = c.case_insensitive, .single_match = true },
+            };
+            meta[next] = .{ .policy_index = c.policy_index };
+            next += 1;
+        }
     }
 
     const db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
@@ -3018,8 +3198,11 @@ test "LogMatcherIndex: negated matcher creates negated database" {
     const expected_key: LogMatcherKey = .{ .field = .{ .log_field = .LOG_FIELD_BODY } };
     const db = index.getDatabase(expected_key);
     try testing.expect(db != null);
-    try testing.expect(db.?.negated_db != null);
-    try testing.expect(db.?.positive_db == null);
+    // Both sets share one database now, so a negated-only key shows up as a
+    // database whose positive half is empty.
+    try testing.expect(db.?.db != null);
+    try testing.expectEqual(@as(usize, 0), db.?.positive_count);
+    try testing.expectEqual(@as(usize, 1), db.?.patterns.len);
 }
 
 test "LogMatcherIndex: scan database" {

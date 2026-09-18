@@ -212,6 +212,68 @@ const hexRenderId = policy_types.hexRenderId;
 /// serve multiple consumers: each consumer's evaluate site passes its own
 /// (comptime) accessor, and the engine instantiates one specialized path
 /// per accessor.
+pub const ScanState = struct {
+    /// Indexed by policy index. Seeded by `activate` on first touch, so it
+    /// never has to be cleared per record.
+    match_counts: [max_policies]u16,
+    /// Every policy this record touched, in touch order.
+    active_policies: [max_policies]PolicyIndex,
+    /// One byte per policy, and the only part of the state cleared per
+    /// record. A bitset is eight times smaller but measurably slower: the
+    /// clear is a vectorized memset either way, while every activation
+    /// pays a read-modify-write on the shared byte. A policy set where
+    /// most policies carry a negated matcher activates all of them on
+    /// every record, and that path dominates.
+    is_active: [max_policies]bool,
+    active_count: usize,
+
+    /// Caller-owned scratch, reusable across records.
+    ///
+    /// Pass a pointer to one of these through `EvaluateOptions.scan_state`
+    /// to skip the per-record clear. The flags are zeroed once here; every
+    /// later record clears only the policies it actually touched, which is
+    /// a handful rather than one byte per policy. At 4,000 policies and
+    /// 8,181 records that is tens of megabytes of memset per batch.
+    ///
+    /// Allocate one per scanning thread. Never pass an uninitialised
+    /// value: stale flags would report policies as active that never
+    /// matched.
+    pub fn init() ScanState {
+        return .{
+            .match_counts = undefined,
+            .active_policies = undefined,
+            .is_active = @splat(false),
+            .active_count = 0,
+        };
+    }
+
+    /// Undo only what the previous record set, so the cost tracks the
+    /// policies that fired rather than the policy set.
+    fn reset(self: *ScanState) void {
+        for (self.active_policies[0..self.active_count]) |policy_index| {
+            self.is_active[policy_index] = false;
+        }
+        self.active_count = 0;
+    }
+
+    fn isActive(self: *const ScanState, policy_index: PolicyIndex) bool {
+        return self.is_active[policy_index];
+    }
+
+    /// Mark `policy_index` active and return its counter. The counter is
+    /// set to `seed` the first time the policy is touched, which is what
+    /// lets `match_counts` go uncleared.
+    fn activate(self: *ScanState, policy_index: PolicyIndex, seed: u16) *u16 {
+        if (!self.is_active[policy_index]) {
+            self.is_active[policy_index] = true;
+            self.active_policies[self.active_count] = policy_index;
+            self.active_count += 1;
+            self.match_counts[policy_index] = seed;
+        }
+        return &self.match_counts[policy_index];
+    }
+};
+
 pub const EvaluateOptions = struct {
     scratch: ?std.mem.Allocator = null,
     /// Io for the io-dependent decision paths: rate-limiter timestamps
@@ -226,6 +288,13 @@ pub const EvaluateOptions = struct {
     /// records are handed to the sink after keep resolution, before
     /// transforms. Null costs a single branch.
     extension_sink: ?policy_types.ExtensionSink = null,
+    /// Reusable scan scratch, from `ScanState.init()`.
+    ///
+    /// Null keeps the per-record stack state, which clears one byte per policy
+    /// on every record. Supplying one moves that cost to the policies that
+    /// actually fired. Allocate one per scanning thread, since evaluation
+    /// writes to it.
+    scan_state: ?*ScanState = null,
 };
 
 // =============================================================================
@@ -310,13 +379,13 @@ pub const PolicyEngine = struct {
     /// Returns PolicyResult containing the filter decision and list of matched policy IDs.
     /// If field_mutator is provided, transforms are applied to matched policies.
     /// Result of scanning all matcher keys against field values
-    const ScanState = struct {
-        match_counts: [max_matches_per_scan]u16,
-        active_policies: [max_matches_per_scan]PolicyIndex,
-        is_active: [max_matches_per_scan]bool,
-        active_count: usize,
-    };
-
+    /// Per-record scan state, indexed by **policy index**, so it must hold
+    /// every policy the index can carry. It was sized by
+    /// `max_matches_per_scan` (256) while `matcher_index.max_policies` allows
+    /// 8192, so a policy whose index passed 255 wrote past these arrays: a
+    /// panic in a safe build, silent memory corruption in a fast one. Only the
+    /// first `policy_count` entries are ever touched, so the cost still tracks
+    /// the policy set rather than the ceiling.
     /// Result of finding matching policies from scan state
     const MatchState = struct {
         matched_indices: [max_matches_per_scan]PolicyIndex,
@@ -369,12 +438,24 @@ pub const PolicyEngine = struct {
         self.bus.debug(start_event);
 
         // Phase 1: Scan all matcher keys and compute match counts
-        var scan_state: ScanState = undefined;
-        self.scanMatcherKeys(T, accessor, ctx, index, &scan_state);
+        // Either reuse the caller's scratch, undoing only the last record's
+        // marks, or fall back to a per-record stack value cleared over the
+        // range this index can reach.
+        var local_state: ScanState = undefined;
+        const scan_state = if (options.scan_state) |shared| blk: {
+            shared.reset();
+            break :blk shared;
+        } else blk: {
+            local_state.active_count = 0;
+            const policy_count = @min(index.getPolicyCount(), max_policies);
+            @memset(local_state.is_active[0..policy_count], false);
+            break :blk &local_state;
+        };
+        self.scanMatcherKeys(T, accessor, ctx, index, scan_state);
 
         // Phase 2: Find matching policies and determine decision
         var match_state: MatchState = undefined;
-        self.findMatchingPolicies(options.io, T, accessor, ctx, index, &scan_state, policy_id_buf, &match_state);
+        self.findMatchingPolicies(options.io, T, accessor, ctx, index, scan_state, policy_id_buf, &match_state);
 
         const result_event: EvaluateResult = .{
             .decision = match_state.decision,
@@ -453,28 +534,17 @@ pub const PolicyEngine = struct {
         index: *const matcher_index.MatcherIndexType(T),
         state: *ScanState,
     ) void {
-        state.* = .{
-            .match_counts = undefined,
-            .active_policies = undefined,
-            .is_active = undefined,
-            .active_count = 0,
-        };
-        @memset(&state.match_counts, 0);
-        @memset(&state.is_active, false);
+        // The caller has already cleared the flags, either by clearing the
+        // range this index can reach or, for reused scratch, by undoing the
+        // previous record. `match_counts` is seeded on first touch by
+        // `activate`, so it needs no clearing at all.
 
         // Initialize match counts for policies with negated patterns
         // No telemetry type filtering needed - index only contains policies of type T
         for (index.getPoliciesWithNegation()) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
-            state.match_counts[policy_index] = policy_info.negated_count;
-            if (!state.is_active[policy_index]) {
-                state.is_active[policy_index] = true;
-                state.active_policies[state.active_count] = policy_index;
-                state.active_count += 1;
-            }
+            _ = state.activate(policy_index, policy_info.negated_count);
         }
-
-        var result_buf: [max_matches_per_scan]u32 = undefined;
 
         // Iterate type-specific matcher keys - no runtime type filtering needed
         for (index.getMatcherKeys()) |matcher_key| {
@@ -492,17 +562,13 @@ pub const PolicyEngine = struct {
             if (matcher_key.exists_entries.len > 0) {
                 const is_present = accessor.callExists(ctx, field_ref);
                 for (matcher_key.exists_entries) |entry| {
+                    const counter = state.activate(entry.policy_index, 0);
                     if (is_present) {
                         if (entry.negate) {
-                            state.match_counts[entry.policy_index] -= 1;
+                            counter.* -= 1;
                         } else {
-                            state.match_counts[entry.policy_index] += 1;
+                            counter.* += 1;
                         }
-                    }
-                    if (!state.is_active[entry.policy_index]) {
-                        state.is_active[entry.policy_index] = true;
-                        state.active_policies[state.active_count] = entry.policy_index;
-                        state.active_count += 1;
                     }
                 }
             }
@@ -552,47 +618,31 @@ pub const PolicyEngine = struct {
             // has_value_db guarantees the cached db pointer is non-null.
             const db = matcher_key.db.?;
 
-            // Scan positive patterns - increment match counts
-            const positive_result = db.scanPositive(value, &result_buf);
-            for (positive_result.matches()) |pattern_id| {
-                if (pattern_id < db.positive_patterns.len) {
-                    const meta = db.positive_patterns[pattern_id];
-                    state.match_counts[meta.policy_index] += 1;
-                    if (!state.is_active[meta.policy_index]) {
-                        state.is_active[meta.policy_index] = true;
-                        state.active_policies[state.active_count] = meta.policy_index;
-                        state.active_count += 1;
+            // One pass over both databases. A positive hit raises the policy's
+            // count, a negated hit lowers it. Unbuffered, so a key with more
+            // matching patterns than any fixed buffer would hold can no longer
+            // lose the remainder, and scratch is taken once rather than twice.
+            const Sink = struct {
+                state: *ScanState,
+                engine: *const PolicyEngine,
+
+                const Self = @This();
+
+                fn onMatch(sink: *Self, policy_index: PolicyIndex, is_negated: bool) void {
+                    const counter = sink.state.activate(policy_index, 0);
+                    if (is_negated) {
+                        counter.* -= 1;
+                        if (sink.engine.bus.isEnabled(.debug)) {
+                            const event: PolicyNegationFailed = .{ .policy_index = policy_index };
+                            sink.engine.bus.debug(event);
+                        }
+                    } else {
+                        counter.* += 1;
                     }
                 }
-            }
-
-            // Scan negated patterns - decrement match counts
-            const negated_result = db.scanNegated(value, &result_buf);
-            for (negated_result.matches()) |pattern_id| {
-                if (pattern_id < db.negated_patterns.len) {
-                    const meta = db.negated_patterns[pattern_id];
-                    state.match_counts[meta.policy_index] -= 1;
-                    if (!state.is_active[meta.policy_index]) {
-                        state.is_active[meta.policy_index] = true;
-                        state.active_policies[state.active_count] = meta.policy_index;
-                        state.active_count += 1;
-                    }
-                    if (self.bus.isEnabled(.debug)) {
-                        const event: PolicyNegationFailed = .{
-                            .policy_index = meta.policy_index,
-                        };
-                        self.bus.debug(event);
-                    }
-                }
-            }
-
-            if (self.bus.isEnabled(.debug)) {
-                const event: ScanResult = .{
-                    .positive_count = positive_result.count,
-                    .negated_count = negated_result.count,
-                };
-                self.bus.debug(event);
-            }
+            };
+            var sink: Sink = .{ .state = state, .engine = self };
+            db.scanInto(*Sink, Sink.onMatch, value, &sink);
         }
 
         // Typed checks (v1.5.0): evaluate equals/gt/gte/lt/lte against typed field
@@ -607,18 +657,11 @@ pub const PolicyEngine = struct {
 
             const fired = check.matcher.evaluate(typed_val);
 
+            const counter = state.activate(check.policy_index, 0);
             if (check.negate) {
-                if (fired) {
-                    state.match_counts[check.policy_index] -= 1;
-                }
+                if (fired) counter.* -= 1;
             } else if (fired) {
-                state.match_counts[check.policy_index] += 1;
-            }
-
-            if (!state.is_active[check.policy_index]) {
-                state.is_active[check.policy_index] = true;
-                state.active_policies[state.active_count] = check.policy_index;
-                state.active_count += 1;
+                counter.* += 1;
             }
         }
 
@@ -758,7 +801,11 @@ pub const PolicyEngine = struct {
                     break :blk applyKeepValue(io, policy_info);
                 };
 
-                if (state.matched_count < policy_id_buf.len) {
+                // Both bounds matter: the caller's buffer, and the fixed
+                // arrays in MatchState. Checking only the caller's buffer let a
+                // caller with a buffer larger than `max_matches_per_scan`
+                // overrun those arrays.
+                if (state.matched_count < @min(policy_id_buf.len, max_matches_per_scan)) {
                     policy_id_buf[state.matched_count] = policy_info.id;
                     state.matched_indices[state.matched_count] = policy_index;
                     state.matched_policies[state.matched_count] = policy_info;
@@ -1116,6 +1163,109 @@ test "PolicyEngine: single policy drop match" {
     var info_log: TestLogContext = .{ .message = "all good" };
     const result2 = evalTestLog(&engine, &info_log, &policy_id_buf);
     try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "PolicyEngine: a policy past the 256th index still matches" {
+    // The index orders policies by id, so a policy's position in the set
+    // decides its index. `ScanState` was sized by `max_matches_per_scan`
+    // (256) and indexed by policy index, so the 257th policy onwards wrote
+    // past those arrays: a panic in a safe build, silent corruption in a fast
+    // one. 300 policies, and the one that matches sorts last.
+    const allocator = testing.allocator;
+    const count = 300;
+
+    var policies: [count]Policy = undefined;
+    var made: usize = 0;
+    defer for (policies[0..made]) |*p| p.deinit(allocator);
+
+    for (0..count - 1) |i| {
+        var p: Policy = .{
+            .id = try std.fmt.allocPrint(allocator, "miss-{d:0>6}", .{i}),
+            .name = try allocator.dupe(u8, "miss"),
+            .enabled = true,
+            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+        };
+        try p.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .regex = try std.fmt.allocPrint(allocator, "absent-{d:0>6}", .{i}) },
+        });
+        policies[i] = p;
+        made += 1;
+    }
+    var last: Policy = .{
+        .id = try allocator.dupe(u8, "zzz-drop"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    try last.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    policies[count - 1] = last;
+    made += 1;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&policies, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var error_log: TestLogContext = .{ .message = "an error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    const result = evalTestLog(&engine, &error_log, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+}
+
+test "PolicyEngine: reused scan state matches a fresh one" {
+    // The shared state clears only what the previous record marked. If that
+    // undo were incomplete, a later record would inherit stale activity and
+    // report policies that never matched, so alternate matching and
+    // non-matching records through one state and compare against the
+    // per-record path.
+    const allocator = testing.allocator;
+
+    var policy: Policy = .{
+        .id = try allocator.dupe(u8, "drop-errors"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    defer policy.deinit(allocator);
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .contains = try allocator.dupe(u8, "error") },
+    });
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var shared = ScanState.init();
+
+    const bodies = [_][]const u8{ "an error occurred", "all good", "another error", "fine", "fine again" };
+    for (bodies) |body| {
+        var log_a: TestLogContext = .{ .message = body };
+        var log_b: TestLogContext = .{ .message = body };
+        var buf_a: [16][]const u8 = undefined;
+        var buf_b: [16][]const u8 = undefined;
+
+        const fresh = engine.evaluate(.log, &TestLogContext.accessor, &log_a, &buf_a, .{
+            .io = std.Options.debug_io,
+        });
+        const reused = engine.evaluate(.log, &TestLogContext.accessor, &log_b, &buf_b, .{
+            .io = std.Options.debug_io,
+            .scan_state = &shared,
+        });
+
+        try testing.expectEqual(fresh.decision, reused.decision);
+        try testing.expectEqual(fresh.matched_policy_ids.len, reused.matched_policy_ids.len);
+    }
 }
 
 test "PolicyEngine: single policy keep match returns policy ID" {

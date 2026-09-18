@@ -314,6 +314,10 @@ pub const PolicyRegistry = struct {
     // Optional extension resolver (v1.6.0), consulted at snapshot compile
     // time to resolve/validate each policy's extension declarations.
     extension_resolver: ?policy_types.ExtensionResolver,
+    /// Greatest number of threads that may scan a snapshot at once. Set once
+    /// by the host via `setScanConcurrency`; zero leaves the library default.
+    /// It describes the process, not a snapshot, so it survives reloads.
+    scan_concurrency: usize = 0,
 
     // Optional extension sync hooks (v1.6.0), pushed to each provider on
     // subscribe for capability advertisement + broadcast-config routing.
@@ -545,6 +549,16 @@ pub const PolicyRegistry = struct {
         }
     }
 
+    /// Declare how many threads may scan a snapshot at the same time.
+    ///
+    /// Call once at start-up, before the first snapshot. A task-per-connection
+    /// host should pass its connection limit rather than its core count: what
+    /// matters is concurrent scanners, and too small a value serialises them
+    /// on a spin loop instead of failing. Zero keeps the library default.
+    pub fn setScanConcurrency(self: *PolicyRegistry, concurrency: usize) void {
+        self.scan_concurrency = concurrency;
+    }
+
     /// Update policies from a specific provider
     /// Deduplicates by id and applies priority rules based on source_type
     pub fn updatePolicies(
@@ -765,30 +779,33 @@ pub const PolicyRegistry = struct {
         var comp_errors = matcher_index.CompilationErrors.init(self.allocator);
         defer comp_errors.deinit();
 
-        var log_idx = try LogMatcherIndex.build(
+        var log_idx = try LogMatcherIndex.buildWithOptions(
             self.allocator,
             self.bus,
             policies_slice,
             &comp_errors,
             self.extension_resolver,
+            .{ .scan_concurrency = self.scan_concurrency },
         );
         errdefer log_idx.deinit();
 
-        var metric_idx = try MetricMatcherIndex.build(
+        var metric_idx = try MetricMatcherIndex.buildWithOptions(
             self.allocator,
             self.bus,
             policies_slice,
             &comp_errors,
             self.extension_resolver,
+            .{ .scan_concurrency = self.scan_concurrency },
         );
         errdefer metric_idx.deinit();
 
-        var trace_idx = try TraceMatcherIndex.build(
+        var trace_idx = try TraceMatcherIndex.buildWithOptions(
             self.allocator,
             self.bus,
             policies_slice,
             &comp_errors,
             self.extension_resolver,
+            .{ .scan_concurrency = self.scan_concurrency },
         );
         errdefer trace_idx.deinit();
 
