@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/usetero/policy-zig/compare/v0.7.3...v0.7.4) (2026-09-18)
+
+
+### Bug Fixes
+
+* size scan state by policy count and rework the matcher scan path ([#104](https://github.com/usetero/policy-zig/issues/104)) ([571b75e](https://github.com/usetero/policy-zig/commit/571b75e1b47b139dc7257023f3a6ffb7e2a2a234))
+
 ## [0.7.3](https://github.com/usetero/policy-zig/compare/v0.7.2...v0.7.3) (2026-09-15)
 
 
