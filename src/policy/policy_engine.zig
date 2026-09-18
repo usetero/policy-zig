@@ -302,6 +302,18 @@ pub const EvaluateOptions = struct {
 // =============================================================================
 
 const EvaluateEmpty = struct {};
+
+/// More policies matched one record than `MatchState` can hold, so the ones
+/// past the limit keep their say in the keep or drop verdict but lose their
+/// transforms. Raise the caller's policy id buffer if it is the smaller of the
+/// two bounds; otherwise `max_matches_per_scan` is the ceiling.
+const MatchedPoliciesTruncated = struct {
+    recorded: usize,
+    dropped: usize,
+    caller_buffer: usize,
+    ceiling: usize,
+    telemetry_type: TelemetryType,
+};
 const EvaluateStart = struct { matcher_key_count: usize, policy_count: usize };
 const MatcherKeyFieldNotPresent = struct {
     telemetry_type: TelemetryType,
@@ -392,6 +404,11 @@ pub const PolicyEngine = struct {
         matched_policies: [max_matches_per_scan]*const PolicyInfo,
         matched_decisions: [max_matches_per_scan]FilterDecision,
         matched_count: usize,
+        /// Policies that matched but did not fit. They still shape the keep or
+        /// drop decision, which is updated outside the bounds check, but their
+        /// transforms never run because `matched_policies` is what the
+        /// transform pass walks.
+        dropped_count: usize,
         decision: FilterDecision,
         /// Whether a trace sampling threshold was written back via mutator
         was_trace_sampled: bool = false,
@@ -729,6 +746,7 @@ pub const PolicyEngine = struct {
             .matched_policies = undefined,
             .matched_decisions = undefined,
             .matched_count = 0,
+            .dropped_count = 0,
             .decision = .unset,
         };
 
@@ -811,6 +829,12 @@ pub const PolicyEngine = struct {
                     state.matched_policies[state.matched_count] = policy_info;
                     state.matched_decisions[state.matched_count] = decision;
                     state.matched_count += 1;
+                } else {
+                    // Count rather than drop in silence. The record still gets
+                    // the right keep or drop verdict, but this policy's
+                    // transforms will not run, and a caller has no other way
+                    // to learn that happened.
+                    state.dropped_count += 1;
                 }
 
                 // Update final decision: drop beats keep, keep beats unset
@@ -820,6 +844,17 @@ pub const PolicyEngine = struct {
                     state.decision = .keep;
                 }
             }
+        }
+
+        if (state.dropped_count > 0) {
+            const event: MatchedPoliciesTruncated = .{
+                .recorded = state.matched_count,
+                .dropped = state.dropped_count,
+                .caller_buffer = policy_id_buf.len,
+                .ceiling = max_matches_per_scan,
+                .telemetry_type = T,
+            };
+            self.bus.warn(event);
         }
     }
 
@@ -1217,6 +1252,58 @@ test "PolicyEngine: a policy past the 256th index still matches" {
 
     const result = evalTestLog(&engine, &error_log, &policy_id_buf);
     try testing.expectEqual(FilterDecision.drop, result.decision);
+}
+
+test "PolicyEngine: truncated matches keep the verdict and are reported" {
+    // More matching policies than MatchState can record. The verdict must
+    // still be right, because the decision update sits outside the bounds
+    // check, and the loss must be visible, because the transforms of the
+    // policies past the limit will not run.
+    const allocator = testing.allocator;
+    const count = 300;
+
+    var policies: [count]Policy = undefined;
+    var made: usize = 0;
+    defer for (policies[0..made]) |*p| p.deinit(allocator);
+
+    for (0..count) |i| {
+        var p: Policy = .{
+            .id = try std.fmt.allocPrint(allocator, "drop-{d:0>4}", .{i}),
+            .name = try allocator.dupe(u8, "drop"),
+            .enabled = true,
+            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        };
+        try p.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .contains = try allocator.dupe(u8, "error") },
+        });
+        policies[i] = p;
+        made += 1;
+    }
+
+    var out: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out);
+    var bus = EventBus.init(std.Options.debug_io, &writer);
+    bus.setLevel(.warn);
+
+    var registry = PolicyRegistry.init(allocator, &bus);
+    defer registry.deinit();
+    try registry.updatePolicies(&policies, "file-provider", .file);
+
+    const engine = PolicyEngine.init(&bus, &registry);
+
+    var log: TestLogContext = .{ .message = "an error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(.log, &TestLogContext.accessor, &log, &policy_id_buf, .{
+        .io = std.Options.debug_io,
+    });
+
+    // Every policy matched, so the verdict is drop regardless of the cap.
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    const written = out[0..writer.end];
+    try testing.expect(std.mem.containsAtLeast(u8, written, 1, "matched.policies.truncated"));
+    try testing.expect(std.mem.containsAtLeast(u8, written, 1, "dropped="));
 }
 
 test "PolicyEngine: reused scan state matches a fresh one" {

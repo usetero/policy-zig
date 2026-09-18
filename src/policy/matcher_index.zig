@@ -748,12 +748,17 @@ pub const MatcherDatabase = struct {
                         .db = self,
                     };
                 }
+                // Deliberately give up rather than try the next slot. The only
+                // way `ensureScratch` fails is an allocation failure, and
+                // every other slot would ask for the same amount, so walking
+                // the pool would just repeat the failure once per slot.
                 self.scratch_locks[slot].store(false, .release);
                 return null;
             }
         }
-        // All slots busy — spin on this thread's home slot (extremely rare:
-        // needs more concurrent scanners than scratch_pool_size).
+        // All slots busy — spin on this thread's home slot. Rare: it needs
+        // more concurrent scanners than the pool has slots, which is what
+        // `PolicyRegistry.setScanConcurrency` exists to prevent.
         const slot = base % self.scratch_pool.len;
         while (self.scratch_locks[slot].cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
@@ -780,13 +785,14 @@ pub const MatcherDatabase = struct {
     /// buffer has slots therefore loses policies. Here there is no buffer, so
     /// the scan always runs to completion.
     ///
-    /// It takes scratch once instead of twice. `Scratch.initMulti` sizes each
-    /// pool slot for both databases, so one handle serves both scans.
+    /// It scans once. Both pattern sets live in one database, so this takes
+    /// scratch once and pays the per-scan setup once.
     ///
     /// `callback` receives the policy index and whether the pattern came from
-    /// the negated database. Every pattern compiles with `single_match`, so
-    /// Hyperscan reports each id at most once per scan and the callback never
-    /// sees a duplicate.
+    /// the negated half, which the id decides: ids below `positive_count` are
+    /// positive, the rest negated. Every pattern compiles with `single_match`,
+    /// so Hyperscan reports each id at most once per scan and the callback
+    /// never sees a duplicate.
     pub fn scanInto(
         self: *MatcherDatabase,
         comptime Context: type,
