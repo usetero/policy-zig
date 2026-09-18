@@ -261,6 +261,11 @@ fn mapError(code: c_int) Error {
 // Compile Flags
 // =============================================================================
 
+/// Longest expression `compileMulti` accepts. Kept from the fixed-size buffer
+/// the function used to allocate per pattern, so the accepted input set does
+/// not change now that the buffer is packed.
+pub const max_expression_len: usize = 4096;
+
 /// Flags that modify pattern matching behavior
 pub const Flags = packed struct(c_uint) {
     /// Case-insensitive matching
@@ -432,13 +437,24 @@ pub const Database = struct {
         const expressions = try alloc.alloc([*:0]const u8, patterns.len);
         const flags = try alloc.alloc(c_uint, patterns.len);
         const ids = try alloc.alloc(c_uint, patterns.len);
-        const pattern_bufs = try alloc.alloc([4096]u8, patterns.len);
 
+        // One buffer sized from the real expression lengths, not a fixed 4 KB
+        // block per pattern. The old layout cost 4 KB for an expression that
+        // is typically a few dozen bytes, so a large policy set paid tens of
+        // megabytes of arena and a 4 KB copy per pattern.
+        var total_len: usize = 0;
+        for (patterns) |pat| {
+            if (pat.expression.len >= max_expression_len) return error.Invalid;
+            total_len += pat.expression.len + 1; // room for the null terminator
+        }
+        const pattern_buf = try alloc.alloc(u8, total_len);
+
+        var offset: usize = 0;
         for (patterns, 0..) |pat, i| {
-            if (pat.expression.len >= 4096) return error.Invalid;
-            @memcpy(pattern_bufs[i][0..pat.expression.len], pat.expression);
-            pattern_bufs[i][pat.expression.len] = 0;
-            expressions[i] = @ptrCast(&pattern_bufs[i]);
+            @memcpy(pattern_buf[offset..][0..pat.expression.len], pat.expression);
+            pattern_buf[offset + pat.expression.len] = 0;
+            expressions[i] = @ptrCast(pattern_buf[offset..].ptr);
+            offset += pat.expression.len + 1;
             flags[i] = @bitCast(options.flags.with(pat.flags));
             ids[i] = pat.id;
         }

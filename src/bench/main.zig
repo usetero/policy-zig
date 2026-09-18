@@ -85,6 +85,30 @@ fn buildLogJson(allocator: std.mem.Allocator, n: usize) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
+/// Same shape as `buildLogJson` plus a negated matcher per policy, so each
+/// matcher key compiles a negated database as well as a positive one. Without
+/// this the suite never scans a negated database, and the cost of carrying two
+/// is invisible.
+fn buildLogNegatedJson(allocator: std.mem.Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"policies\":[");
+    for (0..n) |i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":\"logneg-");
+        try appendNum(&buf, allocator, i);
+        try buf.appendSlice(allocator, "\",\"name\":\"logneg-");
+        try appendNum(&buf, allocator, i);
+        try buf.appendSlice(allocator, "\",\"log\":{\"match\":[{\"log_field\":\"body\",\"regex\":\"secret-token-");
+        try appendNum(&buf, allocator, i);
+        try buf.appendSlice(allocator, "-[0-9a-f]{16}\"},{\"log_field\":\"body\",\"regex\":\"healthcheck-");
+        try appendNum(&buf, allocator, i);
+        try buf.appendSlice(allocator, "\",\"negate\":true}],\"keep\":\"none\"}}");
+    }
+    try buf.appendSlice(allocator, "]}");
+    return buf.toOwnedSlice(allocator);
+}
+
 fn buildMetricJson(allocator: std.mem.Allocator, n: usize) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -154,6 +178,83 @@ const LogState = struct {
     }
 
     pub fn run(self: *LogState, alloc: std.mem.Allocator) void {
+        _ = alloc;
+        _ = self.engine.evaluate(.log, &BenchLog.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
+    }
+};
+
+/// Same workload as `LogState`, but reusing one scan state across records via
+/// `EvaluateOptions.scan_state`. Isolates what the per-record clear costs.
+const LogScratchState = struct {
+    registry: *PolicyRegistry,
+    engine: PolicyEngine,
+    scan_state: ScanState,
+    ctx: BenchLog = .{ .body = "normal application log line, nothing sensitive here" },
+    policy_id_buf: [1024][]const u8 = undefined,
+
+    fn init(allocator: std.mem.Allocator, bus: *o11y.EventBus, n: usize) !*LogScratchState {
+        const json = try buildLogJson(allocator, n);
+        defer allocator.free(json);
+        const policies = try policy_zig.parser.parsePoliciesBytes(allocator, json);
+        defer {
+            for (policies) |*p| p.deinit(allocator);
+            allocator.free(policies);
+        }
+        const self = try allocator.create(LogScratchState);
+        self.registry = try allocator.create(PolicyRegistry);
+        self.registry.* = PolicyRegistry.init(allocator, bus);
+        try self.registry.updatePolicies(policies, "bench", .file);
+        self.engine = PolicyEngine.init(bus, self.registry);
+        self.scan_state = ScanState.init();
+        self.ctx = .{ .body = "normal application log line, nothing sensitive here" };
+        return self;
+    }
+
+    fn deinit(self: *LogScratchState, allocator: std.mem.Allocator) void {
+        self.registry.deinit();
+        allocator.destroy(self.registry);
+        allocator.destroy(self);
+    }
+
+    pub fn run(self: *LogScratchState, alloc: std.mem.Allocator) void {
+        _ = alloc;
+        _ = self.engine.evaluate(.log, &BenchLog.accessor, &self.ctx, &self.policy_id_buf, .{
+            .io = std.Options.debug_io,
+            .scan_state = &self.scan_state,
+        });
+    }
+};
+
+const LogNegatedState = struct {
+    registry: *PolicyRegistry,
+    engine: PolicyEngine,
+    ctx: BenchLog = .{ .body = "normal application log line, nothing sensitive here" },
+    policy_id_buf: [1024][]const u8 = undefined,
+
+    fn init(allocator: std.mem.Allocator, bus: *o11y.EventBus, n: usize) !*LogNegatedState {
+        const json = try buildLogNegatedJson(allocator, n);
+        defer allocator.free(json);
+        const policies = try policy_zig.parser.parsePoliciesBytes(allocator, json);
+        defer {
+            for (policies) |*p| p.deinit(allocator);
+            allocator.free(policies);
+        }
+        const self = try allocator.create(LogNegatedState);
+        self.registry = try allocator.create(PolicyRegistry);
+        self.registry.* = PolicyRegistry.init(allocator, bus);
+        try self.registry.updatePolicies(policies, "bench", .file);
+        self.engine = PolicyEngine.init(bus, self.registry);
+        self.ctx = .{ .body = "normal application log line, nothing sensitive here" };
+        return self;
+    }
+
+    fn deinit(self: *LogNegatedState, allocator: std.mem.Allocator) void {
+        self.registry.deinit();
+        allocator.destroy(self.registry);
+        allocator.destroy(self);
+    }
+
+    pub fn run(self: *LogNegatedState, alloc: std.mem.Allocator) void {
         _ = alloc;
         _ = self.engine.evaluate(.log, &BenchLog.accessor, &self.ctx, &self.policy_id_buf, .{ .io = std.Options.debug_io });
     }
@@ -243,8 +344,10 @@ pub fn main() !void {
 
     // Build all states upfront (outside the timed loops), register with zBench.
     // We need bench name buffers to outlive bench.run().
-    var name_bufs: [COUNTS.len * 3][32]u8 = undefined;
+    var name_bufs: [COUNTS.len * 5][32]u8 = undefined;
     var states_log: [COUNTS.len]*LogState = undefined;
+    var states_log_neg: [COUNTS.len]*LogNegatedState = undefined;
+    var states_log_scratch: [COUNTS.len]*LogScratchState = undefined;
     var states_metric: [COUNTS.len]*MetricState = undefined;
     var states_trace: [COUNTS.len]*TraceState = undefined;
 
@@ -252,6 +355,14 @@ pub fn main() !void {
         states_log[idx] = try LogState.init(allocator, bus, n);
         const log_name = try std.fmt.bufPrint(&name_bufs[idx], "log/{d}", .{n});
         try bench.addParam(log_name, @as(*const LogState, states_log[idx]), .{});
+
+        states_log_neg[idx] = try LogNegatedState.init(allocator, bus, n);
+        const log_neg_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len * 3 + idx], "log-neg/{d}", .{n});
+        try bench.addParam(log_neg_name, @as(*const LogNegatedState, states_log_neg[idx]), .{});
+
+        states_log_scratch[idx] = try LogScratchState.init(allocator, bus, n);
+        const log_scratch_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len * 4 + idx], "log-scratch/{d}", .{n});
+        try bench.addParam(log_scratch_name, @as(*const LogScratchState, states_log_scratch[idx]), .{});
 
         states_metric[idx] = try MetricState.init(allocator, bus, n);
         const metric_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len + idx], "metric/{d}", .{n});
@@ -266,6 +377,8 @@ pub fn main() !void {
     try bench.run(io, std.Io.File.stdout());
 
     for (states_log) |s| s.deinit(allocator);
+    for (states_log_neg) |s| s.deinit(allocator);
+    for (states_log_scratch) |s| s.deinit(allocator);
     for (states_metric) |s| s.deinit(allocator);
     for (states_trace) |s| s.deinit(allocator);
 }
