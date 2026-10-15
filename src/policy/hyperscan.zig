@@ -310,17 +310,17 @@ pub const Mode = enum(c_uint) {
 
     /// Add start-of-match tracking with large horizon
     pub fn withSomLarge(self: Mode) c_uint {
-        return @intFromEnum(self) | c.hs_mode_som_horizon_large;
+        return @backingInt(self) | c.hs_mode_som_horizon_large;
     }
 
     /// Add start-of-match tracking with medium horizon
     pub fn withSomMedium(self: Mode) c_uint {
-        return @intFromEnum(self) | c.hs_mode_som_horizon_medium;
+        return @backingInt(self) | c.hs_mode_som_horizon_medium;
     }
 
     /// Add start-of-match tracking with small horizon
     pub fn withSomSmall(self: Mode) c_uint {
-        return @intFromEnum(self) | c.hs_mode_som_horizon_small;
+        return @backingInt(self) | c.hs_mode_som_horizon_small;
     }
 };
 
@@ -398,7 +398,7 @@ pub const Database = struct {
         const rc = c.hs_compile(
             @ptrCast(&pattern_buf),
             @bitCast(options.flags),
-            @intFromEnum(options.mode),
+            @backingInt(options.mode),
             null,
             &db,
             &comp_err,
@@ -467,7 +467,7 @@ pub const Database = struct {
             flags.ptr,
             ids.ptr,
             @intCast(patterns.len),
-            @intFromEnum(options.mode),
+            @backingInt(options.mode),
             null,
             &db,
             &comp_err,
@@ -492,7 +492,7 @@ pub const Database = struct {
             pattern.ptr,
             @bitCast(options.flags),
             pattern.len,
-            @intFromEnum(options.mode),
+            @backingInt(options.mode),
             null,
             &db,
             &comp_err,
@@ -545,7 +545,7 @@ pub const Database = struct {
             ids.ptr,
             lens.ptr,
             @intCast(patterns.len),
-            @intFromEnum(options.mode),
+            @backingInt(options.mode),
             null,
             &db,
             &comp_err,

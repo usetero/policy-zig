@@ -581,7 +581,7 @@ pub const Gauge = struct {
 /// reported measurements over a time interval.
 pub const Sum = struct {
     data_points: std.ArrayList(NumberDataPoint) = .empty,
-    aggregation_temporality: AggregationTemporality = @enumFromInt(0),
+    aggregation_temporality: AggregationTemporality = @fromBackingInt(0),
     is_monotonic: bool = false,
 
     pub const _desc_table = .{
@@ -664,7 +664,7 @@ pub const Sum = struct {
 /// as a Histogram of all reported measurements over a time interval.
 pub const Histogram = struct {
     data_points: std.ArrayList(HistogramDataPoint) = .empty,
-    aggregation_temporality: AggregationTemporality = @enumFromInt(0),
+    aggregation_temporality: AggregationTemporality = @fromBackingInt(0),
 
     pub const _desc_table = .{
         .data_points = fd(1, .{ .repeated = .submessage }),
@@ -745,7 +745,7 @@ pub const Histogram = struct {
 /// as a ExponentialHistogram of all reported double measurements over a time interval.
 pub const ExponentialHistogram = struct {
     data_points: std.ArrayList(ExponentialHistogramDataPoint) = .empty,
-    aggregation_temporality: AggregationTemporality = @enumFromInt(0),
+    aggregation_temporality: AggregationTemporality = @fromBackingInt(0),
 
     pub const _desc_table = .{
         .data_points = fd(1, .{ .repeated = .submessage }),

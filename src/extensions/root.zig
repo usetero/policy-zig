@@ -157,7 +157,7 @@ pub const Extensions = struct {
             .s3_dump => {
                 const handler = self.s3Dump() orelse return null;
                 const slot = handler.resolve(io, signal, policy_id, extension.config) orelse return null;
-                return .{ .handler = @intFromEnum(tag), .slot = slot };
+                return .{ .handler = @backingInt(tag), .slot = slot };
             },
         }
     }

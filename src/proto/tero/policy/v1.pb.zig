@@ -31,7 +31,7 @@ pub const Extension = struct {
     type: []const u8 = &.{},
     version: []const u8 = &.{},
     config: []const u8 = &.{},
-    mode: ExtensionMode = @enumFromInt(0),
+    mode: ExtensionMode = @fromBackingInt(0),
 
     pub const _desc_table = .{
         .type = fd(1, .{ .scalar = .string }),
@@ -2702,7 +2702,7 @@ pub const SyncResponse = struct {
     hash: []const u8 = &.{},
     sync_timestamp_unix_nano: u64 = 0,
     recommended_sync_interval_seconds: u32 = 0,
-    sync_type: SyncType = @enumFromInt(0),
+    sync_type: SyncType = @fromBackingInt(0),
     error_message: []const u8 = &.{},
     extension_configs: std.ArrayList(ExtensionConfig) = .empty,
 

@@ -84,8 +84,7 @@ test "e2e minio: real upload round-trips through a real S3-compatible server" {
     });
     defer dump.deinit();
 
-    const target_json = try std.fmt.allocPrint(
-        allocator,
+    const target_json = try allocator.print(
         \\{{"endpoint": "{s}", "region": "us-east-1", "bucket": "{s}", "prefix": "e2e/", "force_path_style": true}}
     ,
         .{ env.endpoint, env.bucket },

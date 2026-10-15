@@ -310,7 +310,7 @@ Remember: **Optimize for data locality first, algorithmic complexity second.**
 
 # Zig 0.15.x std.io Breaking Changes Reference
 
-> **HISTORICAL (2026-06):** the codebase is now fully Zig 0.16-native — std.Io
+> **HISTORICAL (2026-10):** the codebase is now fully Zig 0.17-native — std.Io
 > is an injected interface (io parameter everywhere), the HTTP data plane rides
 > std.Io.net + std.http.Server with structured cancellation (Io.Group), and
 > request bodies stream through src/pipeline/. The notes below describe the

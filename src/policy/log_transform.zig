@@ -285,7 +285,7 @@ pub fn applyRename(
     // is borrowed by `to_ref` for the duration of the call — do not move
     // its construction into a helper that returns the FieldRef by value.
     const to_path = [_][]const u8{rule.to};
-    const to_attr: AttributePath = .{ .path = .{ .items = @constCast(&to_path), .capacity = 1 } };
+    const to_attr: AttributePath = .{ .path = .fromOwnedSlice(@constCast(&to_path)) };
     const to_ref: FieldRef = switch (from_ref) {
         .log_field => return false,
         .log_attribute => .{ .log_attribute = to_attr },
@@ -436,7 +436,7 @@ const TestContext = struct {
 
 /// Helper to create AttributePath for tests
 fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
-    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}), .capacity = 1 } };
+    return .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{key})) };
 }
 
 test "applyRemove: removes existing field" {

@@ -1215,14 +1215,14 @@ test "PolicyEngine: a policy past the 256th index still matches" {
 
     for (0..count - 1) |i| {
         var p: Policy = .{
-            .id = try std.fmt.allocPrint(allocator, "miss-{d:0>6}", .{i}),
+            .id = try allocator.print("miss-{d:0>6}", .{i}),
             .name = try allocator.dupe(u8, "miss"),
             .enabled = true,
             .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
         };
         try p.target.?.log.match.append(allocator, .{
             .field = .{ .log_field = .LOG_FIELD_BODY },
-            .match = .{ .regex = try std.fmt.allocPrint(allocator, "absent-{d:0>6}", .{i}) },
+            .match = .{ .regex = try allocator.print("absent-{d:0>6}", .{i}) },
         });
         policies[i] = p;
         made += 1;
@@ -1268,7 +1268,7 @@ test "PolicyEngine: truncated matches keep the verdict and are reported" {
 
     for (0..count) |i| {
         var p: Policy = .{
-            .id = try std.fmt.allocPrint(allocator, "drop-{d:0>4}", .{i}),
+            .id = try allocator.print("drop-{d:0>4}", .{i}),
             .name = try allocator.dupe(u8, "drop"),
             .enabled = true,
             .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
@@ -4730,7 +4730,7 @@ test "PolicyEngine: more matching policies than policy_id_buf capacity" {
     var policies: [5]Policy = undefined;
     for (&policies, 0..) |*p, i| {
         var id_buf: [16]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "policy-{d}", .{i}) catch unreachable;
+        const id = std.mem.print(&id_buf, "policy-{d}", .{i}) catch unreachable;
 
         p.* = Policy{
             .id = try allocator.dupe(u8, id),

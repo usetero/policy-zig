@@ -592,8 +592,7 @@ pub const S3Dump = struct {
         const year_day = epoch_secs.getEpochDay().calculateYearDay();
         const month_day = year_day.calculateMonthDay();
         const seq = self.object_seq.fetchAdd(1, .monotonic);
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "{s}{s}/{d:0>4}/{d:0>2}/{d:0>2}/{d:0>2}/{s}-{d}-{d}.ndjson",
             .{
                 prefix,

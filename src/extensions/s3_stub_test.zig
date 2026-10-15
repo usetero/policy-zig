@@ -114,7 +114,7 @@ const StubS3Server = struct {
     }
 
     fn headContains(head: []const u8, needle: []const u8) bool {
-        return std.ascii.indexOfIgnoreCase(head, needle) != null;
+        return std.ascii.findIgnoreCase(head, needle) != null;
     }
 };
 
@@ -128,8 +128,7 @@ fn encodeTargetRef(allocator: std.mem.Allocator, kind: []const u8, name: []const
 }
 
 fn targetJson(allocator: std.mem.Allocator, port: u16) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         \\{{"endpoint": "http://127.0.0.1:{d}", "region": "us-east-1", "bucket": "waste", "prefix": "dumps/"}}
     ,
         .{port},
