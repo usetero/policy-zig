@@ -4,6 +4,7 @@ const std = @import("std");
 
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
+const fdf = protobuf.fdf;
 /// import package google.api
 const google_api = @import("../../google/api.pb.zig");
 /// import package opentelemetry.proto.common.v1
@@ -34,8 +35,8 @@ pub const Extension = struct {
     mode: ExtensionMode = @fromBackingInt(0),
 
     pub const _desc_table = .{
-        .type = fd(1, .{ .scalar = .string }),
-        .version = fd(2, .{ .scalar = .string }),
+        .type = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .version = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .config = fd(3, .{ .scalar = .bytes }),
         .mode = fd(4, .@"enum"),
     };
@@ -58,6 +59,10 @@ pub const Extension = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -121,8 +126,8 @@ pub const ExtensionCapability = struct {
     config: std.ArrayList([]const u8) = .empty,
 
     pub const _desc_table = .{
-        .type = fd(1, .{ .scalar = .string }),
-        .min_version = fd(2, .{ .scalar = .string }),
+        .type = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .min_version = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .config = fd(3, .{ .repeated = .{ .scalar = .bytes } }),
     };
 
@@ -144,6 +149,10 @@ pub const ExtensionCapability = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -205,7 +214,7 @@ pub const ExtensionConfig = struct {
     config: std.ArrayList([]const u8) = .empty,
 
     pub const _desc_table = .{
-        .type = fd(1, .{ .scalar = .string }),
+        .type = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .config = fd(2, .{ .repeated = .{ .scalar = .bytes } }),
     };
 
@@ -227,6 +236,10 @@ pub const ExtensionConfig = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -319,7 +332,7 @@ pub const AttributePath = struct {
     path: std.ArrayList([]const u8) = .empty,
 
     pub const _desc_table = .{
-        .path = fd(1, .{ .repeated = .{ .scalar = .string } }),
+        .path = fdf(1, .{ .repeated = .{ .scalar = .string } }, .{ .utf8_validation = .verify }),
     };
 
     /// Encodes the message to the writer
@@ -340,6 +353,10 @@ pub const AttributePath = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -440,8 +457,8 @@ pub const Value = struct {
             .int_value = fd(2, .{ .scalar = .int64 }),
             .double_value = fd(3, .{ .scalar = .double }),
             .bytes_value = fd(4, .{ .scalar = .bytes }),
-            .hex_value = fd(5, .{ .scalar = .string }),
-            .string_value = fd(6, .{ .scalar = .string }),
+            .hex_value = fdf(5, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .string_value = fdf(6, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         };
     };
 
@@ -467,6 +484,10 @@ pub const Value = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -570,6 +591,10 @@ pub const NumericValue = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -643,7 +668,7 @@ pub const LogTarget = struct {
 
     pub const _desc_table = .{
         .match = fd(1, .{ .repeated = .submessage }),
-        .keep = fd(2, .{ .scalar = .string }),
+        .keep = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .transform = fd(3, .submessage),
         .sample_key = fd(4, .submessage),
     };
@@ -666,6 +691,10 @@ pub const LogTarget = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -764,6 +793,10 @@ pub const LogSampleKey = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -877,12 +910,12 @@ pub const LogMatcher = struct {
         lt: NumericValue,
         lte: NumericValue,
         pub const _desc_table = .{
-            .exact = fd(10, .{ .scalar = .string }),
-            .regex = fd(11, .{ .scalar = .string }),
+            .exact = fdf(10, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .regex = fdf(11, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .exists = fd(12, .{ .scalar = .bool }),
-            .starts_with = fd(13, .{ .scalar = .string }),
-            .ends_with = fd(14, .{ .scalar = .string }),
-            .contains = fd(15, .{ .scalar = .string }),
+            .starts_with = fdf(13, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .ends_with = fdf(14, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .contains = fdf(15, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .equals = fd(22, .submessage),
             .gt = fd(23, .submessage),
             .gte = fd(24, .submessage),
@@ -896,6 +929,14 @@ pub const LogMatcher = struct {
         .case_insensitive = fd(21, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
         .match = fd(null, .{ .oneof = match_union }),
+    };
+
+    /// Options of the fields that have some (`google.protobuf.FieldOptions`).
+    pub const _field_options = .{
+        .exact = .{
+            .@"#raw" = "\x18\x01",
+            .deprecated = true,
+        },
     };
 
     /// Encodes the message to the writer
@@ -916,6 +957,10 @@ pub const LogMatcher = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1000,6 +1045,10 @@ pub const LogTransform = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1098,6 +1147,10 @@ pub const LogRemove = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -1175,8 +1228,8 @@ pub const LogRedact = struct {
     };
 
     pub const _desc_table = .{
-        .replacement = fd(10, .{ .scalar = .string }),
-        .regex = fd(11, .{ .scalar = .string }),
+        .replacement = fdf(10, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .regex = fdf(11, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .field = fd(null, .{ .oneof = field_union }),
     };
 
@@ -1198,6 +1251,10 @@ pub const LogRedact = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1276,7 +1333,7 @@ pub const LogRename = struct {
     };
 
     pub const _desc_table = .{
-        .to = fd(10, .{ .scalar = .string }),
+        .to = fdf(10, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .upsert = fd(11, .{ .scalar = .bool }),
         .from = fd(null, .{ .oneof = from_union }),
     };
@@ -1299,6 +1356,10 @@ pub const LogRename = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1377,7 +1438,7 @@ pub const LogAdd = struct {
     };
 
     pub const _desc_table = .{
-        .value = fd(10, .{ .scalar = .string }),
+        .value = fdf(10, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .upsert = fd(11, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
     };
@@ -1400,6 +1461,10 @@ pub const LogAdd = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1513,6 +1578,10 @@ pub const MetricTarget = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1632,12 +1701,12 @@ pub const MetricMatcher = struct {
         lt: NumericValue,
         lte: NumericValue,
         pub const _desc_table = .{
-            .exact = fd(10, .{ .scalar = .string }),
-            .regex = fd(11, .{ .scalar = .string }),
+            .exact = fdf(10, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .regex = fdf(11, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .exists = fd(12, .{ .scalar = .bool }),
-            .starts_with = fd(13, .{ .scalar = .string }),
-            .ends_with = fd(14, .{ .scalar = .string }),
-            .contains = fd(15, .{ .scalar = .string }),
+            .starts_with = fdf(13, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .ends_with = fdf(14, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .contains = fdf(15, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .equals = fd(22, .submessage),
             .gt = fd(23, .submessage),
             .gte = fd(24, .submessage),
@@ -1651,6 +1720,14 @@ pub const MetricMatcher = struct {
         .case_insensitive = fd(21, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
         .match = fd(null, .{ .oneof = match_union }),
+    };
+
+    /// Options of the fields that have some (`google.protobuf.FieldOptions`).
+    pub const _field_options = .{
+        .exact = .{
+            .@"#raw" = "\x18\x01",
+            .deprecated = true,
+        },
     };
 
     /// Encodes the message to the writer
@@ -1671,6 +1748,10 @@ pub const MetricMatcher = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -1797,6 +1878,10 @@ pub const TraceTarget = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -1892,9 +1977,9 @@ pub const TraceMatcher = struct {
             .scope_attribute = fd(4, .submessage),
             .span_kind = fd(5, .@"enum"),
             .span_status = fd(6, .@"enum"),
-            .event_name = fd(7, .{ .scalar = .string }),
+            .event_name = fdf(7, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .event_attribute = fd(8, .submessage),
-            .link_trace_id = fd(9, .{ .scalar = .string }),
+            .link_trace_id = fdf(9, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         };
     };
 
@@ -1924,12 +2009,12 @@ pub const TraceMatcher = struct {
         lt: NumericValue,
         lte: NumericValue,
         pub const _desc_table = .{
-            .exact = fd(10, .{ .scalar = .string }),
-            .regex = fd(11, .{ .scalar = .string }),
+            .exact = fdf(10, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .regex = fdf(11, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .exists = fd(12, .{ .scalar = .bool }),
-            .starts_with = fd(13, .{ .scalar = .string }),
-            .ends_with = fd(14, .{ .scalar = .string }),
-            .contains = fd(15, .{ .scalar = .string }),
+            .starts_with = fdf(13, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .ends_with = fdf(14, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .contains = fdf(15, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .equals = fd(22, .submessage),
             .gt = fd(23, .submessage),
             .gte = fd(24, .submessage),
@@ -1943,6 +2028,14 @@ pub const TraceMatcher = struct {
         .case_insensitive = fd(21, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
         .match = fd(null, .{ .oneof = match_union }),
+    };
+
+    /// Options of the fields that have some (`google.protobuf.FieldOptions`).
+    pub const _field_options = .{
+        .exact = .{
+            .@"#raw" = "\x18\x01",
+            .deprecated = true,
+        },
     };
 
     /// Encodes the message to the writer
@@ -1963,6 +2056,10 @@ pub const TraceMatcher = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2060,6 +2157,10 @@ pub const TraceSamplingConfig = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2163,9 +2264,9 @@ pub const Policy = struct {
     };
 
     pub const _desc_table = .{
-        .id = fd(1, .{ .scalar = .string }),
-        .name = fd(2, .{ .scalar = .string }),
-        .description = fd(3, .{ .scalar = .string }),
+        .id = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .name = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .description = fdf(3, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .enabled = fd(4, .{ .scalar = .bool }),
         .created_at_unix_nano = fd(5, .{ .scalar = .fixed64 }),
         .modified_at_unix_nano = fd(6, .{ .scalar = .fixed64 }),
@@ -2192,6 +2293,10 @@ pub const Policy = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2277,6 +2382,10 @@ pub const ClientMetadata = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -2357,6 +2466,10 @@ pub const TransformStageStatus = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -2421,10 +2534,10 @@ pub const PolicySyncStatus = struct {
     add: ?TransformStageStatus = null,
 
     pub const _desc_table = .{
-        .id = fd(1, .{ .scalar = .string }),
+        .id = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .match_hits = fd(2, .{ .scalar = .int64 }),
         .match_misses = fd(3, .{ .scalar = .int64 }),
-        .errors = fd(4, .{ .repeated = .{ .scalar = .string } }),
+        .errors = fdf(4, .{ .repeated = .{ .scalar = .string } }, .{ .utf8_validation = .verify }),
         .remove = fd(10, .submessage),
         .redact = fd(11, .submessage),
         .rename = fd(12, .submessage),
@@ -2449,6 +2562,10 @@ pub const PolicySyncStatus = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2557,6 +2674,10 @@ pub const VolumeStats = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -2621,7 +2742,7 @@ pub const SyncRequest = struct {
         .client_metadata = fd(1, .submessage),
         .full_sync = fd(2, .{ .scalar = .bool }),
         .last_sync_timestamp_unix_nano = fd(3, .{ .scalar = .fixed64 }),
-        .last_successful_hash = fd(4, .{ .scalar = .string }),
+        .last_successful_hash = fdf(4, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .policy_statuses = fd(5, .{ .repeated = .submessage }),
         .volume = fd(6, .submessage),
     };
@@ -2644,6 +2765,10 @@ pub const SyncRequest = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2708,11 +2833,11 @@ pub const SyncResponse = struct {
 
     pub const _desc_table = .{
         .policies = fd(1, .{ .repeated = .submessage }),
-        .hash = fd(2, .{ .scalar = .string }),
+        .hash = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .sync_timestamp_unix_nano = fd(3, .{ .scalar = .fixed64 }),
         .recommended_sync_interval_seconds = fd(4, .{ .scalar = .uint32 }),
         .sync_type = fd(5, .@"enum"),
-        .error_message = fd(6, .{ .scalar = .string }),
+        .error_message = fdf(6, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .extension_configs = fd(7, .{ .repeated = .submessage }),
     };
 
@@ -2734,6 +2859,10 @@ pub const SyncResponse = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2792,6 +2921,16 @@ pub fn PolicyService(comptime UserDataType: type, comptime ErrorSet: type) type 
         pub const package = "tero.policy.v1";
         pub const service_name = "PolicyService";
 
+        /// Options of the methods that have some (`google.protobuf.MethodOptions`).
+        pub const _method_options = .{
+            .Sync = .{
+                .@"#raw" = "\x82\xd3\xe4\x93\x02\x14\"\x0f/v1/policy/sync:\x01*",
+                .@"google.api.http" = .{
+                    .post = "/v1/policy/sync",
+                    .body = "*",
+                },
+            },
+        };
         /// Sync policies with the provider
         Sync: *const fn (userdata: *UserDataType, request: SyncRequest) ErrorSet!SyncResponse,
     };
@@ -2810,8 +2949,8 @@ pub const ExtensionTarget = struct {
     config: []const u8 = &.{},
 
     pub const _desc_table = .{
-        .kind = fd(1, .{ .scalar = .string }),
-        .name = fd(2, .{ .scalar = .string }),
+        .kind = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .name = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .config = fd(3, .{ .scalar = .bytes }),
     };
 
@@ -2833,6 +2972,10 @@ pub const ExtensionTarget = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2895,8 +3038,8 @@ pub const ExtensionTargetRef = struct {
     name: []const u8 = &.{},
 
     pub const _desc_table = .{
-        .kind = fd(1, .{ .scalar = .string }),
-        .name = fd(2, .{ .scalar = .string }),
+        .kind = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .name = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
     };
 
     /// Encodes the message to the writer
@@ -2917,6 +3060,10 @@ pub const ExtensionTargetRef = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2967,4 +3114,37 @@ pub const ExtensionTargetRef = struct {
     ) !@This() {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
+};
+
+/// Options of the files of this package that have some
+/// (`google.protobuf.FileOptions`), by file name.
+pub const _file_options = .{
+    .@"tero/policy/v1/extension.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
+    .@"tero/policy/v1/shared.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
+    .@"tero/policy/v1/log.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
+    .@"tero/policy/v1/metric.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
+    .@"tero/policy/v1/trace.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
+    .@"tero/policy/v1/policy.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
+    .@"tero/policy/v1/tero_extensions.proto" = .{
+        .@"#raw" = "Z/github.com/usetero/policy/gen/go/tero/policy/v1",
+        .go_package = "github.com/usetero/policy/gen/go/tero/policy/v1",
+    },
 };
