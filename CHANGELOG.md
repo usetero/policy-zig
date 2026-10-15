@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/usetero/policy-zig/compare/v0.7.4...v0.8.0) (2026-10-15)
+
+
+### Features
+
+* upgrade to Zig 0.17.0 ([#106](https://github.com/usetero/policy-zig/issues/106)) ([5679b3f](https://github.com/usetero/policy-zig/commit/5679b3f10d75102370da35cf7c2af1747ec991c8))
+
 ## [0.7.4](https://github.com/usetero/policy-zig/compare/v0.7.3...v0.7.4) (2026-09-18)
 
 
