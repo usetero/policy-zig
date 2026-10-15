@@ -469,9 +469,9 @@ pub fn updateTracestateInPlaceWithRv(
     // Build the new ot entry: "ot=th:THRESHOLD" or "ot=th:THRESHOLD;rv:VALUE"
     var new_ot_buf: [64]u8 = undefined;
     const new_ot = if (rv_hex) |rv|
-        std.fmt.bufPrint(&new_ot_buf, "ot=th:{s};rv:{s}", .{ threshold_hex, rv }) catch return null
+        std.mem.print(&new_ot_buf, "ot=th:{s};rv:{s}", .{ threshold_hex, rv }) catch return null
     else
-        std.fmt.bufPrint(&new_ot_buf, "ot=th:{s}", .{threshold_hex}) catch return null;
+        std.mem.print(&new_ot_buf, "ot=th:{s}", .{threshold_hex}) catch return null;
 
     var pos: usize = 0;
 
@@ -1074,7 +1074,7 @@ test "ProbabilisticSampler: binary trace_id approximate distribution for 50%" {
     const total: u32 = 10000;
 
     for (0..total) |i| {
-        var trace_id = [_]u8{0} ** 16;
+        var trace_id: [16]u8 = @splat(0);
         // Vary the randomness bytes (last 7 bytes) to sweep the full 56-bit range.
         trace_id[9] = @intCast((i * 256 / total) & 0xff);
         trace_id[10] = @intCast(i & 0xff);

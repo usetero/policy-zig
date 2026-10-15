@@ -7,7 +7,7 @@ pub fn formatTimestamp(io: std.Io, buf: []u8) []const u8 {
     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
 
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{
+    return std.mem.print(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{
         day_seconds.getHoursIntoDay(),
         day_seconds.getMinutesIntoHour(),
         day_seconds.getSecondsIntoMinute(),
@@ -23,7 +23,7 @@ pub fn formatTimestampIso(io: std.Io, buf: []u8) []const u8 {
     const month_day = year_day.calculateMonthDay();
     const day_seconds = epoch_seconds.getDaySeconds();
 
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         year_day.year,
         month_day.month.numeric(),
         month_day.day_index + 1,

@@ -17,6 +17,7 @@ const LogAccessor = policy_zig.LogAccessor;
 const MetricAccessor = policy_zig.MetricAccessor;
 const TraceAccessor = policy_zig.TraceAccessor;
 const TypedValue = policy_zig.TypedValue;
+const ScanState = policy_zig.ScanState;
 const NoopEventBus = o11y.NoopEventBus;
 
 const COUNTS = [_]usize{ 1, 10, 100, 1000 };
@@ -63,7 +64,7 @@ const BenchTrace = struct {
 
 fn appendNum(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: usize) !void {
     var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+    const s = std.mem.print(&tmp, "{d}", .{n}) catch unreachable;
     try buf.appendSlice(allocator, s);
 }
 
@@ -331,9 +332,7 @@ const TraceState = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init(std.Options.debug_io);
@@ -353,23 +352,23 @@ pub fn main() !void {
 
     for (COUNTS, 0..) |n, idx| {
         states_log[idx] = try LogState.init(allocator, bus, n);
-        const log_name = try std.fmt.bufPrint(&name_bufs[idx], "log/{d}", .{n});
+        const log_name = try std.mem.print(&name_bufs[idx], "log/{d}", .{n});
         try bench.addParam(log_name, @as(*const LogState, states_log[idx]), .{});
 
         states_log_neg[idx] = try LogNegatedState.init(allocator, bus, n);
-        const log_neg_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len * 3 + idx], "log-neg/{d}", .{n});
+        const log_neg_name = try std.mem.print(&name_bufs[COUNTS.len * 3 + idx], "log-neg/{d}", .{n});
         try bench.addParam(log_neg_name, @as(*const LogNegatedState, states_log_neg[idx]), .{});
 
         states_log_scratch[idx] = try LogScratchState.init(allocator, bus, n);
-        const log_scratch_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len * 4 + idx], "log-scratch/{d}", .{n});
+        const log_scratch_name = try std.mem.print(&name_bufs[COUNTS.len * 4 + idx], "log-scratch/{d}", .{n});
         try bench.addParam(log_scratch_name, @as(*const LogScratchState, states_log_scratch[idx]), .{});
 
         states_metric[idx] = try MetricState.init(allocator, bus, n);
-        const metric_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len + idx], "metric/{d}", .{n});
+        const metric_name = try std.mem.print(&name_bufs[COUNTS.len + idx], "metric/{d}", .{n});
         try bench.addParam(metric_name, @as(*const MetricState, states_metric[idx]), .{});
 
         states_trace[idx] = try TraceState.init(allocator, bus, n);
-        const trace_name = try std.fmt.bufPrint(&name_bufs[COUNTS.len * 2 + idx], "trace/{d}", .{n});
+        const trace_name = try std.mem.print(&name_bufs[COUNTS.len * 2 + idx], "trace/{d}", .{n});
         try bench.addParam(trace_name, @as(*const TraceState, states_trace[idx]), .{});
     }
 

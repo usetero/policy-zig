@@ -107,8 +107,8 @@ pub const VolumeCounters = struct {
     /// replaying it, matching the per-policy counters above.
     pub fn readAndReset(self: *VolumeCounters) policy_provider.VolumeSnapshot {
         var out: policy_provider.VolumeSnapshot = .{};
-        inline for (@typeInfo(policy_provider.VolumeSnapshot).@"struct".fields) |f| {
-            @field(out, f.name) = @field(self, f.name).swap(0, .monotonic);
+        inline for (@typeInfo(policy_provider.VolumeSnapshot).@"struct".field_names) |name| {
+            @field(out, name) = @field(self, name).swap(0, .monotonic);
         }
         return out;
     }

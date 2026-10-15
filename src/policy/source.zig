@@ -9,7 +9,7 @@ pub const SourceType = enum(u8) {
     http = 1,
 
     pub fn priority(self: SourceType) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

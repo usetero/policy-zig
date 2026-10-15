@@ -166,7 +166,7 @@ pub const FileProvider = struct {
     }
 
     fn watchLoop(self: *FileProvider) void {
-        if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        if (builtin.target.os.tag == .linux or builtin.target.os.tag == .macos) {
             self.watchLoopPoll() catch |err| {
                 const event: FileWatcherError = .{ .err = @errorName(err) };
                 self.bus.err(event);

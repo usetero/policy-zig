@@ -211,7 +211,7 @@ pub const EventBus = struct {
     /// Check if events at the given level would be emitted.
     /// Use to guard expensive event construction in hot paths.
     pub inline fn isEnabled(self: *const EventBus, comptime level: Level) bool {
-        return @intFromEnum(level) >= @intFromEnum(self.min_level);
+        return @backingInt(level) >= @backingInt(self.min_level);
     }
 
     /// Emit a debug event
@@ -247,7 +247,7 @@ pub const EventBus = struct {
     ) void {
         const name = comptime eventName(@TypeOf(event));
         // Check level filter
-        if (@intFromEnum(level) < @intFromEnum(self.min_level)) {
+        if (@backingInt(level) < @backingInt(self.min_level)) {
             return;
         }
 
@@ -282,10 +282,8 @@ pub const EventBus = struct {
 
         // Event fields
         const T = @TypeOf(event);
-        const fields = @typeInfo(T).@"struct".fields;
-        inline for (fields) |field| {
-            const value = @field(event, field.name);
-            writeField(writer, field.name, value);
+        inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+            writeField(writer, field_name, @field(event, field_name));
         }
 
         // Span ID and elapsed time if we have a span
@@ -402,9 +400,10 @@ pub fn SpanGuard(comptime StartedEvent: type) type {
 
         /// Terminate the span as a failure, recording the error name.
         ///
-        /// Pair with `errdefer |err| span.failed(err)` so a function that
-        /// returns an error still closes its span. Emitted at `.err` so a
-        /// failure stays visible even when the span itself is a debug span.
+        /// Call from `inner() catch |err| { span.failed(err); return err; }`
+        /// so a function that returns an error still closes its span.
+        /// Emitted at `.err` so a failure stays visible even when the span
+        /// itself is a debug span.
         pub fn failed(self: *Self, err: anyerror) void {
             if (self.terminated) return;
             self.terminated = true;

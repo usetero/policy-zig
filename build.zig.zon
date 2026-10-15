@@ -25,7 +25,7 @@
     .fingerprint = 0xd8303674de69f7e7, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,22 +33,21 @@
     // internet connectivity.
     .dependencies = .{
         .protobuf = .{
-            .url = "git+https://github.com/jaronoff97/zig-protobuf?ref=json-bytes-hex-and-wire-perf#918588bd2692e76c96e262ee48ec1cf23190cd08",
-            .hash = "protobuf-5.0.0-0e82au0yLABQ5CCO9OpPIqmq-S1rPOEq7iS2Ard8_OU6",
+            .url = "git+https://github.com/jaronoff97/zig-protobuf.git#ea3d361877be1e765ef8670a8c86c3c39a24bc3e",
+            .hash = "protobuf-7.0.0-0e82apRWNwArHKGcy5yxjfQM2Aof2DyE4cNnvP5l4TzG",
         },
         .regex = .{
-            .url = "git+https://github.com/quangd42/regex.zig.git#01a591df26b9d21e842d85ecbb4e16ee5a40eb93",
-            .hash = "regex-0.0.0-V8KKSZgdAwByxie7A2ODgrnew7XqS2VJIu2SJh8Jl7LV",
+            .url = "git+https://github.com/quangd42/regex.zig.git#05f09f23c61a7d08ad85256c0300cb18d89d85ef",
+            .hash = "regex-0.2.0-V8KKSc5OBAAEU6Uycs0NFSRtnVak__NqaocwJOr7BP5d",
         },
-        // Pinned to the immutable v0.13.0 tag commit via git+https. Two reasons
-        // for this exact pin: (1) a branch/archive URL tracks a moving ref, so
-        // its content hash drifts on every upstream push and breaks downstream
-        // `zig build --fetch`; (2) v0.14.0 dropped the public `addModule("zbench")`
-        // from its build.zig, so newer commits can't satisfy `dep.module("zbench")`.
-        // v0.13.0 is the latest release that exports the module.
+        // Pinned to an exact commit via git+https: a branch/archive URL tracks a
+        // moving ref, so its content hash drifts on every upstream push and
+        // breaks downstream `zig build --fetch`. f12a226 ("fix: build module")
+        // restores the public `addModule("zbench")` that v0.14.0 dropped and
+        // builds on Zig 0.17.
         .zbench = .{
-            .url = "git+https://github.com/hendriknielaender/zBench.git#b2b89c475e3ef1bb2bd71255c80478a82d3e0ca8",
-            .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
+            .url = "git+https://github.com/hendriknielaender/zBench.git#f12a2262bcd9d300207890555c577da5e29de453",
+            .hash = "zbench-0.14.1-YTdc781OAQCR6wxqkgAwm9bG4TnFGzm8c9aE-ZPiTAU1",
         },
         .z3 = .{
             .url = "git+https://codeberg.org/fellowtraveler/z3#8fb97954064e24ceaf790cbb2a9ea49dfdd2c79c",

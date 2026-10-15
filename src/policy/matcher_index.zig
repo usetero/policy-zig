@@ -88,7 +88,7 @@ pub const CompilationErrors = struct {
         const a = self.arena.allocator();
         try self.items.append(a, .{
             .policy_id = try a.dupe(u8, policy_id),
-            .message = try std.fmt.allocPrint(a, fmt, args),
+            .message = try a.print(fmt, args),
         });
     }
 };
@@ -1624,10 +1624,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             // Create an AttributePath with the copied path segments
             // Cast is safe because we own these allocations and they won't be mutated
             const attr_path: AttributePath = .{
-                .path = .{
-                    .items = @constCast(path_copy),
-                    .capacity = path_copy.len,
-                },
+                .path = .fromOwnedSlice(@constCast(path_copy)),
             };
 
             switch (T) {
@@ -1925,8 +1922,30 @@ fn buildIndex(
     var span = bus.started(.info, started_event);
     // Close the span on every way out. Without this a failed build leaves the
     // span open in the telemetry. See issue #100.
-    errdefer |err| span.failed(err);
+    const index = buildIndexInner(allocator, T, bus, policies_slice, errors, extension_resolver, options) catch |err| {
+        span.failed(err);
+        return err;
+    };
 
+    const completed_event: MatcherIndexBuildCompleted = .{
+        .database_count = index.databases.count(),
+        .matcher_key_count = index.matcher_keys.len,
+        .policy_count = index.policies.len,
+    };
+    span.completed(completed_event);
+
+    return index;
+}
+
+fn buildIndexInner(
+    allocator: std.mem.Allocator,
+    comptime T: TelemetryType,
+    bus: *EventBus,
+    policies_slice: []const Policy,
+    errors: ?*CompilationErrors,
+    extension_resolver: ?policy_types.ExtensionResolver,
+    options: IndexOptions,
+) !MatcherIndexType(T) {
     if (policies_slice.len > max_policies) {
         // The error alone tells a host nothing about how far over it is, and a
         // host whose own metric counts policies as loaded would read the
@@ -1957,16 +1976,7 @@ fn buildIndex(
         try builder.processPolicy(policy, @intCast(i));
     }
 
-    var index = try builder.finish();
-
-    const completed_event: MatcherIndexBuildCompleted = .{
-        .database_count = index.databases.count(),
-        .matcher_key_count = index.matcher_keys.len,
-        .policy_count = index.policies.len,
-    };
-    span.completed(completed_event);
-
-    return index;
+    return builder.finish();
 }
 
 // =============================================================================
@@ -2582,22 +2592,13 @@ test "LogMatcherKey: hash and equality" {
     const key2: LogMatcherKey = .{ .field = .{ .log_field = .LOG_FIELD_BODY } };
     const key3: LogMatcherKey = .{ .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT } };
     const key4: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"service"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"service"})) } },
     };
     const key5: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"service"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"service"})) } },
     };
     const key6: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"env"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"env"})) } },
     };
 
     try testing.expect(key1.eql(key2));
@@ -2609,22 +2610,13 @@ test "LogMatcherKey: hash and equality" {
 
     // Test nested paths
     const key7: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{ "http", "method" }),
-            .capacity = 2,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{ "http", "method" })) } },
     };
     const key8: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{ "http", "method" }),
-            .capacity = 2,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{ "http", "method" })) } },
     };
     const key9: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{ "http", "status" }),
-            .capacity = 2,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{ "http", "status" })) } },
     };
 
     try testing.expect(key7.eql(key8));
@@ -2637,22 +2629,13 @@ test "MetricMatcherKey: hash and equality" {
     const key2: MetricMatcherKey = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key3: MetricMatcherKey = .{ .field = .{ .metric_field = .METRIC_FIELD_UNIT } };
     const key4: MetricMatcherKey = .{
-        .field = .{ .datapoint_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"status"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .datapoint_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"status"})) } },
     };
     const key5: MetricMatcherKey = .{
-        .field = .{ .datapoint_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"status"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .datapoint_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"status"})) } },
     };
     const key6: MetricMatcherKey = .{
-        .field = .{ .datapoint_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"env"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .datapoint_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"env"})) } },
     };
 
     try testing.expect(key1.eql(key2));
@@ -2666,16 +2649,10 @@ test "MetricMatcherKey: hash and equality" {
 test "FieldRef: isKeyed" {
     const log_field: FieldRef = .{ .log_field = .LOG_FIELD_BODY };
     const log_attr: FieldRef = .{
-        .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"service"}),
-            .capacity = 1,
-        } },
+        .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"service"})) },
     };
     const resource_attr: FieldRef = .{
-        .resource_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"env"}),
-            .capacity = 1,
-        } },
+        .resource_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"env"})) },
     };
 
     try testing.expect(!log_field.isKeyed());
@@ -2873,10 +2850,10 @@ test "LogMatcherIndex: build survives every allocation failure" {
     // failures into "this policy is invalid, keep building the rest" (see the
     // spec's Error Handling section), so an induced failure does not always
     // surface as error.OutOfMemory. What must hold at every fault point is
-    // containment: no leak, no double free, no crash. A DebugAllocator checks
+    // containment: no leak, no double free, no crash. A SafeAllocator checks
     // all three.
     //
-    // Scope of the guarantee: the DebugAllocator only sees Zig-side
+    // Scope of the guarantee: the SafeAllocator only sees Zig-side
     // allocations. Hyperscan and the third-party regex engine allocate through
     // the C allocator, so failures inside them are neither injected nor
     // checked here. The fixture also carries no extension, so the extension
@@ -2890,20 +2867,20 @@ test "LogMatcherIndex: build survives every allocation failure" {
         // which allocation was made to fail.
         errdefer std.debug.print("containment failed at fail_index={d}\n", .{fail_index});
 
-        var dbg: std.heap.DebugAllocator(.{}) = .init;
+        var dbg: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
         var failing: testing.FailingAllocator = .init(dbg.allocator(), .{ .fail_index = fail_index });
 
         const result = Case.run(failing.allocator(), policy);
         const induced = failing.has_induced_failure;
         // Take the leak verdict before propagating anything, so deinit runs on
         // every path including an unexpected error.
-        const leak_check = dbg.deinit();
+        const leaks = dbg.deinit();
 
         result catch |err| switch (err) {
             error.OutOfMemory => {},
             else => return err,
         };
-        try testing.expectEqual(std.heap.Check.ok, leak_check);
+        try testing.expectEqual(0, leaks);
 
         // No failure was induced, so the sweep has passed every allocation.
         if (!induced) return;
@@ -3167,10 +3144,7 @@ test "LogMatcherIndex: build with keyed matchers" {
     try testing.expect(!index.isEmpty());
 
     const expected_key: LogMatcherKey = .{
-        .field = .{ .log_attribute = .{ .path = .{
-            .items = @constCast(&[_][]const u8{"service"}),
-            .capacity = 1,
-        } } },
+        .field = .{ .log_attribute = .{ .path = .fromOwnedSlice(@constCast(&[_][]const u8{"service"})) } },
     };
     const db = index.getDatabase(expected_key);
     try testing.expect(db != null);
@@ -3337,17 +3311,14 @@ test "MetricMatcherIndex: metric_type with null match (implicit exists)" {
         .enabled = true,
         .target = .{
             .metric = .{
-                .match = .{
-                    .items = @constCast(&[_]MetricMatcher{
-                        .{
-                            .field = .{ .metric_type = .METRIC_TYPE_GAUGE },
-                            .match = null, // <-- This is what the HTTP sync produces
-                            .negate = false,
-                            .case_insensitive = false,
-                        },
-                    }),
-                    .capacity = 1,
-                },
+                .match = .fromOwnedSlice(@constCast(&[_]MetricMatcher{
+                    .{
+                        .field = .{ .metric_type = .METRIC_TYPE_GAUGE },
+                        .match = null, // <-- This is what the HTTP sync produces
+                        .negate = false,
+                        .case_insensitive = false,
+                    },
+                })),
                 .keep = false,
             },
         },
@@ -3375,26 +3346,22 @@ test "TraceMatcherIndex: span_kind null match with second resource_attribute mat
         .enabled = true,
         .target = .{
             .trace = .{
-                .match = .{
-                    .items = @constCast(&[_]TraceMatcher{
-                        .{
-                            .field = .{ .span_kind = .SPAN_KIND_INTERNAL },
-                            .match = null, // implicit exists via HTTP sync
-                            .negate = false,
-                            .case_insensitive = false,
-                        },
-                        .{
-                            .field = .{ .resource_attribute = .{ .path = .{
-                                .items = @constCast(&[_][]const u8{"service.name"}),
-                                .capacity = 1,
-                            } } },
-                            .match = .{ .exact = "frontend" },
-                            .negate = false,
-                            .case_insensitive = false,
-                        },
-                    }),
-                    .capacity = 2,
-                },
+                .match = .fromOwnedSlice(@constCast(&[_]TraceMatcher{
+                    .{
+                        .field = .{ .span_kind = .SPAN_KIND_INTERNAL },
+                        .match = null, // implicit exists via HTTP sync
+                        .negate = false,
+                        .case_insensitive = false,
+                    },
+                    .{
+                        .field = .{ .resource_attribute = .{
+                            .path = .fromOwnedSlice(@constCast(&[_][]const u8{"service.name"})),
+                        } },
+                        .match = .{ .exact = "frontend" },
+                        .negate = false,
+                        .case_insensitive = false,
+                    },
+                })),
             },
         },
     };
@@ -3427,17 +3394,14 @@ test "TraceMatcherIndex: span_kind with null match (implicit exists)" {
         .enabled = true,
         .target = .{
             .trace = .{
-                .match = .{
-                    .items = @constCast(&[_]TraceMatcher{
-                        .{
-                            .field = .{ .span_kind = .SPAN_KIND_INTERNAL },
-                            .match = null, // <-- HTTP sync produces this
-                            .negate = false,
-                            .case_insensitive = false,
-                        },
-                    }),
-                    .capacity = 1,
-                },
+                .match = .fromOwnedSlice(@constCast(&[_]TraceMatcher{
+                    .{
+                        .field = .{ .span_kind = .SPAN_KIND_INTERNAL },
+                        .match = null, // <-- HTTP sync produces this
+                        .negate = false,
+                        .case_insensitive = false,
+                    },
+                })),
             },
         },
     };

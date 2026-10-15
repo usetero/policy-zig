@@ -20,6 +20,7 @@ const S3Dump = s3_dump_mod.S3Dump;
 // dominate the measurement. smp_allocator is the ReleaseFast-appropriate
 // general-purpose allocator.
 const gpa = std.heap.smp_allocator;
+const rule: [78]u8 = @splat('-');
 
 const Env = struct {
     access_key: []const u8,
@@ -82,8 +83,7 @@ fn makeDump(
     });
     errdefer dump.deinit();
 
-    const target_json = try std.fmt.allocPrint(
-        gpa,
+    const target_json = try gpa.print(
         \\{{"endpoint": "{s}", "region": "us-east-1", "bucket": "{s}", "prefix": "bench/", "force_path_style": true}}
     ,
         .{ endpoint_override orelse env.endpoint, env.bucket },
@@ -98,7 +98,7 @@ fn makeDump(
     errdefer gpa.free(slots);
     for (slots, 0..) |*slot, i| {
         var id_buf: [32]u8 = undefined;
-        const policy_id = try std.fmt.bufPrint(&id_buf, "bench-policy-{d:0>3}", .{i});
+        const policy_id = try std.mem.print(&id_buf, "bench-policy-{d:0>3}", .{i});
         slot.* = dump.resolve(io, .log, policy_id, ref) orelse return error.ResolveFailed;
     }
     return .{ .dump = dump, .slots = slots };
@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         "\ns3-dump scale benchmarks ({s}, record={d}B)\n" ++
             "{s}\n",
-        .{ env.endpoint, record_line.len, "-" ** 78 },
+        .{ env.endpoint, record_line.len, &rule },
     );
 
     // -------------------------------------------------------------------
@@ -280,5 +280,5 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    std.debug.print("{s}\n", .{"-" ** 78});
+    std.debug.print("{s}\n", .{&rule});
 }

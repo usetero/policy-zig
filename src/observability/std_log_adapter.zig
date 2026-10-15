@@ -62,7 +62,7 @@ pub const StdLogAdapter = struct {
         const event_level = mapLevel(level);
 
         // Check level filter
-        if (@intFromEnum(event_level) < @intFromEnum(bus.min_level)) {
+        if (@backingInt(event_level) < @backingInt(bus.min_level)) {
             return;
         }
 

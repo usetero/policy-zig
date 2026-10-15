@@ -44,8 +44,8 @@ pub const VolumeSnapshot = struct {
     span_bytes: i64 = 0,
 
     pub fn isZero(self: VolumeSnapshot) bool {
-        inline for (@typeInfo(VolumeSnapshot).@"struct".fields) |f| {
-            if (@field(self, f.name) != 0) return false;
+        inline for (@typeInfo(VolumeSnapshot).@"struct".field_names) |name| {
+            if (@field(self, name) != 0) return false;
         }
         return true;
     }
@@ -163,9 +163,9 @@ test "VolumeSnapshot.isZero: any single tracked field defeats omission" {
 
     // A consumer tracking only one signal, or only bytes, must still be
     // reported — omission is reserved for "nothing observed at all".
-    inline for (@typeInfo(VolumeSnapshot).@"struct".fields) |f| {
+    inline for (@typeInfo(VolumeSnapshot).@"struct".field_names) |name| {
         var snap: VolumeSnapshot = .{};
-        @field(snap, f.name) = 1;
+        @field(snap, name) = 1;
         try testing.expect(!snap.isZero());
     }
 }

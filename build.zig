@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/extensions/s3_bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "proto", .module = proto_mod },
                 .{ .name = "policy_zig", .module = mod },
@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) void {
     s3_bench_step.dependOn(&run_s3_bench.step);
 
     // Benchmarks
-    const zbench_dep = b.dependency("zbench", .{ .target = target, .optimize = .ReleaseFast });
+    const zbench_dep = b.dependency("zbench", .{ .target = target, .optimize = .fast });
     const zbench_mod = zbench_dep.module("zbench");
 
     const bench_exe = b.addExecutable(.{
@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "policy_zig", .module = mod },
                 .{ .name = "observability", .module = o11y_mod },
@@ -180,6 +180,6 @@ pub fn build(b: *std.Build) void {
                 b.path("proto"),
             },
         });
-        gen_proto.dependOn(&protoc_step.step);
+        gen_proto.dependOn(protoc_step.step);
     }
 }

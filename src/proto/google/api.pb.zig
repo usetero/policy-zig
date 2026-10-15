@@ -4,6 +4,7 @@ const std = @import("std");
 
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
+const fdf = protobuf.fdf;
 /// import package google.protobuf
 const google_protobuf = @import("protobuf.pb.zig");
 
@@ -37,6 +38,10 @@ pub const Http = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -376,19 +381,19 @@ pub const HttpRule = struct {
         patch: []const u8,
         custom: CustomHttpPattern,
         pub const _desc_table = .{
-            .get = fd(2, .{ .scalar = .string }),
-            .put = fd(3, .{ .scalar = .string }),
-            .post = fd(4, .{ .scalar = .string }),
-            .delete = fd(5, .{ .scalar = .string }),
-            .patch = fd(6, .{ .scalar = .string }),
+            .get = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .put = fdf(3, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .post = fdf(4, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .delete = fdf(5, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .patch = fdf(6, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
             .custom = fd(8, .submessage),
         };
     };
 
     pub const _desc_table = .{
-        .selector = fd(1, .{ .scalar = .string }),
-        .body = fd(7, .{ .scalar = .string }),
-        .response_body = fd(12, .{ .scalar = .string }),
+        .selector = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .body = fdf(7, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .response_body = fdf(12, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .additional_bindings = fd(11, .{ .repeated = .submessage }),
         .pattern = fd(null, .{ .oneof = pattern_union }),
     };
@@ -411,6 +416,10 @@ pub const HttpRule = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -469,8 +478,8 @@ pub const CustomHttpPattern = struct {
     path: []const u8 = &.{},
 
     pub const _desc_table = .{
-        .kind = fd(1, .{ .scalar = .string }),
-        .path = fd(2, .{ .scalar = .string }),
+        .kind = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .path = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
     };
 
     /// Encodes the message to the writer
@@ -491,6 +500,10 @@ pub const CustomHttpPattern = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -542,3 +555,8 @@ pub const CustomHttpPattern = struct {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
 };
+
+pub const http = protobuf.Extension(google_protobuf.MethodOptions, ?HttpRule, fd(72295728, .submessage), "google.api.http", null, .{});
+
+/// Extensions declared in this package, for `protobuf.ExtensionRegistry.init`.
+pub const extensions = .{http};

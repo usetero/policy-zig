@@ -65,17 +65,17 @@ pub const Span = struct {
         if (elapsed_ns < std.time.ns_per_ms) {
             // Microseconds
             const us = @divFloor(elapsed_ns, std.time.ns_per_us);
-            return std.fmt.bufPrint(buf, "{d}µs", .{us}) catch "?";
+            return std.mem.print(buf, "{d}µs", .{us}) catch "?";
         } else if (elapsed_ns < std.time.ns_per_s) {
             // Milliseconds
             const ms = @divFloor(elapsed_ns, std.time.ns_per_ms);
-            return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";
+            return std.mem.print(buf, "{d}ms", .{ms}) catch "?";
         } else {
             // Seconds with one decimal
             const ms = @divFloor(elapsed_ns, std.time.ns_per_ms);
             const secs = @divFloor(ms, 1000);
             const frac = @divFloor(@mod(ms, 1000), 100);
-            return std.fmt.bufPrint(buf, "{d}.{d}s", .{ secs, frac }) catch "?";
+            return std.mem.print(buf, "{d}.{d}s", .{ secs, frac }) catch "?";
         }
     }
 };

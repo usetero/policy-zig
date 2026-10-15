@@ -292,11 +292,16 @@ pub const HttpProvider = struct {
         const fetch_started: HttpFetchStarted = .{};
         const fetch_completed: HttpFetchCompleted = .{};
         var span = self.bus.started(.debug, fetch_started);
-        // Registered first, so it runs last: on the error path `failed` has
-        // already terminated the span and this is a no-op. Without it a failed
-        // fetch was reported as an ordinary completion. See issue #100.
-        defer span.completed(fetch_completed);
-        errdefer |err| span.failed(err);
+        // Report a failed fetch as a failure, not an ordinary completion.
+        // See issue #100.
+        self.fetchAndNotifyInner() catch |err| {
+            span.failed(err);
+            return err;
+        };
+        span.completed(fetch_completed);
+    }
+
+    fn fetchAndNotifyInner(self: *HttpProvider) !void {
         var result = try self.fetchPolicies();
         defer result.parsed.deinit();
         defer self.allocator.free(result.response_body);
@@ -445,22 +450,10 @@ pub const HttpProvider = struct {
         // Create SyncRequest with the new structure
         const sync_request: SyncRequest = .{
             .client_metadata = .{
-                .supported_extensions = .{
-                    .items = supported_extensions,
-                    .capacity = supported_extensions.len,
-                },
-                .supported_policy_stages = .{
-                    .items = @constCast(supported_policy_stages),
-                    .capacity = supported_policy_stages.len,
-                },
-                .resource_attributes = .{
-                    .items = resource_attributes.items,
-                    .capacity = resource_attributes.capacity,
-                },
-                .labels = .{
-                    .items = labels.items,
-                    .capacity = labels.capacity,
-                },
+                .supported_extensions = .fromOwnedSlice(supported_extensions),
+                .supported_policy_stages = .fromOwnedSlice(@constCast(supported_policy_stages)),
+                .resource_attributes = resource_attributes,
+                .labels = labels,
             },
             .full_sync = self.last_sync_timestamp == 0,
             .last_sync_timestamp_unix_nano = self.last_sync_timestamp,
@@ -523,7 +516,7 @@ pub const HttpProvider = struct {
         if (result.status != .ok) {
             const event: HttpSyncRequestFailed = .{
                 .url = self.config_url,
-                .status = @intFromEnum(result.status),
+                .status = @backingInt(result.status),
             };
             self.bus.err(event);
             return error.HttpRequestFailed;
@@ -591,7 +584,7 @@ fn statsToSyncStatuses(
             .id = snap.id,
             .match_hits = snap.hits,
             .match_misses = snap.misses,
-            .errors = .{ .items = @constCast(snap.errors), .capacity = snap.errors.len },
+            .errors = .fromOwnedSlice(@constCast(snap.errors)),
             .remove = if (tr.removes_attempted > 0)
                 .{
                     .hits = @intCast(tr.removes_applied),
@@ -742,7 +735,7 @@ const SyncStub = struct {
     /// needs. Caller owns both (see the deinit pattern in the tests below).
     fn provider(self: *const SyncStub, a: std.mem.Allocator, sio: std.Io, bus: *EventBus) !*HttpProvider {
         var url_buf: [64]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sync", .{self.port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/sync", .{self.port});
         return HttpProvider.init(a, sio, bus, .{
             .id = "p",
             .url = url,
@@ -768,7 +761,7 @@ test "HttpProvider.close: flushes final stats once, then is idempotent" {
     var noop_bus: o11y.NoopEventBus = undefined;
     noop_bus.init(io);
 
-    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/sync", .{stub.port});
+    const url = try allocator.print("http://127.0.0.1:{d}/sync", .{stub.port});
     defer allocator.free(url);
 
     var provider = try HttpProvider.init(
